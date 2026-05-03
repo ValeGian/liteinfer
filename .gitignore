@@ -1,0 +1,81 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# Type checkers / linters
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.dmypy.json
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# IDEs / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Model weights — never commit
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.ggml
+
+# Local model / cache directories
+models/
+checkpoints/
+hf_cache/
+.cache/
+
+# Benchmark output
+benchmarks/results/
+!benchmarks/results/.gitkeep
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Profiling artifacts
+*.prof
+*.lprof
+nsight_*.qdrep
+nsight_*.sqlite
