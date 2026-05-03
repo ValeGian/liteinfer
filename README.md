@@ -63,7 +63,7 @@ Each module's `__init__.py` documents the contract it owns.
 
 ## Architecture (brief)
 
-User code calls **`LLM`**, a thin façade over **`LLMEngine`**, which owns:
+User code calls **`LLM`**, a thin facade over **`LLMEngine`**, which owns:
 
 - **`Scheduler`** — picks which sequences run on the next forward pass
   (continuous batching; later, prefix-cache aware).
