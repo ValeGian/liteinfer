@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUMP="${1:-}"
+if [[ "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
+    printf "Usage: %s <patch|minor|major>\n" "$0" >&2
+    exit 1
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    printf "error: must be on main branch (currently on '%s')\n" "$CURRENT_BRANCH" >&2
+    exit 1
+fi
+
+if ! git diff --quiet || ! git diff --staged --quiet; then
+    printf "error: working tree is not clean; commit or stash changes first\n" >&2
+    exit 1
+fi
+
+CURRENT=$(python3 -c "
+import re, sys
+with open('pyproject.toml') as f:
+    content = f.read()
+m = re.search(r'^version = \"(\d+\.\d+\.\d+)\"', content, re.MULTILINE)
+if not m:
+    sys.exit('error: could not find version in pyproject.toml')
+print(m.group(1))
+")
+
+NEW=$(python3 -c "
+major, minor, patch = map(int, '$CURRENT'.split('.'))
+if '$BUMP' == 'major':
+    major += 1; minor = 0; patch = 0
+elif '$BUMP' == 'minor':
+    minor += 1; patch = 0
+else:
+    patch += 1
+print(f'{major}.{minor}.{patch}')
+")
+
+printf "Bumping %s → %s (%s)\n" "$CURRENT" "$NEW" "$BUMP"
+
+sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" pyproject.toml
+
+git add pyproject.toml
+git commit -m "chore: release v${NEW}"
+git tag "v${NEW}"
+
+printf "\nDone. Run:  git push origin main --tags\n"
