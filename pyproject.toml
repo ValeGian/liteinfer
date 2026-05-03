@@ -37,7 +37,7 @@ dev = [
     "pyright>=1.1.380",
 ]
 bench = [
-    "vllm>=0.6",
+    "vllm==0.20.0",
     "pandas>=2.2",
     "tabulate>=0.9",
 ]

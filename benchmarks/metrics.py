@@ -25,6 +25,9 @@ class BenchmarkMetrics:
     ttft_p50_s: float
     ttft_p99_s: float
 
+    e2e_latency_p50_s: float
+    e2e_latency_p99_s: float
+
     peak_memory_bytes: int | None
 
     def as_dict(self) -> dict:
@@ -39,6 +42,7 @@ def summarize(
 ) -> BenchmarkMetrics:
     output_tokens = sum(len(r.output_token_ids) for r in results)
     ttfts = sorted(r.ttft_s for r in results)
+    e2e = sorted(r.total_time_s for r in results)
     return BenchmarkMetrics(
         engine=engine,
         num_requests=len(results),
@@ -48,6 +52,8 @@ def summarize(
         output_tokens_per_second=output_tokens / wall_time_s if wall_time_s > 0 else 0.0,
         ttft_p50_s=statistics.median(ttfts) if ttfts else 0.0,
         ttft_p99_s=_percentile(ttfts, 0.99),
+        e2e_latency_p50_s=statistics.median(e2e) if e2e else 0.0,
+        e2e_latency_p99_s=_percentile(e2e, 0.99),
         peak_memory_bytes=peak_memory_bytes,
     )
 
