@@ -44,8 +44,9 @@ print(f'{major}.{minor}.{patch}')
 printf "Bumping %s → %s (%s)\n" "$CURRENT" "$NEW" "$BUMP"
 
 sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" pyproject.toml
+sed -i "s/^__version__ = \"$CURRENT\"/__version__ = \"$NEW\"/" liteinfer/__init__.py
 
-git add pyproject.toml
+git add pyproject.toml liteinfer/__init__.py
 git commit -m "chore: release v${NEW}"
 git tag "v${NEW}"
 
