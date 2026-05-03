@@ -15,4 +15,4 @@ RUNNERS: dict[str, type[EngineRunner]] = {
     "vllm": VLLMRunner,
 }
 
-__all__ = ["EngineRunner", "GenerationResult", "SamplingSpec", "RUNNERS"]
+__all__ = ["RUNNERS", "EngineRunner", "GenerationResult", "SamplingSpec"]

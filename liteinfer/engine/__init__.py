@@ -14,9 +14,9 @@ from liteinfer.engine.sequence import Sequence, SequenceGroup, SequenceStatus
 
 __all__ = [
     "LLMEngine",
+    "ModelRunner",
     "Scheduler",
     "Sequence",
     "SequenceGroup",
     "SequenceStatus",
-    "ModelRunner",
 ]

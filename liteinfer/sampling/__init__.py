@@ -7,4 +7,4 @@ Sampling is a separate stage from model execution so that strategies
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
 
-__all__ = ["SamplingParams", "Sampler"]
+__all__ = ["Sampler", "SamplingParams"]
