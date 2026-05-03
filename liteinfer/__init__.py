@@ -5,4 +5,4 @@ from liteinfer.llm import LLM, RequestOutput
 from liteinfer.sampling.params import SamplingParams
 
 __all__ = ["LLM", "EngineConfig", "RequestOutput", "SamplingParams"]
-__version__ = "0.0.1"
+__version__ = "0.0.3"
