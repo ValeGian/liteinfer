@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "liteinfer"
+version = "0.0.1"
+description = "A lightweight, hackable LLM inference engine built from scratch."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Valerio" }]
+keywords = ["llm", "inference", "transformers", "pytorch", "cuda", "vllm"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.24",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-xdist>=3.5",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+]
+bench = [
+    "vllm>=0.6",
+    "pandas>=2.2",
+    "tabulate>=0.9",
+]
+
+[project.urls]
+Repository = "https://github.com/ValeGian/liteinfer"
+
+[tool.hatch.build.targets.wheel]
+packages = ["liteinfer"]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "SIM",           # flake8-simplify
+    "RUF",           # ruff-specific rules
+]
+ignore = ["E501"]  # line length is enforced by the formatter
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "gpu: requires a CUDA GPU to run (auto-skipped on CPU-only machines)",
+    "slow: takes more than a few seconds",
+    "e2e: end-to-end test that loads a real model",
+    "benchmark: performance measurement, not correctness — skipped by default",
+]
+
+[tool.pyright]
+include = ["liteinfer", "tests", "benchmarks"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingImports = "error"
+reportMissingTypeStubs = false
