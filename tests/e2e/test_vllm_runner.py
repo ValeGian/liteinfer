@@ -115,10 +115,12 @@ def test_total_time_positive_for_all_results(runner: VLLMRunner) -> None:
 
 
 class _MockMetricsV020:
-    arrival_time = 100.0
-    first_token_ts = 100.5
-    last_token_ts = 101.5
-    first_token_latency = 0.5
+    # All _ts fields are monotonic; arrival_time is Unix — different clocks.
+    arrival_time = 1_700_000_000.0  # Unix, must NOT be mixed with _ts fields
+    queued_ts = 1000.0
+    first_token_ts = 1000.5
+    last_token_ts = 1001.5
+    first_token_latency = 99.0  # unreliable cross-clock value — must be ignored
 
 
 class _MockMetricsLegacy:
@@ -131,29 +133,23 @@ class _MockMetricsEmpty:
     pass
 
 
-def test_extract_timing_uses_v020_fields() -> None:
-    ttft, total = _extract_timing(_MockMetricsV020(), wall=5.0, num_tokens=10)
-    assert ttft == pytest.approx(0.5)   # first_token_latency
-    assert total == pytest.approx(1.5)  # last_token_ts - arrival_time
+def test_extract_timing_uses_v020_monotonic_fields() -> None:
+    ttft, total = _extract_timing(_MockMetricsV020())
+    assert ttft == pytest.approx(0.5)   # first_token_ts - queued_ts
+    assert total == pytest.approx(1.5)  # last_token_ts - queued_ts
 
 
-def test_extract_timing_falls_back_to_legacy_fields() -> None:
-    ttft, total = _extract_timing(_MockMetricsLegacy(), wall=5.0, num_tokens=10)
-    assert ttft == pytest.approx(0.5)   # first_token_time - arrival_time
-    assert total == pytest.approx(1.5)  # finished_time - arrival_time
-
-
-def test_extract_timing_wall_fallback_when_no_metrics() -> None:
-    ttft, total = _extract_timing(_MockMetricsEmpty(), wall=2.0, num_tokens=20)
-    assert ttft == pytest.approx(0.1)   # wall / num_tokens
-    assert total == pytest.approx(2.0)
+def test_extract_timing_ignores_first_token_latency() -> None:
+    # first_token_latency crosses clock sources and must not be used for TTFT.
+    ttft, _ = _extract_timing(_MockMetricsV020())
+    assert ttft != pytest.approx(99.0)
 
 
 def test_extract_timing_v020_preferred_over_legacy_when_both_present() -> None:
     class Both(_MockMetricsV020, _MockMetricsLegacy):
         pass
 
-    ttft, total = _extract_timing(Both(), wall=5.0, num_tokens=10)
-    # v0.20.0 path wins because first_token_ts > 0
-    assert ttft == pytest.approx(0.5)
-    assert total == pytest.approx(1.5)
+    ttft, total = _extract_timing(Both())
+    # v0.20.0 monotonic path wins (queued_ts / first_token_ts / last_token_ts > 0)
+    assert ttft == pytest.approx(0.5)   # first_token_ts - queued_ts, not legacy
+    assert total == pytest.approx(1.5)  # last_token_ts - queued_ts

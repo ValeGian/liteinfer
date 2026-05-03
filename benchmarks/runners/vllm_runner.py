@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 from benchmarks.runners.base import GenerationResult, SamplingSpec
 
@@ -19,6 +18,10 @@ class VLLMRunner:
         # (e.g. torch.cuda.is_available() in a test runner). Spawn avoids this.
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+        # disable_log_stats=False is required: LLM() overrides it to True by
+        # default, which leaves RequestOutput.metrics=None and forces us into
+        # the wall-time fallback path.
+        kwargs.setdefault("disable_log_stats", False)
         self._llm = LLM(model=model, dtype="bfloat16", **kwargs)
         self.peak_memory_bytes: int | None = None
 
@@ -36,16 +39,14 @@ class VLLMRunner:
             seed=sampling.seed,
         )
 
-        wall_start = time.perf_counter()
         outputs = self._llm.generate(prompts, params)
-        wall = time.perf_counter() - wall_start
 
         self.peak_memory_bytes = _peak_cuda_memory()
 
         results = []
         for output in outputs:
             best = output.outputs[0]
-            ttft, total = _extract_timing(output.metrics, wall, len(best.token_ids))
+            ttft, total = _extract_timing(output.metrics)
             results.append(
                 GenerationResult(
                     prompt=output.prompt or "",
@@ -62,31 +63,24 @@ class VLLMRunner:
         self._llm = None
 
 
-def _extract_timing(metrics: object, wall: float, num_tokens: int) -> tuple[float, float]:
+def _extract_timing(metrics: object) -> tuple[float, float]:
     """Return (ttft_s, total_s) from vLLM request metrics, or fall back to wall-time estimates.
 
-    vLLM 0.20.0 uses RequestStateStats with first_token_ts / last_token_ts.
-    Older releases used first_token_time / finished_time.  We probe both.
-    """
-    arrival = getattr(metrics, "arrival_time", 0.0) or 0.0
+    vLLM 0.20.0 uses RequestStateStats with monotonic-clock timestamps:
+      queued_ts / first_token_ts / last_token_ts
 
-    # vLLM >= 0.20.0: RequestStateStats
+    arrival_time is Unix time; it must NOT be mixed with the _ts fields because
+    they come from different clocks.  first_token_latency crosses those clocks
+    and is therefore unreliable — we ignore it.
+    """
+    # vLLM >= 0.20.0: all three fields from the same monotonic clock
+    queued_ts = getattr(metrics, "queued_ts", 0.0) or 0.0
     first_ts = getattr(metrics, "first_token_ts", 0.0) or 0.0
     last_ts = getattr(metrics, "last_token_ts", 0.0) or 0.0
-    if first_ts > 0.0 and last_ts > 0.0 and arrival > 0.0:
-        # first_token_latency is pre-computed by vLLM; use it when populated.
-        precomputed = getattr(metrics, "first_token_latency", 0.0) or 0.0
-        ttft = precomputed if precomputed > 0.0 else max(0.0, first_ts - arrival)
-        return ttft, max(0.0, last_ts - arrival)
+    if queued_ts > 0.0 and first_ts > 0.0 and last_ts > 0.0:
+        return max(0.0, first_ts - queued_ts), max(0.0, last_ts - queued_ts)
 
-    # vLLM < 0.20.0: first_token_time / finished_time
-    first_token = getattr(metrics, "first_token_time", None)
-    finished = getattr(metrics, "finished_time", None)
-    if first_token is not None and finished is not None and arrival > 0.0:
-        return max(0.0, first_token - arrival), max(0.0, finished - arrival)
-
-    # Fallback: estimate TTFT as one inter-token step, total as full wall time.
-    return wall / max(1, num_tokens), wall
+    raise Exception("Not possible")
 
 
 def _reset_peak_cuda_memory() -> None:
