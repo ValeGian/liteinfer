@@ -9,17 +9,17 @@ from liteinfer import EngineConfig, SamplingParams
 
 
 def test_package_exposes_public_api() -> None:
-    for name in ("LLM", "SamplingParams", "EngineConfig", "RequestOutput"):
+    for name in ("LLM", "SamplingParams", "EngineConfig", "RequestOutput", "StepMetrics"):
         assert hasattr(liteinfer, name), f"missing public export: {name}"
 
 
 def test_sampling_params_rejects_negative_temperature() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError):
         SamplingParams(temperature=-0.1)
 
 
 def test_sampling_params_rejects_zero_max_tokens() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError):
         SamplingParams(max_tokens=0)
 
 
@@ -29,16 +29,23 @@ def test_sampling_params_greedy_when_temperature_zero() -> None:
 
 
 def test_engine_config_rejects_invalid_tp_size() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError):
         EngineConfig(model="dummy", tensor_parallel_size=0)
 
 
 def test_engine_config_rejects_invalid_memory_util() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError):
         EngineConfig(model="dummy", gpu_memory_utilization=1.5)
+
+
+def test_engine_config_rejects_invalid_cache_mode() -> None:
+    with pytest.raises(AssertionError):
+        EngineConfig(model="dummy", cache_mode="paged")  # type: ignore[arg-type]
 
 
 def test_engine_config_accepts_defaults() -> None:
     cfg = EngineConfig(model="dummy")
     assert cfg.tensor_parallel_size == 1
-    assert cfg.block_size > 0
+    assert cfg.kvcache_block_size > 0
+    assert cfg.cache_mode == "eager"
+    assert cfg.device == "auto"
