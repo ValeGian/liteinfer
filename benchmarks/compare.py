@@ -151,9 +151,7 @@ def _print_speedup(all_metrics: list[BenchmarkMetrics]) -> None:
             else 0.0
         )
         # For latency, lower is better: speedup = baseline / current
-        ttft_ratio = (
-            baseline.ttft_p50_s / m.ttft_p50_s if m.ttft_p50_s > 0 else 0.0
-        )
+        ttft_ratio = baseline.ttft_p50_s / m.ttft_p50_s if m.ttft_p50_s > 0 else 0.0
         direction = "faster" if thr_ratio > 1.0 else "slower"
         print(
             f"  {m.engine}:  {thr_ratio:.2f}x throughput  |  {ttft_ratio:.2f}x TTFT p50  ({direction})"

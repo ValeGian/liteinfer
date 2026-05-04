@@ -25,9 +25,7 @@ class VLLMRunner:
         self._llm = LLM(model=model, dtype="bfloat16", **kwargs)
         self.peak_memory_bytes: int | None = None
 
-    def generate(
-        self, prompts: list[str], sampling: SamplingSpec
-    ) -> list[GenerationResult]:
+    def generate(self, prompts: list[str], sampling: SamplingSpec) -> list[GenerationResult]:
         from vllm import SamplingParams as VLLMSamplingParams
 
         _reset_peak_cuda_memory()
