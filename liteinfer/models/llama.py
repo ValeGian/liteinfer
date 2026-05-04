@@ -1,0 +1,339 @@
+# pyright: reportPrivateImportUsage=false, reportOptionalSubscript=false
+# pyright: reportOptionalOperand=false, reportOperatorIssue=false
+# pyright: reportArgumentType=false, reportAssignmentType=false
+"""Llama model — generation-only path.
+
+Adapted from `transformers.models.llama.modeling_llama` for inference.
+Only the classes needed to run greedy/sampled generation are kept:
+
+- `LlamaForCausalLM` (the one liteinfer dispatches to)
+- `LlamaModel` (the decoder stack it wraps)
+- decoder-layer / attention / MLP / RMSNorm / rotary-embedding building
+  blocks they use
+
+The training-time outputs (loss, attentions), classification heads
+(`LlamaForSequenceClassification`, `…ForQuestionAnswering`, `…ForTokenClassification`),
+and HuggingFace integration decorators (auto-docstring, hub-kernel
+hooks, output recording, generation mixin) are all dropped — we own
+generation, and the rest is dead weight.
+
+Cross-version compatibility surface kept against `transformers`:
+
+- `LlamaConfig` is imported as-is — config schema stays sourced from
+  HF.
+- `Cache` / `DynamicCache` from `transformers.cache_utils` — used by
+  `EagerKVCache` and threaded through `forward(past_key_values=…)`.
+- `ROPE_INIT_FUNCTIONS` — Llama-3.x uses `rope_type="llama3"` with
+  frequency interpolation; reusing the HF init avoids re-deriving the
+  exact scaling formula.
+- `ACT2FN` — `config.hidden_act` is a string; HF's mapping keeps us
+  honest.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import ClassVar
+
+import torch
+from torch import nn
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.models.llama.configuration_llama import LlamaConfig
+
+
+@dataclass
+class CausalLMOutput:
+    """Minimal forward output. Mirrors the fields liteinfer reads."""
+
+    logits: torch.Tensor
+    past_key_values: Cache | None = None
+
+
+# ---------------------------------------------------------------------------
+# Building blocks
+# ---------------------------------------------------------------------------
+
+
+class LlamaRMSNorm(nn.Module):
+    """RMSNorm in float32 to match HF training precision exactly."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class LlamaRotaryEmbedding(nn.Module):
+    """Position-dependent (cos, sin) tables for RoPE.
+
+    The init function is delegated to HF's ROPE registry so frequency
+    interpolation schemes (e.g. `llama3`, `linear`, `dynamic`, `yarn`)
+    keep working without re-implementing each one.
+    """
+
+    inv_freq: torch.Tensor
+
+    def __init__(self, config: LlamaConfig, device: torch.device | None = None) -> None:
+        super().__init__()
+        self.config = config
+        self.rope_type = config.rope_parameters["rope_type"]
+        rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # RoPE math is sensitive to fp16/bf16 rounding; force fp32.
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = (emb.cos() * self.attention_scaling).to(x.dtype)
+        sin = (emb.sin() * self.attention_scaling).to(x.dtype)
+        return cos, sin
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(1)  # broadcast over heads
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand grouped-query KV heads back to the number of query heads."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    return (
+        hidden_states[:, :, None, :, :]
+        .expand(batch, num_kv_heads, n_rep, slen, head_dim)
+        .reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+    )
+
+
+class LlamaMLP(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class LlamaAttention(nn.Module):
+    """Grouped-query causal self-attention with eager (matmul) kernel.
+
+    SDPA / FlashAttention paths are intentionally not branched on here:
+    the engine pins eager. A fused-kernel variant is a future drop-in
+    behind `EngineConfig.attn_implementation` (see `docs/roadmap.md`).
+    """
+
+    def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = hidden_states.shape
+        hidden_shape = (batch, seq_len, -1, self.head_dim)
+
+        q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+
+        if past_key_values is not None:
+            k, v = past_key_values.update(k, v, self.layer_idx)
+
+        k = _repeat_kv(k, self.num_kv_groups)
+        v = _repeat_kv(v, self.num_kv_groups)
+
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[-2]]
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v).transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch, seq_len, -1)
+        return self.o_proj(attn_output)
+
+
+class LlamaDecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.self_attn = LlamaAttention(config, layer_idx)
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Top-level models
+# ---------------------------------------------------------------------------
+
+
+def _build_causal_mask(
+    seq_len: int,
+    past_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a `[1, 1, seq_len, past_len + seq_len]` additive mask.
+
+    Positions that should be masked get the dtype's `min`; allowed
+    positions get 0. Cached tokens are always visible; new tokens see
+    only positions up to (and including) themselves.
+    """
+    total_len = past_len + seq_len
+    mask = torch.zeros((seq_len, total_len), dtype=dtype, device=device)
+    if seq_len > 1:
+        causal = torch.full(
+            (seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=device
+        )
+        causal = torch.triu(causal, diagonal=1)
+        mask[:, past_len:] = causal
+    return mask[None, None, :, :]
+
+
+class LlamaModel(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = LlamaRotaryEmbedding(config)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool = False,
+    ) -> CausalLMOutput:
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        inputs_embeds = self.embed_tokens(input_ids)
+        seq_len = inputs_embeds.shape[1]
+        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+
+        if position_ids is None:
+            position_ids = torch.arange(
+                past_len, past_len + seq_len, device=inputs_embeds.device
+            ).unsqueeze(0)
+
+        attention_mask = _build_causal_mask(
+            seq_len, past_len, inputs_embeds.dtype, inputs_embeds.device
+        )
+
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+
+        hidden_states = inputs_embeds
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return CausalLMOutput(logits=hidden_states, past_key_values=past_key_values)
+
+
+class LlamaForCausalLM(nn.Module):
+    """Llama with a tied LM head — the entry point liteinfer dispatches to."""
+
+    # Read by `liteinfer.models.loader` to resolve checkpoints that store
+    # only the embedding copy of a tied weight.
+    _tied_weights_keys: ClassVar[dict[str, str]] = {
+        "lm_head.weight": "model.embed_tokens.weight"
+    }
+
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.model = LlamaModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if getattr(config, "tie_word_embeddings", True):
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool = False,
+    ) -> CausalLMOutput:
+        outputs = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        logits = self.lm_head(outputs.logits)
+        return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
