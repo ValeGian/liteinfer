@@ -52,9 +52,7 @@ class LLMEngine:
         """Tokenize, wrap as a `SequenceGroup`, and enqueue with the scheduler."""
         token_ids = self.tokenizer.encode(prompt)
         if len(token_ids) >= self.config.max_model_len:
-            raise ValueError(
-                f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}"
-            )
+            raise ValueError(f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}")
         seq = Sequence(seq_id=next(self._seq_id_gen), prompt_token_ids=list(token_ids))
         group = SequenceGroup(
             request_id=request_id,
