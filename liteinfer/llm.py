@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence as _Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import count
 
@@ -45,7 +45,7 @@ class LLM:
 
     def generate(
         self,
-        prompts: str | _Sequence[str],
+        prompts: str | Sequence[str],
         sampling_params: SamplingParams | None = None,
     ) -> list[RequestOutput]:
         """Generate completions. Drains all requests before returning."""
