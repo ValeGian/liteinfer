@@ -39,7 +39,3 @@ class Tokenizer:
 
     def decode(self, token_ids: list[int]) -> str:
         return self._hf.decode(token_ids, skip_special_tokens=True)
-
-    def apply_chat_template(self, messages: list[dict[str, str]]) -> list[int]:
-        """Render a chat-formatted prompt to token ids using the model's template."""
-        return self._hf.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
