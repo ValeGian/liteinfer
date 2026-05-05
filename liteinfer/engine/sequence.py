@@ -12,7 +12,7 @@ class SequenceStatus(str, Enum):
     WAITING = "waiting"
     RUNNING = "running"
     FINISHED_STOPPED = "finished_stopped"  # hit a stop string / EOS
-    FINISHED_LENGTH = "finished_length"  # reached max_tokens
+    FINISHED_LENGTH = "finished_length"    # reached max_tokens
     FINISHED_ABORTED = "finished_aborted"  # cancelled by the user
 
 
