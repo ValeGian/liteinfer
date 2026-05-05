@@ -45,8 +45,6 @@ class LLMEngine:
         sampling_params: SamplingParams,
     ) -> None:
         """Tokenize, wrap as a `SequenceGroup`, and enqueue with the scheduler."""
-        if sampling_params.n != 1:
-            raise NotImplementedError("v0 supports n=1 per request")
         tokenizer = self.model_runner.tokenizer
         if tokenizer is None:
             raise RuntimeError("model not loaded; call load_model() first")
