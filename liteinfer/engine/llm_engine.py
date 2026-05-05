@@ -21,6 +21,7 @@ from liteinfer.engine.sequence import (
 )
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
+from liteinfer.tokenizer import Tokenizer
 
 
 class LLMEngine:
@@ -35,6 +36,10 @@ class LLMEngine:
         self._seq_id_gen = count(0)
         self._step_idx = 0
 
+    @property
+    def tokenizer(self) -> Tokenizer:
+        return self.model_runner.tokenizer
+
     def load_model(self) -> None:
         self.model_runner.load_model()
 
@@ -45,10 +50,7 @@ class LLMEngine:
         sampling_params: SamplingParams,
     ) -> None:
         """Tokenize, wrap as a `SequenceGroup`, and enqueue with the scheduler."""
-        tokenizer = self.model_runner.tokenizer
-        if tokenizer is None:
-            raise RuntimeError("model not loaded; call load_model() first")
-        token_ids = tokenizer.encode(prompt)
+        token_ids = self.tokenizer.encode(prompt)
         if len(token_ids) >= self.config.max_model_len:
             raise ValueError(
                 f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}"
@@ -115,9 +117,6 @@ class LLMEngine:
         sampled,
     ) -> int:
         """Append sampled tokens, update statuses. Returns count of new tokens."""
-        tokenizer = self.model_runner.tokenizer
-        if tokenizer is None:
-            raise RuntimeError("model not loaded; call load_model() first")
         new_count = 0
         for i, group in enumerate(scheduled):
             seq = group.primary
@@ -126,17 +125,16 @@ class LLMEngine:
             token_id = int(sampled[i].item())
             seq.output_token_ids.append(token_id)
             new_count += 1
-            self._maybe_finish(seq, group.sampling_params, tokenizer, token_id)
+            self._maybe_finish(seq, group.sampling_params, token_id)
         return new_count
 
     def _maybe_finish(
         self,
         seq: Sequence,
         params: SamplingParams,
-        tokenizer,
         last_token_id: int,
     ) -> None:
-        if last_token_id in tokenizer.eos_token_ids:
+        if last_token_id in self.tokenizer.eos_token_ids:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
         if params.stop_token_ids and last_token_id in params.stop_token_ids:
@@ -146,7 +144,7 @@ class LLMEngine:
             seq.status = SequenceStatus.FINISHED_LENGTH
             return
         if params.stop:
-            text = tokenizer.decode(seq.output_token_ids)
+            text = self.tokenizer.decode(seq.output_token_ids)
             if any(s in text for s in params.stop):
                 seq.status = SequenceStatus.FINISHED_STOPPED
                 return
