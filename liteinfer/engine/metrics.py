@@ -82,6 +82,7 @@ class EngineStats:
     total_new_tokens: int = 0
     total_prefill_input_tokens: int = 0
     total_prefill_wall_s: float = 0.0
+    total_decode_new_tokens: int = 0
     total_decode_wall_s: float = 0.0
     total_wall_s: float = 0.0
     num_requests_finished: int = 0
@@ -96,6 +97,7 @@ class EngineStats:
             self.total_prefill_input_tokens += step.input_tokens
             self.total_prefill_wall_s += step.wall_time_s
         elif step.phase == Phase.DECODE:
+            self.total_decode_new_tokens += step.new_tokens
             self.total_decode_wall_s += step.wall_time_s
         for listener in self.listeners:
             listener(step)
@@ -113,8 +115,7 @@ class EngineStats:
     def avg_decode_throughput_tokens_per_s(self) -> float:
         if self.total_decode_wall_s <= 0:
             return 0.0
-        decode_steps_new = sum(s.new_tokens for s in self.steps if s.phase == Phase.DECODE)
-        return decode_steps_new / self.total_decode_wall_s
+        return self.total_decode_new_tokens / self.total_decode_wall_s
 
     @property
     def avg_prefill_throughput_tokens_per_s(self) -> float:
