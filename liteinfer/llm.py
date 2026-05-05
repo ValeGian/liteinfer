@@ -11,6 +11,7 @@ from liteinfer.engine.llm_engine import LLMEngine
 from liteinfer.engine.metrics import EngineStats
 from liteinfer.engine.sequence import SequenceStatus
 from liteinfer.sampling.params import SamplingParams
+from liteinfer.tokenizer import Tokenizer
 
 
 @dataclass
@@ -43,6 +44,10 @@ class LLM:
     def stats(self) -> EngineStats:
         return self.engine.stats
 
+    @property
+    def tokenizer(self) -> Tokenizer:
+        return self.engine.model_runner.tokenizer
+
     def generate(
         self,
         prompts: str | Sequence[str],
@@ -67,7 +72,7 @@ class LLM:
                         RequestOutput(
                             request_id=group.request_id,
                             prompt=group.prompt,
-                            text=self.engine.model_runner.tokenizer.decode(seq.output_token_ids),
+                            text=self.tokenizer.decode(seq.output_token_ids),
                             token_ids=list(seq.output_token_ids),
                             finish_reason=_FINISH_REASONS.get(seq.status, "stop"),
                         )
