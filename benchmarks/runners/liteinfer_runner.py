@@ -32,11 +32,12 @@ class LiteInferRunner:
         # liteinfer v0 processes one prompt per static batch. Time each
         # prompt individually so per-request TTFT/total are accurate.
         for prompt in prompts:
-            first_step_wall: list[float] = []
+            first_step_wall: float | None = None
 
-            def _capture_first(step: StepMetrics, sink: list[float] = first_step_wall) -> None:
-                if not sink:
-                    sink.append(step.wall_time_s)
+            def _capture_first(step: StepMetrics) -> None:
+                nonlocal first_step_wall
+                if first_step_wall is None:
+                    first_step_wall = step.wall_time_s
 
             self.llm.stats.on_step(_capture_first)
 
@@ -46,7 +47,7 @@ class LiteInferRunner:
 
             self.llm.stats.listeners.remove(_capture_first)
 
-            ttft = first_step_wall[0] if first_step_wall else total
+            ttft = first_step_wall if first_step_wall is not None else total
             results.append(
                 GenerationResult(
                     prompt=prompt,
