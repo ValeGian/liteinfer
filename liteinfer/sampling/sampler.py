@@ -1,15 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Sampler — turns logits into token ids per request.
-
-Deliberately a separate stage from the model forward pass: sampling
-strategies (greedy, temperature, top-k, top-p) can be swapped or
-benchmarked in isolation without touching the engine.
-
-v0 implements per-row sampling in a Python loop. That's slower than a
-fully vectorized path but keeps the logic obvious and correct when the
-batch contains a mix of greedy and stochastic requests with different
-parameters.
-"""
+"""Sampler — logits → token ids, per-row Python loop."""
 
 from __future__ import annotations
 
@@ -22,8 +12,8 @@ class Sampler:
     """Apply per-request sampling parameters to a batch of logits."""
 
     def __init__(self) -> None:
-        # Per-seq generators keyed by id() of the SamplingParams. Created
-        # lazily so callers don't have to pre-register sequences.
+        # Generators keyed by id(SamplingParams) so RNG state advances across
+        # decode steps for the same request.
         self._generators: dict[int, torch.Generator] = {}
 
     def __call__(
@@ -67,7 +57,6 @@ class Sampler:
 
 
 def _apply_top_k(logits: torch.Tensor, k: int) -> torch.Tensor:
-    """Mask all but the top-k logits to ``-inf`` (in place on a copy)."""
     if k >= logits.numel():
         return logits
     top_values, _ = torch.topk(logits, k)
@@ -76,7 +65,6 @@ def _apply_top_k(logits: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
-    """Zero out probabilities outside the top-p (nucleus) set, then renormalize."""
     sorted_probs, sorted_idx = torch.sort(probs, descending=True)
     cum = torch.cumsum(sorted_probs, dim=-1)
     # Drop entries strictly past the threshold; keep the first crossing.

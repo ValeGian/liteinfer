@@ -1,14 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Load HuggingFace-format models from a local directory.
-
-Reads ``config.json``, dispatches on the architecture name to the
-matching liteinfer model class, and streams weights from the directory's
-``*.safetensors`` shards onto the target device.
-
-Remote download is intentionally out of scope: the engine consumes
-already-materialized weights. Run ``huggingface-cli download …`` (or
-equivalent) ahead of time.
-"""
+"""Load HuggingFace-format models from a local directory."""
 
 from __future__ import annotations
 
@@ -22,24 +13,17 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from liteinfer.config import EngineConfig
+from liteinfer.models.gemma4 import Gemma4ForCausalLM
+from liteinfer.models.llama import LlamaForCausalLM
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
 # Architecture name (from `config.json["architectures"][0]`) → liteinfer class.
-# Kept lazy to avoid importing every modeling module when only one is used.
-_DISPATCH: dict[str, str] = {
-    "LlamaForCausalLM": "liteinfer.models.llama:LlamaForCausalLM",
-    "Gemma4ForCausalLM": "liteinfer.models.gemma4:Gemma4ForCausalLM",
+_DISPATCH: dict[str, type[nn.Module]] = {
+    "LlamaForCausalLM": LlamaForCausalLM,
+    "Gemma4ForCausalLM": Gemma4ForCausalLM,
 }
-
-
-def _resolve(qualified: str) -> type[nn.Module]:
-    module_path, _, attr = qualified.partition(":")
-    import importlib
-
-    module = importlib.import_module(module_path)
-    return getattr(module, attr)
 
 
 def _read_architecture(model_dir: Path) -> str:
@@ -61,12 +45,7 @@ def _iter_safetensor_shards(model_dir: Path) -> list[Path]:
 
 
 def _load_weights(model: nn.Module, model_dir: Path, device: torch.device) -> None:
-    """Stream weights from safetensors shards into ``model`` on ``device``.
-
-    Missing keys raise; unexpected keys are tolerated and reported via the
-    ``model._unexpected_keys`` attribute (set on the instance) so callers
-    can audit them.
-    """
+    """Stream safetensors weights into `model`. Missing keys raise; unexpected keys recorded on `model._unexpected_keys`."""
     state_keys = set(model.state_dict().keys())
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
@@ -106,13 +85,7 @@ def _load_weights(model: nn.Module, model_dir: Path, device: torch.device) -> No
 
 
 def load_hf_model(config: EngineConfig) -> tuple[nn.Module, PretrainedConfig]:
-    """Load a model from a local HuggingFace-format directory.
-
-    Returns ``(model, hf_config)``. The HF config is returned alongside
-    so callers (model runner, scheduler) can read fields like
-    ``num_hidden_layers`` and ``eos_token_id`` without reopening the
-    directory.
-    """
+    """Load model from a local HF-format directory. Returns `(model, hf_config)`."""
     model_dir = Path(config.model)
     if not model_dir.is_dir():
         raise FileNotFoundError(
@@ -130,7 +103,7 @@ def load_hf_model(config: EngineConfig) -> tuple[nn.Module, PretrainedConfig]:
     # are an optimization to add later behind a flag.
     hf_config._attn_implementation = "eager"
 
-    model_cls = _resolve(_DISPATCH[architecture])
+    model_cls = _DISPATCH[architecture]
     text_config = getattr(hf_config, "text_config", hf_config)
     device = config.resolved_device()
 

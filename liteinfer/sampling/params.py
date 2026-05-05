@@ -21,11 +21,16 @@ class SamplingParams:
     seed: int | None = None
 
     def __post_init__(self) -> None:
-        assert self.n >= 1, "n must be >= 1"
-        assert self.temperature >= 0, "temperature must be >= 0"
-        assert 0.0 < self.top_p <= 1.0, "top_p must be in (0, 1]"
-        assert self.top_k == -1 or self.top_k >= 1, "top_k must be -1 (disabled) or >= 1"
-        assert self.max_tokens >= 1, "max_tokens must be >= 1"
+        if self.n < 1:
+            raise ValueError("n must be >= 1")
+        if self.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if self.top_k != -1 and self.top_k < 1:
+            raise ValueError("top_k must be -1 (disabled) or >= 1")
+        if self.max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
 
     @property
     def greedy(self) -> bool:

@@ -1,11 +1,4 @@
-"""Scheduler — picks which sequences run on the next forward pass.
-
-v0 policy is **static batching**: drain up to ``max_num_seqs`` waiting
-requests into one batch, run them lockstep until every sequence
-finishes, then move on to the next batch. Continuous batching, paged
-KV reuse, and prefix-aware reordering are deliberately deferred — each
-gets its own subclass behind a flag once the eager baseline is solid.
-"""
+"""Scheduler — v0 policy: static batching."""
 
 from __future__ import annotations
 
@@ -37,13 +30,11 @@ class Scheduler:
         self.running: list[SequenceGroup] = []
 
     def add(self, group: SequenceGroup) -> None:
-        """Enqueue a new sequence group. Marked ``WAITING`` until scheduled."""
         for seq in group.sequences:
             seq.status = SequenceStatus.WAITING
         self.waiting.append(group)
 
     def schedule(self) -> SchedulerOutput:
-        """Pick the next batch under the static-batching policy."""
         is_new_batch = False
         if not self.running and self.waiting:
             n = min(len(self.waiting), self.config.max_num_seqs)
@@ -56,11 +47,7 @@ class Scheduler:
         return SchedulerOutput(scheduled=list(self.running), is_new_batch=is_new_batch)
 
     def remove_finished(self) -> list[SequenceGroup]:
-        """Drop finished groups from the running batch and return them.
-
-        Called once per step by the engine. Under the static policy the
-        next batch only starts after this list empties the running set.
-        """
+        """Drop finished groups from running, return them."""
         finished, self.running = (
             [g for g in self.running if g.is_finished],
             [g for g in self.running if not g.is_finished],

@@ -1,10 +1,4 @@
-"""Eager per-sequence KV cache.
-
-Wraps `transformers.cache_utils.DynamicCache`. The point of going
-through liteinfer's `KVCache` ABC rather than passing `DynamicCache`
-around directly is to keep the engine code untouched when paged or
-prefix-shared variants are introduced.
-"""
+"""Eager per-sequence KV cache. Wraps `transformers.cache_utils.DynamicCache`."""
 
 from __future__ import annotations
 

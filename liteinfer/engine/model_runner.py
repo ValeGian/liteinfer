@@ -1,17 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""ModelRunner — runs one forward pass for a scheduled batch.
-
-Owns the model weights, tokenizer, and (for the eager path) the active
-KV cache. Acts as the seam between the engine and the modeling code:
-the engine deals in `Sequence` objects; the runner translates them into
-tensors and back.
-
-v0 limitation: batch size = 1. Variable-length static batching plus
-finish-mask bookkeeping is the first optimization to add; doing it
-correctly with the eager cache requires careful padding/positions and
-is intentionally deferred so the first end-to-end path stays small and
-obviously correct.
-"""
+"""ModelRunner — one forward pass per call. v0 caps batch size at 1."""
 
 from __future__ import annotations
 
@@ -33,17 +21,14 @@ class ModelRunner:
         self.hf_config = None
         self.tokenizer: Tokenizer | None = None
 
-        # Per-static-batch state. Reset on `start_batch` / `end_batch`.
         self._cache: KVCache | None = None
         self._batch: list[SequenceGroup] = []
 
     def load_model(self) -> None:
-        """Materialize model weights and tokenizer on the target device."""
         self.model, self.hf_config = load_hf_model(self.config)
         self.tokenizer = Tokenizer(self.config.model)
 
     def start_batch(self, scheduled: list[SequenceGroup]) -> None:
-        """Register a static batch and (re)initialize cache state."""
         if len(scheduled) != 1:
             raise NotImplementedError(
                 "v0 supports batch size 1; static batching of multiple "
@@ -65,15 +50,7 @@ class ModelRunner:
     def execute(
         self, scheduled: list[SequenceGroup], is_new_batch: bool
     ) -> tuple[torch.Tensor, int]:
-        """Run one forward pass.
-
-        Returns
-        -------
-        logits : tensor of shape ``[batch, vocab_size]`` — the next-token
-            logits for each scheduled sequence.
-        input_tokens : how many tokens were fed into the forward pass
-            in total. Used by the metrics layer.
-        """
+        """Run one forward pass. Returns (logits [batch, vocab], input_tokens)."""
         if self.model is None:
             raise RuntimeError("model not loaded; call load_model() first")
         if scheduled != self._batch:
@@ -85,8 +62,8 @@ class ModelRunner:
         return self._execute_no_cache(seq)
 
     def _execute_eager(self, seq, is_new_batch: bool) -> tuple[torch.Tensor, int]:
-        """Eager-cache path: prefill on the first step, single-token decodes after."""
-        assert self.model is not None
+        if self.model is None:
+            raise RuntimeError("model not loaded; call load_model() first")
         cache_payload = self._cache.payload if self._cache is not None else None
 
         if is_new_batch:
@@ -103,12 +80,12 @@ class ModelRunner:
             past_key_values=cache_payload,
             use_cache=True,
         )
-        logits = out.logits[:, -1, :]  # [1, vocab]
+        logits = out.logits[:, -1, :]
         return logits, int(input_ids.shape[1])
 
     def _execute_no_cache(self, seq) -> tuple[torch.Tensor, int]:
-        """No-cache path: feed the full sequence each step, no past KV reused."""
-        assert self.model is not None
+        if self.model is None:
+            raise RuntimeError("model not loaded; call load_model() first")
         all_tokens = seq.all_token_ids()
         input_ids = torch.tensor([all_tokens], dtype=torch.long, device=self.device)
         position_ids = torch.arange(input_ids.shape[1], device=self.device).unsqueeze(0)

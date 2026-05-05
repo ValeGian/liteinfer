@@ -24,13 +24,7 @@ from liteinfer.sampling.sampler import Sampler
 
 
 class LLMEngine:
-    """The core inference engine.
-
-    Owns the lifecycle of every request from arrival to completion. Each
-    `step()` call runs at most one forward pass: ask the scheduler what
-    to run, ask the model runner to run it, route outputs back to the
-    originating sequences, emit a `StepMetrics` snapshot.
-    """
+    """Core inference engine. One forward pass per `step()`."""
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
@@ -54,7 +48,8 @@ class LLMEngine:
         if sampling_params.n != 1:
             raise NotImplementedError("v0 supports n=1 per request")
         tokenizer = self.model_runner.tokenizer
-        assert tokenizer is not None
+        if tokenizer is None:
+            raise RuntimeError("model not loaded; call load_model() first")
         token_ids = tokenizer.encode(prompt)
         if len(token_ids) >= self.config.max_model_len:
             raise ValueError(
@@ -121,13 +116,10 @@ class LLMEngine:
         scheduled: list[SequenceGroup],
         sampled,
     ) -> int:
-        """Append sampled tokens to each running sequence and update statuses.
-
-        Returns the number of *meaningful* tokens appended this step
-        (skipping sequences that finished pre-step).
-        """
+        """Append sampled tokens, update statuses. Returns count of new tokens."""
         tokenizer = self.model_runner.tokenizer
-        assert tokenizer is not None
+        if tokenizer is None:
+            raise RuntimeError("model not loaded; call load_model() first")
         new_count = 0
         for i, group in enumerate(scheduled):
             seq = group.primary

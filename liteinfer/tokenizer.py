@@ -1,9 +1,4 @@
-"""Tokenizer — thin wrapper around HuggingFace `AutoTokenizer`.
-
-Centralizing the wrapper keeps engine code free of HF-specific imports
-and gives one place to swap implementations later (custom BPE, faster
-tokenizers, etc.).
-"""
+"""Tokenizer — thin wrapper around HuggingFace `AutoTokenizer`."""
 
 from __future__ import annotations
 
@@ -14,13 +9,9 @@ from transformers import AutoTokenizer
 
 
 class Tokenizer:
-    """Encode/decode text. Backed by HF `PreTrainedTokenizerFast` when available."""
-
     def __init__(self, model_dir: str | Path) -> None:
         self._hf: Any = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
-        # `eos_token_id` may be a list on multimodal models; reduce to a single id
-        # for the v0 stop-criterion logic. Stored as a tuple so callers can
-        # iterate without copying.
+        # Multimodal models can return a list; normalize to tuple of ints.
         eos = self._hf.eos_token_id
         if isinstance(eos, list):
             self.eos_token_ids: tuple[int, ...] = tuple(eos)

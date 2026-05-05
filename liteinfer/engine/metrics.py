@@ -1,16 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Per-step engine metrics.
-
-Designed for a teaching engine: emit one ``StepMetrics`` snapshot per
-``LLMEngine.step()`` so a UI, dashboard, or log can show *what just
-happened* without touching internals. ``EngineStats`` accumulates them
-and exposes derived rates (decode tok/s, prefill tok/s, request
-throughput).
-
-Cost model: a step's ``wall_time_s`` is wall-clock around the forward
-pass plus sampling. CUDA work is synchronized before reading the clock
-so the number reflects executed time, not enqueue latency.
-"""
+"""Per-step engine metrics. Wall time uses CUDA sync so it reflects executed work."""
 
 from __future__ import annotations
 
@@ -24,30 +13,20 @@ import torch
 
 class Phase(str, Enum):
     PREFILL = "prefill"
-    """First step of an eager-cache batch: model consumes the prompt."""
     DECODE = "decode"
-    """Subsequent steps of an eager-cache batch: one new token per seq."""
     RECOMPUTE = "recompute"
-    """Cache-disabled step: model re-processes the full sequence."""
 
 
 @dataclass(frozen=True)
 class StepMetrics:
-    """Snapshot of one engine step.
-
-    Distinguishes ``input_tokens`` (tokens fed to the forward pass) from
-    ``new_tokens`` (tokens sampled this step) so callers can compute
-    prefill vs. decode throughput consistently across cache modes.
-    """
+    """Snapshot of one engine step."""
 
     step_idx: int
     phase: Phase
 
     num_seqs: int
-    input_tokens: int
-    """Total tokens in the forward-pass input across the batch."""
-    new_tokens: int
-    """Total tokens sampled (and appended to outputs) this step."""
+    input_tokens: int  # Total tokens in the forward-pass input across the batch.
+    new_tokens: int    # Total tokens sampled (and appended to outputs) this step.
 
     wall_time_s: float
     peak_gpu_mem_bytes: int | None = None
@@ -70,12 +49,7 @@ class StepMetrics:
 
 @dataclass
 class EngineStats:
-    """Cumulative engine stats and a per-step log.
-
-    The engine appends to ``steps`` after every forward pass and updates
-    the running totals. Subscribers registered via ``on_step`` receive
-    each ``StepMetrics`` synchronously — useful for live dashboards.
-    """
+    """Cumulative stats + per-step log. Subscribe via `on_step`."""
 
     steps: list[StepMetrics] = field(default_factory=list)
     total_input_tokens: int = 0
@@ -103,7 +77,6 @@ class EngineStats:
             listener(step)
 
     def on_step(self, listener: Callable[[StepMetrics], None]) -> None:
-        """Subscribe to per-step metrics."""
         self.listeners.append(listener)
 
     @property
@@ -125,10 +98,7 @@ class EngineStats:
 
 
 class StepTimer:
-    """Context manager that times a forward pass with CUDA sync.
-
-    Use as ``with StepTimer(device) as t: ...`` then read ``t.elapsed``.
-    """
+    """Times a forward pass with CUDA sync. Read `t.elapsed` after exit."""
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
