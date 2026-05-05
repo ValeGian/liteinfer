@@ -41,10 +41,6 @@ class LLMEngine:
         self._seq_id_gen = count(0)
         self._step_idx = 0
 
-    @property
-    def is_loaded(self) -> bool:
-        return self.model_runner.is_loaded
-
     def load_model(self) -> None:
         self.model_runner.load_model()
 
@@ -55,8 +51,6 @@ class LLMEngine:
         sampling_params: SamplingParams,
     ) -> None:
         """Tokenize, wrap as a `SequenceGroup`, and enqueue with the scheduler."""
-        if not self.is_loaded:
-            self.load_model()
         if sampling_params.n != 1:
             raise NotImplementedError("v0 supports n=1 per request")
         tokenizer = self.model_runner.tokenizer

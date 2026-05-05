@@ -42,10 +42,6 @@ class ModelRunner:
         self.model, self.hf_config = load_hf_model(self.config)
         self.tokenizer = Tokenizer(self.config.model)
 
-    @property
-    def is_loaded(self) -> bool:
-        return self.model is not None
-
     def start_batch(self, scheduled: list[SequenceGroup]) -> None:
         """Register a static batch and (re)initialize cache state."""
         if len(scheduled) != 1:

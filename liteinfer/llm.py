@@ -42,6 +42,8 @@ class LLM:
         self.engine = LLMEngine(self.config)
         self._req_id_gen = count(0)
 
+        self.engine.load_model()
+
     @property
     def stats(self) -> EngineStats:
         return self.engine.stats
