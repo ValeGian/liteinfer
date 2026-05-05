@@ -74,9 +74,7 @@ class LLMEngine:
         phase = self._phase_for(sched_out.is_new_batch)
 
         with StepTimer(self.model_runner.device) as timer:
-            logits, input_tokens = self.model_runner.execute(
-                sched_out.scheduled, is_new_batch=sched_out.is_new_batch
-            )
+            logits, input_tokens = self.model_runner.execute(sched_out.scheduled, is_new_batch=sched_out.is_new_batch)
             sampling_params = [g.sampling_params for g in sched_out.scheduled]
             sampled = self.sampler(logits, sampling_params)
 
