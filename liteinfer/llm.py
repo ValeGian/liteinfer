@@ -9,13 +9,12 @@ from itertools import count
 from liteinfer.config import EngineConfig
 from liteinfer.engine.llm_engine import LLMEngine
 from liteinfer.engine.metrics import EngineStats
+from liteinfer.engine.sequence import SequenceStatus
 from liteinfer.sampling.params import SamplingParams
 
 
 @dataclass
 class RequestOutput:
-    """Result for a single generation request."""
-
     request_id: str
     prompt: str
     text: str
@@ -23,19 +22,15 @@ class RequestOutput:
     finish_reason: str  # "stop" | "length" | "abort"
 
 
-_FINISH_REASONS = {
-    "FINISHED_STOPPED": "stop",
-    "FINISHED_LENGTH": "length",
-    "FINISHED_ABORTED": "abort",
+_FINISH_REASONS: dict[SequenceStatus, str] = {
+    SequenceStatus.FINISHED_STOPPED: "stop",
+    SequenceStatus.FINISHED_LENGTH: "length",
+    SequenceStatus.FINISHED_ABORTED: "abort",
 }
 
 
 class LLM:
-    """High-level offline inference API.
-
-    A thin facade over `LLMEngine`. The intent is for this public surface
-    to stay stable while engine internals evolve.
-    """
+    """High-level offline inference API. Facade over `LLMEngine`."""
 
     def __init__(self, model: str, **engine_kwargs) -> None:
         self.config = EngineConfig(model=model, **engine_kwargs)
@@ -53,20 +48,14 @@ class LLM:
         prompts: str | _Sequence[str],
         sampling_params: SamplingParams | None = None,
     ) -> list[RequestOutput]:
-        """Generate completions for one or more prompts.
-
-        Drains every request to completion before returning. Per-step
-        metrics accumulate in ``self.stats`` and can be inspected
-        afterwards or subscribed to via ``self.stats.on_step``.
-        """
+        """Generate completions. Drains all requests before returning."""
         if isinstance(prompts, str):
             prompts = [prompts]
         params = sampling_params or SamplingParams()
 
-        # v0 runs one prompt per static batch (see ModelRunner). Submit
-        # and drain each request before moving on so multi-prompt input
-        # still works under the B=1 limitation. Once batched execution
-        # lands, this loop collapses into a single submit-then-drain.
+        # v0 runs one prompt per static batch — submit and drain each
+        # request before moving on. Collapses into one submit-then-drain
+        # once batched execution lands.
         results: list[RequestOutput] = []
         for prompt in prompts:
             req_id = f"req-{next(self._req_id_gen)}"
@@ -75,14 +64,15 @@ class LLM:
                 for group in self.engine.step():
                     seq = group.primary
                     tokenizer = self.engine.model_runner.tokenizer
-                    assert tokenizer is not None
+                    if tokenizer is None:
+                        raise RuntimeError("model not loaded; call load_model() first")
                     results.append(
                         RequestOutput(
                             request_id=group.request_id,
                             prompt=group.prompt,
                             text=tokenizer.decode(seq.output_token_ids),
                             token_ids=list(seq.output_token_ids),
-                            finish_reason=_FINISH_REASONS.get(seq.status.name, "stop"),
+                            finish_reason=_FINISH_REASONS.get(seq.status, "stop"),
                         )
                     )
         return results
