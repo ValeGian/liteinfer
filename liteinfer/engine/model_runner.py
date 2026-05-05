@@ -78,7 +78,6 @@ class ModelRunner:
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=cache_payload,
-            use_cache=True,
         )
         logits = out.logits[:, -1, :]
         return logits, int(input_ids.shape[1])
@@ -94,7 +93,6 @@ class ModelRunner:
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=None,
-            use_cache=False,
         )
         logits = out.logits[:, -1, :]
         return logits, int(input_ids.shape[1])

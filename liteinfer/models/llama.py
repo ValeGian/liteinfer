@@ -1,34 +1,7 @@
 # pyright: reportPrivateImportUsage=false, reportOptionalSubscript=false
 # pyright: reportOptionalOperand=false, reportOperatorIssue=false
 # pyright: reportArgumentType=false, reportAssignmentType=false
-"""Llama model — generation-only path.
-
-Adapted from `transformers.models.llama.modeling_llama` for inference.
-Only the classes needed to run greedy/sampled generation are kept:
-
-- `LlamaForCausalLM` (the one liteinfer dispatches to)
-- `LlamaModel` (the decoder stack it wraps)
-- decoder-layer / attention / MLP / RMSNorm / rotary-embedding building
-  blocks they use
-
-The training-time outputs (loss, attentions), classification heads
-(`LlamaForSequenceClassification`, `…ForQuestionAnswering`, `…ForTokenClassification`),
-and HuggingFace integration decorators (auto-docstring, hub-kernel
-hooks, output recording, generation mixin) are all dropped — we own
-generation, and the rest is dead weight.
-
-Cross-version compatibility surface kept against `transformers`:
-
-- `LlamaConfig` is imported as-is — config schema stays sourced from
-  HF.
-- `Cache` / `DynamicCache` from `transformers.cache_utils` — used by
-  `EagerKVCache` and threaded through `forward(past_key_values=…)`.
-- `ROPE_INIT_FUNCTIONS` — Llama-3.x uses `rope_type="llama3"` with
-  frequency interpolation; reusing the HF init avoids re-deriving the
-  exact scaling formula.
-- `ACT2FN` — `config.hidden_act` is a string; HF's mapping keeps us
-  honest.
-"""
+"""Llama generation path. Adapted from `transformers.models.llama.modeling_llama`."""
 
 from __future__ import annotations
 
@@ -38,7 +11,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.llama.configuration_llama import LlamaConfig
 
@@ -272,11 +245,7 @@ class LlamaModel(nn.Module):
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        use_cache: bool = False,
     ) -> CausalLMOutput:
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
         inputs_embeds = self.embed_tokens(input_ids)
         seq_len = inputs_embeds.shape[1]
         past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -327,13 +296,11 @@ class LlamaForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        use_cache: bool = False,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            use_cache=use_cache,
         )
         logits = self.lm_head(outputs.logits)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)

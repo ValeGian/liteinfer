@@ -36,7 +36,7 @@ from torch import nn
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_experts_implementation
 from transformers.masking_utils import (
@@ -72,7 +72,7 @@ if is_accelerate_available():
 )
 class Gemma4ModelOutputWithPast(BaseModelOutputWithPast):
     r"""
-    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+    past_key_values (`Cache`, *optional*):
         It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
         Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
@@ -102,7 +102,7 @@ class Gemma4CausalLMOutputWithPast(ModelOutput):
         Language modeling loss (for next-token prediction).
     logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.text_config.vocab_size)`):
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+    past_key_values (`Cache`, *optional*):
         It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
         Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
@@ -782,7 +782,6 @@ class Gemma4TextModel(Gemma4PreTrainedModel):
             past_key_values: Cache | None = None,
             inputs_embeds: torch.FloatTensor | None = None,
             per_layer_inputs: torch.Tensor | None = None,
-            use_cache: bool | None = None,
             **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         r"""
@@ -803,9 +802,6 @@ class Gemma4TextModel(Gemma4PreTrainedModel):
             if per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
-
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
 
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -970,7 +966,6 @@ class Gemma4ForCausalLM(Gemma4PreTrainedModel, GenerationMixin):
             past_key_values: Cache | None = None,
             inputs_embeds: torch.FloatTensor | None = None,
             labels: torch.LongTensor | None = None,
-            use_cache: bool | None = None,
             logits_to_keep: int | torch.Tensor = 0,
             **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
@@ -998,7 +993,6 @@ class Gemma4ForCausalLM(Gemma4PreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
             **kwargs,
         )
 
