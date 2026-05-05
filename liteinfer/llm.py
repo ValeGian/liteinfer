@@ -63,14 +63,11 @@ class LLM:
             while self.engine.has_unfinished_requests():
                 for group in self.engine.step():
                     seq = group.primary
-                    tokenizer = self.engine.model_runner.tokenizer
-                    if tokenizer is None:
-                        raise RuntimeError("model not loaded; call load_model() first")
                     results.append(
                         RequestOutput(
                             request_id=group.request_id,
                             prompt=group.prompt,
-                            text=tokenizer.decode(seq.output_token_ids),
+                            text=self.engine.model_runner.tokenizer.decode(seq.output_token_ids),
                             token_ids=list(seq.output_token_ids),
                             finish_reason=_FINISH_REASONS.get(seq.status, "stop"),
                         )
