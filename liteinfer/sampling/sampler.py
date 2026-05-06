@@ -14,7 +14,7 @@ class Sampler:
     def __init__(self) -> None:
         # Generators keyed by id(SamplingParams) so RNG state advances across
         # decode steps for the same request.
-        self._generators: dict[int, torch.Generator] = {}
+        self._generators: dict[str, torch.Generator] = {}
 
     def __call__(
         self,
@@ -48,7 +48,7 @@ class Sampler:
     def _get_generator(self, p: SamplingParams, device: torch.device) -> torch.Generator | None:
         if p.seed is None:
             return None
-        key = id(p)
+        key = p.id
         gen = self._generators.get(key)
         if gen is None or gen.device != device:
             gen = torch.Generator(device=device).manual_seed(p.seed)
@@ -59,9 +59,11 @@ class Sampler:
 def _apply_top_k(logits: torch.Tensor, k: int) -> torch.Tensor:
     if k >= logits.numel():
         return logits
-    top_values, _ = torch.topk(logits, k)
-    cutoff = top_values[-1]
-    return torch.where(logits < cutoff, torch.full_like(logits, float("-inf")), logits)
+    # Index-based masking avoids keeping >k tokens when values tie at the boundary.
+    _, top_indices = torch.topk(logits, k)
+    mask = torch.full_like(logits, float("-inf"))
+    mask.scatter_(0, top_indices, logits[top_indices])
+    return mask
 
 
 def _apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
@@ -72,5 +74,7 @@ def _apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     sorted_probs = sorted_probs.masked_fill(mask, 0.0)
     out = torch.zeros_like(probs)
     out.scatter_(-1, sorted_idx, sorted_probs)
-    out = out / out.sum()
+    total = out.sum()
+    if total > 0:
+        out = out / total
     return out
