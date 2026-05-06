@@ -33,8 +33,7 @@ class StepMetrics:
 
     @property
     def throughput_tokens_per_s(self) -> float:
-        denom = self.wall_time_s
-        return (self.input_tokens + self.new_tokens) / denom if denom > 0 else 0.0
+        return (self.input_tokens + self.new_tokens) / self.wall_time_s if self.wall_time_s > 0 else 0.0
 
     @property
     def decode_throughput_tokens_per_s(self) -> float:
