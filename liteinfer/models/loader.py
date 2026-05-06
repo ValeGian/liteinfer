@@ -88,15 +88,11 @@ def load_hf_model(config: EngineConfig) -> tuple[nn.Module, PretrainedConfig]:
     """Load model from a local HF-format directory. Returns `(model, hf_config)`."""
     model_dir = Path(config.model)
     if not model_dir.is_dir():
-        raise FileNotFoundError(
-            f"{config.model!r} is not a directory; this loader only handles local paths"
-        )
+        raise FileNotFoundError(f"{config.model!r} is not a directory; this loader only handles local paths")
 
     architecture = _read_architecture(model_dir)
     if architecture not in _DISPATCH:
-        raise ValueError(
-            f"unsupported architecture {architecture!r}; known: {sorted(_DISPATCH)}"
-        )
+        raise ValueError(f"unsupported architecture {architecture!r}; known: {sorted(_DISPATCH)}")
 
     hf_config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
     # Force eager attention path; SDPA/flash require correct masking and
