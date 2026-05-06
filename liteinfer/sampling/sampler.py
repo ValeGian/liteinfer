@@ -31,7 +31,7 @@ class Sampler:
         return out
 
     def _sample_one(self, row_logits: torch.Tensor, p: SamplingParams) -> torch.Tensor:
-        if p.greedy:
+        if p.greedy or p.top_k == 1:
             return torch.argmax(row_logits, dim=-1)
 
         scaled = row_logits / p.temperature
