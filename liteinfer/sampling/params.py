@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,6 +18,10 @@ class SamplingParams:
 
     seed: int | None = None
 
+    # Stable unique ID so Sampler can key per-request RNG state without
+    # relying on id(), which reuses addresses after GC.
+    _id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.temperature < 0:
             raise ValueError("temperature must be >= 0")
@@ -30,3 +35,7 @@ class SamplingParams:
     @property
     def greedy(self) -> bool:
         return self.temperature == 0.0
+
+    @property
+    def id(self):
+        return self._id
