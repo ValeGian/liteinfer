@@ -80,8 +80,7 @@ class EngineStats:
 
     @property
     def avg_throughput_tokens_per_s(self) -> float:
-        denom = self.total_wall_s
-        return (self.total_input_tokens + self.total_new_tokens) / denom if denom > 0 else 0.0
+        return (self.total_input_tokens + self.total_new_tokens) / self.total_wall_s if self.total_wall_s > 0 else 0.0
 
     @property
     def avg_decode_throughput_tokens_per_s(self) -> float:
