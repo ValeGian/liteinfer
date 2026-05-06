@@ -51,8 +51,6 @@ class ModelRunner:
         self, scheduled: list[SequenceGroup], is_new_batch: bool
     ) -> tuple[torch.Tensor, int]:
         """Run one forward pass. Returns (logits [batch, vocab], input_tokens)."""
-        if self.model is None:
-            raise RuntimeError("model not loaded; call load_model() first")
         if scheduled != self._batch:
             raise RuntimeError("scheduled batch differs from registered batch")
 
@@ -62,8 +60,6 @@ class ModelRunner:
         return self._execute_no_cache(seq)
 
     def _execute_eager(self, seq, is_new_batch: bool) -> tuple[torch.Tensor, int]:
-        if self.model is None:
-            raise RuntimeError("model not loaded; call load_model() first")
         cache_payload = self._cache.payload if self._cache is not None else None
 
         if is_new_batch:
@@ -83,8 +79,6 @@ class ModelRunner:
         return logits, int(input_ids.shape[1])
 
     def _execute_no_cache(self, seq) -> tuple[torch.Tensor, int]:
-        if self.model is None:
-            raise RuntimeError("model not loaded; call load_model() first")
         all_tokens = seq.all_token_ids()
         input_ids = torch.tensor([all_tokens], dtype=torch.long, device=self.device)
         position_ids = torch.arange(input_ids.shape[1], device=self.device).unsqueeze(0)
