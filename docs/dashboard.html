@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiteInfer Benchmark Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #f4f4f6;
+    color: #1a1a1a;
+    padding: 2rem 2.5rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: .3rem }
+  .page-meta {
+    font-size: .8rem; color: #555; margin-bottom: 2rem;
+    display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  }
+  section { margin-bottom: 2.8rem }
+  h2 {
+    font-size: 1.05rem; font-weight: 700;
+    text-transform: capitalize; letter-spacing: .01em;
+    margin-bottom: .2rem;
+  }
+  .subtitle { font-size: .82rem; color: #555; margin-bottom: .4rem }
+  .run-meta {
+    display: flex; flex-wrap: wrap; gap: .5rem;
+    margin-bottom: .75rem;
+  }
+  .meta-item {
+    font-size: .76rem; color: #666;
+    background: #ebebeb; border-radius: 4px;
+    padding: 2px 8px;
+  }
+  .wrap { overflow-x: auto }
+  table {
+    border-collapse: collapse;
+    font-size: .83rem;
+    white-space: nowrap;
+    min-width: 360px;
+  }
+  th {
+    background: #e4e4e7;
+    font-weight: 600;
+    padding: 7px 14px;
+    border: 1px solid #ccc;
+    text-align: right;
+  }
+  th.l { text-align: left }
+  td {
+    padding: 6px 14px;
+    border: 1px solid #ddd;
+    text-align: right;
+    background: #fff;
+    vertical-align: middle;
+  }
+  td.engine {
+    text-align: left;
+    font-weight: 600;
+    background: #fafafa;
+    font-family: ui-monospace, monospace;
+    font-size: .8rem;
+  }
+  .best { background: #d1fae5; color: #065f46; font-weight: 700 }
+  .worst { background: #fee2e2; color: #991b1b; font-weight: 700 }
+  small.ratio-base  { display:block; font-size:.68rem; color:#999; font-weight:400 }
+  small.ratio-better { display:block; font-size:.68rem; color:#059669; font-weight:600 }
+  small.ratio-worse  { display:block; font-size:.68rem; color:#dc2626; font-weight:600 }
+
+  /* ── Tooltip ── */
+  .tip-host {
+    position: relative;
+    cursor: help;
+    text-decoration: underline dotted #aaa;
+    text-underline-offset: 2px;
+  }
+  .tip-host::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #18181b;
+    color: #f4f4f5;
+    font-size: .74rem;
+    font-weight: 400;
+    padding: 6px 10px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    max-width: 280px;
+    width: max-content;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .15s ease;
+    z-index: 200;
+    text-align: left;
+    box-shadow: 0 4px 12px rgba(0,0,0,.25);
+    line-height: 1.45;
+  }
+  .tip-host:hover::after { opacity: 1 }
+  td.engine .tip-host::after { left: 0; transform: none }
+  tbody tr:first-child td.engine .tip-host::after { bottom: auto; top: calc(100% + 8px) }
+  thead th .tip-host::after { bottom: auto; top: calc(100% + 8px); left: 50%; transform: translateX(-50%) }
+
+  /* ── Legend pills ── */
+  .legend-pill {
+    display: inline-block;
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-size: .76rem;
+    font-weight: 600;
+  }
+  .best-pill { background: #d1fae5; color: #065f46 }
+  .worst-pill { background: #fee2e2; color: #991b1b }
+  .tag-pill {
+    background: #dbeafe;
+    color: #1d4ed8;
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+<h1>LiteInfer Benchmark Dashboard</h1>
+<div class="page-meta">2 run(s) in history &nbsp;·&nbsp; 3 engine(s) compared &nbsp;·&nbsp; <span class='legend-pill best-pill'>green = best per column</span> <span class='legend-pill worst-pill'>red = worst per column</span> &nbsp;·&nbsp; x ratio is vs first (baseline) engine</div>
+<section><h2>throughput</h2><p class='subtitle'>All requests submitted at once — engine queues them, processes B=1 at a time. E2E includes queue wait.</p><div class='run-meta'><span class='meta-item'>📅 2026-05-07T23:09:05</span><span class='meta-item tag-pill'>v0_baseline</span><span class='meta-item' title='meta-llama/Llama-3.2-1B-Instruct'>🤖 Llama-3.2-1B-Instruct</span><span class='meta-item'>batch_size=1</span><span class='meta-item'>32 prompts · all submitted at once</span></div><div class='wrap'><table><thead><tr><th class='l'>Engine (B=1)</th><th><span class="tip-host" data-tip="Requests completed per wall-second. Measured over the full batch from first submission to last completion. Higher is better.">req/s</span></th><th><span class="tip-host" data-tip="Output tokens emitted per wall-second across all requests. Higher is better.">tok/s</span></th><th><span class="tip-host" data-tip="Median end-to-end latency per request, from batch submission (t₀) to last token. Includes queue wait time — later requests in a B=1 queue have higher E2E. Lower is better.">E2E p50</span></th><th><span class="tip-host" data-tip="99th-percentile end-to-end latency. With 32 requests and B=1, p99 ≈ the last request's E2E. Lower is better.">E2E p99</span></th></tr></thead><tbody><tr><td class="engine"><span class="tip-host" data-tip="liteinfer v0 · cache_mode=none (RECOMPUTE)&#10;Every step re-feeds the full and growing sequence. No KV cache — decode cost grows linearly with sequence length. v0 default.">liteinfer</span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 1.71x slower than best">1.69<small class='ratio-base'>base</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 2.57x slower than best">70.06<small class='ratio-base'>base</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 2.07x slower than best">11956&thinsp;ms<small class='ratio-base'>base</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 1.71x slower than best">18913&thinsp;ms<small class='ratio-base'>base</small></span></td></tr>
+<tr><td class="engine"><span class="tip-host" data-tip="liteinfer v0 · cache_mode=eager (DynamicCache)&#10;Prefill runs once to populate the KV cache. Each decode step passes only the new token — O(1) input, O(n) attention lookup.">liteinfer-kvcache</span></td><td>1.77<small class='ratio-better'>1.04x</small></td><td>70.61<small class='ratio-better'>1.01x</small></td><td>10480&thinsp;ms<small class='ratio-better'>1.14x</small></td><td>18114&thinsp;ms<small class='ratio-better'>1.04x</small></td></tr>
+<tr><td class="engine"><span class="tip-host" data-tip="vLLM 0.20.0 · max_num_seqs=1 (B=1)&#10;FlashAttention 2, torch.compile, CUDA graphs for decode, paged KV cache, prefix caching enabled.">vllm</span></td><td class="best"><span class="tip-host" data-tip="Best in column — 1.71x better than worst">2.89<small class='ratio-better'>1.71x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 2.57x better than worst">180.13<small class='ratio-better'>2.57x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 2.07x better than worst">5786&thinsp;ms<small class='ratio-better'>2.07x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 1.71x better than worst">11042&thinsp;ms<small class='ratio-better'>1.71x</small></span></td></tr></tbody></table></div></section>
+<section><h2>latency</h2><p class='subtitle'>Sequential, no queue — each request sent only after previous finishes. Pure per-request engine latency.</p><div class='run-meta'><span class='meta-item'>📅 2026-05-07T23:10:48</span><span class='meta-item tag-pill'>v0_baseline</span><span class='meta-item' title='meta-llama/Llama-3.2-1B-Instruct'>🤖 Llama-3.2-1B-Instruct</span><span class='meta-item'>batch_size=1</span><span class='meta-item'>20 prompts · sequential, no queue</span></div><div class='wrap'><table><thead><tr><th class='l'>Engine (B=1)</th><th><span class="tip-host" data-tip="Median time-to-first-token: wall clock from request submission to when the first output token is ready. No queue contamination in this workload. Lower is better.">TTFT p50</span></th><th><span class="tip-host" data-tip="99th-percentile TTFT. Variance here reflects scheduling jitter and GPU state. Lower is better.">TTFT p99</span></th><th><span class="tip-host" data-tip="Median end-to-end latency per request: submission to last token. Sequential workload — no queue wait. Lower is better.">E2E p50</span></th><th><span class="tip-host" data-tip="Output tokens per wall-second (total tokens / total wall time across all sequential requests). Reflects steady-state decode throughput. Higher is better.">tok/s</span></th></tr></thead><tbody><tr><td class="engine"><span class="tip-host" data-tip="liteinfer v0 · cache_mode=none (RECOMPUTE)&#10;Every step re-feeds the full and growing sequence. No KV cache — decode cost grows linearly with sequence length. v0 default.">liteinfer</span></td><td class="best"><span class="tip-host" data-tip="Best in column — 1.88x better than worst">14&thinsp;ms<small class='ratio-base'>base</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 1.99x better than worst">16&thinsp;ms<small class='ratio-base'>base</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 2.49x slower than best">1726&thinsp;ms<small class='ratio-base'>base</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 2.54x slower than best">71.67<small class='ratio-base'>base</small></span></td></tr>
+<tr><td class="engine"><span class="tip-host" data-tip="liteinfer v0 · cache_mode=eager (DynamicCache)&#10;Prefill runs once to populate the KV cache. Each decode step passes only the new token — O(1) input, O(n) attention lookup.">liteinfer-kvcache</span></td><td>15&thinsp;ms<small class='ratio-worse'>0.89x</small></td><td>17&thinsp;ms<small class='ratio-worse'>0.90x</small></td><td>1541&thinsp;ms<small class='ratio-better'>1.12x</small></td><td>72.09<small class='ratio-better'>1.01x</small></td></tr>
+<tr><td class="engine"><span class="tip-host" data-tip="vLLM 0.20.0 · max_num_seqs=1 (B=1)&#10;FlashAttention 2, torch.compile, CUDA graphs for decode, paged KV cache, prefix caching enabled.">vllm</span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 1.88x slower than best">26&thinsp;ms<small class='ratio-worse'>0.53x</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 1.99x slower than best">31&thinsp;ms<small class='ratio-worse'>0.50x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 2.49x better than worst">694&thinsp;ms<small class='ratio-better'>2.49x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 2.54x better than worst">182.12<small class='ratio-better'>2.54x</small></span></td></tr></tbody></table></div></section>
+</body>
+</html>

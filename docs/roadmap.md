@@ -269,3 +269,26 @@ listed.
 - Tighten `KVCache` ABC after §2.1 — richer `payload` may obviate
   eager wrapper.
 - Add `tests/integration/` B=1 vs B=N parity tests once §1.1 lands.
+
+---
+
+## 8. Benchmark harness
+
+### 8.1 ISL / OSL-controlled workloads
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** Current workloads let the model decide output length (EOS
+  or `max_tokens`), so two engines may generate different numbers of
+  tokens for the same prompt. This makes tok/s and E2E comparisons
+  unreliable across engines. Fixed ISL (Input Sequence Length) and
+  OSL (Output Sequence Length) give reproducible, apples-to-apples
+  numbers.
+- **Scope.** Add `isl` / `osl` parameters to `Workload` and to the
+  `--workload` CLI flag. Prompt construction: tokenize a template to
+  exactly ISL tokens (pad or truncate). Output forcing: pass
+  `min_tokens=OSL, max_tokens=OSL` to each engine (requires
+  liteinfer `SamplingParams` to expose `min_tokens`). Add standard
+  workload presets such as `(ISL=128, OSL=128)` and
+  `(ISL=512, OSL=512)` to `benchmarks/workloads.py`.
+- **Parity test.** Assert `len(output_token_ids) == OSL` for every
+  result in both engines.

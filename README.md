@@ -110,6 +110,29 @@ Test layout:
 
 See `tests/README.md` for conventions.
 
+## Performance
+
+Llama-3.2-1B-Instruct · greedy · NVIDIA A40 · **batch size 1** (all engines)
+liteinfer v0.0.6 vs vLLM 0.20.0 — see [`docs/benchmarks.md`](docs/benchmarks.md) for full setup and methodology, or open the **[interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)** for a visual comparison.
+
+`liteinfer` = no KV cache (RECOMPUTE mode, v0 default) · `liteinfer-kvcache` = eager KV cache enabled
+
+**Throughput** — 32 requests submitted at once, engine queues them (B=1 → sequential). E2E includes queue wait time.
+
+| Engine (B=1) | req/s | tok/s | E2E p50 | E2E p99 |
+|---|---:|---:|---:|---:|
+| liteinfer | 1.69 | 70 | 11956 ms | 18914 ms |
+| liteinfer-kvcache | 1.77 | 71 | 10480 ms | 18114 ms |
+| vllm | 2.89 | 180 | 5786 ms | 11042 ms |
+
+**Latency** — sequential, no queue; each request sent only after previous finishes.
+
+| Engine (B=1) | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
+|---|---:|---:|---:|---:|
+| liteinfer | 14 ms | 16 ms | 1726 ms | 72 |
+| liteinfer-kvcache | 15 ms | 17 ms | 1541 ms | 72 |
+| vllm | 26 ms | 31 ms | 694 ms | 182 |
+
 ## Benchmarking against vLLM
 
 Every engine implements the same `EngineRunner` interface, so comparing

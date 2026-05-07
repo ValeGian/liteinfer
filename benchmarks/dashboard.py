@@ -1,13 +1,19 @@
-"""Generate a self-contained HTML dashboard from a benchmark history JSONL file.
+"""Generate a self-contained interactive HTML dashboard from a benchmark history JSONL file.
 
-Each line of the history file is a JSON object produced by `compare.py --append-history`.
-Rows are ordered chronologically; cells are color-coded against the previous run for the
-same engine so regressions and improvements stand out immediately.
+Layout: one section per workload (most recent run). Each section is a table with
+engines as rows and metrics as columns.
+- Best cell per column: green background.
+- Worst cell per column: red background.
+- Every non-baseline cell shows an inline x ratio vs the first (baseline) engine.
+- Metric column headers and engine name cells carry CSS tooltips with context.
+
+Default output is docs/dashboard.html so the file is tracked by git and
+accessible via htmlpreview.github.io.
 
 Usage:
     python -m benchmarks.dashboard \\
         --history benchmarks/results/history.jsonl \\
-        --output benchmarks/results/dashboard.html
+        --output docs/dashboard.html
 """
 
 from __future__ import annotations
@@ -16,19 +22,60 @@ import argparse
 import json
 from pathlib import Path
 
-# (key, display label, higher_is_better)
-_METRIC_DEFS: list[tuple[str, str, bool]] = [
-    ("requests_per_second", "req/s", True),
-    ("output_tokens_per_second", "tok/s", True),
-    ("ttft_p50_s", "TTFT p50", False),
-    ("ttft_p99_s", "TTFT p99", False),
-    ("e2e_latency_p50_s", "E2E p50", False),
-    ("e2e_latency_p99_s", "E2E p99", False),
+# Metrics shown per workload. (key, display_label, higher_is_better, tooltip)
+_THROUGHPUT_METRICS: list[tuple[str, str, bool, str]] = [
+    ("requests_per_second", "req/s", True,
+     "Requests completed per wall-second. Measured over the full batch from first submission to last completion. Higher is better."),
+    ("output_tokens_per_second", "tok/s", True,
+     "Output tokens emitted per wall-second across all requests. Higher is better."),
+    ("e2e_latency_p50_s", "E2E p50", False,
+     "Median end-to-end latency per request, from batch submission (t₀) to last token. Includes queue wait time — later requests in a B=1 queue have higher E2E. Lower is better."),
+    ("e2e_latency_p99_s", "E2E p99", False,
+     "99th-percentile end-to-end latency. With 32 requests and B=1, p99 ≈ the last request's E2E. Lower is better."),
 ]
+
+_LATENCY_METRICS: list[tuple[str, str, bool, str]] = [
+    ("ttft_p50_s", "TTFT p50", False,
+     "Median time-to-first-token: wall clock from request submission to when the first output token is ready. No queue contamination in this workload. Lower is better."),
+    ("ttft_p99_s", "TTFT p99", False,
+     "99th-percentile TTFT. Variance here reflects scheduling jitter and GPU state. Lower is better."),
+    ("e2e_latency_p50_s", "E2E p50", False,
+     "Median end-to-end latency per request: submission to last token. Sequential workload — no queue wait. Lower is better."),
+    ("output_tokens_per_second", "tok/s", True,
+     "Output tokens per wall-second (total tokens / total wall time across all sequential requests). Reflects steady-state decode throughput. Higher is better."),
+]
+
+_WORKLOAD_METRICS: dict[str, list[tuple[str, str, bool, str]]] = {
+    "throughput": _THROUGHPUT_METRICS,
+    "latency": _LATENCY_METRICS,
+    "prefix_share": _THROUGHPUT_METRICS,
+}
 
 _LATENCY_KEYS = {"ttft_p50_s", "ttft_p99_s", "e2e_latency_p50_s", "e2e_latency_p99_s"}
 
-_CHANGE_THRESHOLD = 0.05  # 5 % swing required to color a cell
+_WORKLOAD_SUBTITLES: dict[str, str] = {
+    "throughput": "All requests submitted at once — engine queues them, processes B=1 at a time. E2E includes queue wait.",
+    "latency": "Sequential, no queue — each request sent only after previous finishes. Pure per-request engine latency.",
+    "prefix_share": "Prompts share a long common prefix. Designed to stress prefix caching.",
+}
+
+_ENGINE_TIPS: dict[str, str] = {
+    "liteinfer": (
+        "liteinfer v0 · cache_mode=none (RECOMPUTE)\n"
+        "Every step re-feeds the full and growing sequence. "
+        "No KV cache — decode cost grows linearly with sequence length. v0 default."
+    ),
+    "liteinfer-kvcache": (
+        "liteinfer v0 · cache_mode=eager (DynamicCache)\n"
+        "Prefill runs once to populate the KV cache. "
+        "Each decode step passes only the new token — O(1) input, O(n) attention lookup."
+    ),
+    "vllm": (
+        "vLLM 0.20.0 · max_num_seqs=1 (B=1)\n"
+        "FlashAttention 2, torch.compile, CUDA graphs for decode, "
+        "paged KV cache, prefix caching enabled."
+    ),
+}
 
 
 def load_history(path: Path) -> list[dict]:
@@ -36,100 +83,147 @@ def load_history(path: Path) -> list[dict]:
 
 
 def build_html(runs: list[dict]) -> str:
-    workloads = sorted({r["workload"] for r in runs})
-    all_engines = sorted({e["engine"] for r in runs for e in r["results"]})
-
-    ts_range = f"{runs[0]['timestamp']} &rarr; {runs[-1]['timestamp']}" if runs else ""
-    sections = "\n".join(
-        _workload_section(workload, [r for r in runs if r["workload"] == workload], all_engines)
-        for workload in workloads
-    )
-    return _page(f"{len(runs)} runs &nbsp;&middot;&nbsp; {ts_range}", sections)
-
-
-def _workload_section(workload: str, runs: list[dict], all_engines: list[str]) -> str:
-    thead = _thead(all_engines)
-    rows: list[str] = []
-    prev_by_engine: dict[str, dict] = {}
+    latest: dict[str, dict] = {}
     for run in runs:
-        by_engine = {e["engine"]: e for e in run["results"]}
-        rows.append(_trow(run, by_engine, prev_by_engine, all_engines))
-        prev_by_engine = by_engine
-    tbody = "\n".join(rows)
+        latest[run["workload"]] = run
+
+    sections = "\n".join(_workload_section(run) for run in latest.values())
+    n_engines = max((len(r["results"]) for r in latest.values()), default=0)
+    meta = (
+        f"{len(runs)} run(s) in history &nbsp;·&nbsp; "
+        f"{n_engines} engine(s) compared &nbsp;·&nbsp; "
+        f"<span class='legend-pill best-pill'>green = best per column</span> "
+        f"<span class='legend-pill worst-pill'>red = worst per column</span> "
+        f"&nbsp;·&nbsp; x ratio is vs first (baseline) engine"
+    )
+    return _page(meta, sections)
+
+
+def _workload_section(run: dict) -> str:
+    workload = run["workload"]
+    metrics = _WORKLOAD_METRICS.get(workload, _THROUGHPUT_METRICS)
+    subtitle = _WORKLOAD_SUBTITLES.get(workload, "")
+    num_prompts = run.get("num_prompts", "?")
+    batch_size = run.get("batch_size", 1)
+    tag = run.get("tag", "")
+    model = run.get("model", "")
+    model_short = model.split("/")[-1]
+    ts = run.get("timestamp", "")
+    sequential = run.get("sequential", False)
+    submission = "sequential, no queue" if sequential else "all submitted at once"
+
+    meta_line = (
+        f"<span class='meta-item'>📅 {ts}</span>"
+        + (f"<span class='meta-item tag-pill'>{tag}</span>" if tag else "")
+        + f"<span class='meta-item' title='{model}'>🤖 {model_short}</span>"
+        + f"<span class='meta-item'>batch_size={batch_size}</span>"
+        + f"<span class='meta-item'>{num_prompts} prompts · {submission}</span>"
+    )
+
+    table = _comparison_table(run, metrics)
     return (
-        f"<h2>Workload: {workload}</h2>"
-        f"<div class='wrap'><table>{thead}<tbody>{tbody}</tbody></table></div>"
+        f"<section>"
+        f"<h2>{workload}</h2>"
+        f"<p class='subtitle'>{subtitle}</p>"
+        f"<div class='run-meta'>{meta_line}</div>"
+        f"{table}"
+        f"</section>"
     )
 
 
-def _thead(all_engines: list[str]) -> str:
-    n = len(_METRIC_DEFS)
-    engine_cols = "".join(f'<th colspan="{n}">{e}</th>' for e in all_engines)
-    metric_cols = "".join(f"<th>{label}</th>" for _ in all_engines for _, label, _ in _METRIC_DEFS)
-    return (
-        "<thead>"
-        f"<tr>"
-        f"<th rowspan='2' class='l'>Tag</th>"
-        f"<th rowspan='2' class='l'>Timestamp</th>"
-        f"<th rowspan='2' class='l'>Model</th>"
-        f"{engine_cols}"
-        f"</tr>"
-        f"<tr>{metric_cols}</tr>"
-        "</thead>"
+def _comparison_table(run: dict, metrics: list[tuple[str, str, bool, str]]) -> str:
+    engines = [e["engine"] for e in run["results"]]
+    by_engine = {e["engine"]: e for e in run["results"]}
+
+    # Baseline = first engine.
+    baseline_engine = engines[0] if engines else None
+    baseline_data = by_engine.get(baseline_engine, {}) if baseline_engine else {}
+
+    # Per-column best/worst values.
+    col_extremes: dict[str, tuple[float, float]] = {}
+    for key, _, higher_is_better, _ in metrics:
+        vals = [by_engine[e][key] for e in engines if by_engine[e].get(key) is not None]
+        if len(vals) < 2:
+            continue
+        col_extremes[key] = (
+            (max(vals), min(vals)) if higher_is_better else (min(vals), max(vals))
+        )
+
+    # Header row with tooltips on metric labels.
+    metric_headers = "".join(
+        f'<th><span class="tip-host" data-tip="{_escape(tip)}">{label}</span></th>'
+        for _, label, _, tip in metrics
     )
+    thead = f"<thead><tr><th class='l'>Engine (B=1)</th>{metric_headers}</tr></thead>"
 
+    # Data rows.
+    rows: list[str] = []
+    for engine in engines:
+        data = by_engine[engine]
+        is_baseline = engine == baseline_engine
 
-def _trow(
-    run: dict,
-    by_engine: dict[str, dict],
-    prev_by_engine: dict[str, dict],
-    all_engines: list[str],
-) -> str:
-    tag = run.get("tag") or ""
-    tag_html = f'<span class="tag">{tag}</span>' if tag else "&mdash;"
-    model = run.get("model", "").split("/")[-1]
+        engine_tip = _ENGINE_TIPS.get(engine, "")
+        engine_cell = (
+            f'<td class="engine"><span class="tip-host" data-tip="{_escape(engine_tip)}">'
+            f'{engine}</span></td>'
+        )
 
-    cells: list[str] = []
-    for engine in all_engines:
-        cur = by_engine.get(engine)
-        prev = prev_by_engine.get(engine)
-        for key, _, higher_is_better in _METRIC_DEFS:
-            if cur is None or cur.get(key) is None:
+        cells: list[str] = [engine_cell]
+        for key, _, higher_is_better, _ in metrics:
+            val = data.get(key)
+            if val is None:
                 cells.append("<td>&mdash;</td>")
                 continue
-            val: float = cur[key]
-            text = _fmt(key, val)
-            css = _delta_class(val, prev.get(key) if prev else None, higher_is_better)
-            cells.append(f'<td class="{css}">{text}</td>' if css else f"<td>{text}</td>")
 
-    cells_html = "".join(cells)
-    return (
-        f"<tr>"
-        f"<td class='l'>{tag_html}</td>"
-        f"<td class='l'>{run.get('timestamp', '')}</td>"
-        f"<td class='l'>{model}</td>"
-        f"{cells_html}"
-        f"</tr>"
-    )
+            text = _fmt(key, val)
+
+            # Inline ratio vs baseline.
+            baseline_val = baseline_data.get(key)
+            ratio_html = ""
+            if is_baseline:
+                ratio_html = "<small class='ratio-base'>base</small>"
+            elif baseline_val and baseline_val != 0:
+                ratio = val / baseline_val if higher_is_better else baseline_val / val
+                ratio_cls = "ratio-better" if ratio >= 1.0 else "ratio-worse"
+                ratio_html = f"<small class='{ratio_cls}'>{ratio:.2f}x</small>"
+
+            # Best/worst cell coloring + tooltip.
+            extremes = col_extremes.get(key)
+            css = ""
+            cell_tip = ""
+            if extremes:
+                best, worst = extremes
+                if val == best:
+                    css = "best"
+                    if worst != 0:
+                        gap = (best / worst) if higher_is_better else (worst / best)
+                        cell_tip = f"Best in column — {gap:.2f}x better than worst"
+                elif val == worst:
+                    css = "worst"
+                    if best != 0:
+                        gap = (best / worst) if higher_is_better else (worst / best)
+                        cell_tip = f"Worst in column — {gap:.2f}x slower than best"
+
+            inner = f'{text}{ratio_html}'
+            if cell_tip:
+                inner = f'<span class="tip-host" data-tip="{_escape(cell_tip)}">{inner}</span>'
+            cells.append(f'<td class="{css}">{inner}</td>' if css else f"<td>{inner}</td>")
+
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    tbody = "\n".join(rows)
+    return f"<div class='wrap'><table>{thead}<tbody>{tbody}</tbody></table></div>"
 
 
 def _fmt(key: str, value: float) -> str:
     if key in _LATENCY_KEYS:
-        return f"{value * 1000:.1f} ms"
+        ms = value * 1000
+        return f"{ms:.0f}&thinsp;ms" if ms >= 10 else f"{ms:.1f}&thinsp;ms"
     return f"{value:.2f}"
 
 
-def _delta_class(current: float, previous: float | None, higher_is_better: bool) -> str:
-    if previous is None or previous == 0:
-        return ""
-    ratio = current / previous
-    improved = ratio >= 1 + _CHANGE_THRESHOLD if higher_is_better else ratio <= 1 - _CHANGE_THRESHOLD
-    worsened = ratio <= 1 - _CHANGE_THRESHOLD if higher_is_better else ratio >= 1 + _CHANGE_THRESHOLD
-    if improved:
-        return "ok"
-    if worsened:
-        return "bad"
-    return ""
+def _escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace("\n", "&#10;")
 
 
 def _page(meta: str, body: str) -> str:
@@ -137,28 +231,128 @@ def _page(meta: str, body: str) -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LiteInfer Benchmark Dashboard</title>
 <style>
-  *{{box-sizing:border-box}}
-  body{{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:2rem;background:#f5f5f5;color:#1a1a1a}}
-  h1{{font-size:1.4rem;font-weight:700;margin:0 0 .2rem}}
-  h2{{font-size:1rem;font-weight:600;margin:2rem 0 .6rem;padding-bottom:.3rem;border-bottom:2px solid #ddd}}
-  .meta{{color:#666;font-size:.82rem;margin-bottom:1.8rem}}
-  .wrap{{overflow-x:auto}}
-  table{{border-collapse:collapse;font-size:.8rem;white-space:nowrap}}
-  th{{background:#e8e8e8;font-weight:600;padding:5px 11px;border:1px solid #ccc;text-align:right}}
-  th.l{{text-align:left}}
-  td{{padding:4px 11px;border:1px solid #e4e4e4;text-align:right;background:#fff}}
-  td.l{{text-align:left}}
-  tr:hover td{{background:#eef2ff}}
-  .ok{{color:#1a7f37;font-weight:600}}
-  .bad{{color:#cf222e;font-weight:600}}
-  .tag{{background:#dbeafe;color:#1d4ed8;border-radius:3px;padding:1px 6px;font-size:.74rem;font-weight:500}}
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0 }}
+  body {{
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #f4f4f6;
+    color: #1a1a1a;
+    padding: 2rem 2.5rem;
+    line-height: 1.5;
+  }}
+  h1 {{ font-size: 1.4rem; font-weight: 700; margin-bottom: .3rem }}
+  .page-meta {{
+    font-size: .8rem; color: #555; margin-bottom: 2rem;
+    display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  }}
+  section {{ margin-bottom: 2.8rem }}
+  h2 {{
+    font-size: 1.05rem; font-weight: 700;
+    text-transform: capitalize; letter-spacing: .01em;
+    margin-bottom: .2rem;
+  }}
+  .subtitle {{ font-size: .82rem; color: #555; margin-bottom: .4rem }}
+  .run-meta {{
+    display: flex; flex-wrap: wrap; gap: .5rem;
+    margin-bottom: .75rem;
+  }}
+  .meta-item {{
+    font-size: .76rem; color: #666;
+    background: #ebebeb; border-radius: 4px;
+    padding: 2px 8px;
+  }}
+  .wrap {{ overflow-x: auto }}
+  table {{
+    border-collapse: collapse;
+    font-size: .83rem;
+    white-space: nowrap;
+    min-width: 360px;
+  }}
+  th {{
+    background: #e4e4e7;
+    font-weight: 600;
+    padding: 7px 14px;
+    border: 1px solid #ccc;
+    text-align: right;
+  }}
+  th.l {{ text-align: left }}
+  td {{
+    padding: 6px 14px;
+    border: 1px solid #ddd;
+    text-align: right;
+    background: #fff;
+    vertical-align: middle;
+  }}
+  td.engine {{
+    text-align: left;
+    font-weight: 600;
+    background: #fafafa;
+    font-family: ui-monospace, monospace;
+    font-size: .8rem;
+  }}
+  .best {{ background: #d1fae5; color: #065f46; font-weight: 700 }}
+  .worst {{ background: #fee2e2; color: #991b1b; font-weight: 700 }}
+  small.ratio-base  {{ display:block; font-size:.68rem; color:#999; font-weight:400 }}
+  small.ratio-better {{ display:block; font-size:.68rem; color:#059669; font-weight:600 }}
+  small.ratio-worse  {{ display:block; font-size:.68rem; color:#dc2626; font-weight:600 }}
+
+  /* ── Tooltip ── */
+  .tip-host {{
+    position: relative;
+    cursor: help;
+    text-decoration: underline dotted #aaa;
+    text-underline-offset: 2px;
+  }}
+  .tip-host::after {{
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #18181b;
+    color: #f4f4f5;
+    font-size: .74rem;
+    font-weight: 400;
+    padding: 6px 10px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    max-width: 280px;
+    width: max-content;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .15s ease;
+    z-index: 200;
+    text-align: left;
+    box-shadow: 0 4px 12px rgba(0,0,0,.25);
+    line-height: 1.45;
+  }}
+  .tip-host:hover::after {{ opacity: 1 }}
+  td.engine .tip-host::after {{ left: 0; transform: none }}
+  tbody tr:first-child td.engine .tip-host::after {{ bottom: auto; top: calc(100% + 8px) }}
+  thead th .tip-host::after {{ bottom: auto; top: calc(100% + 8px); left: 50%; transform: translateX(-50%) }}
+
+  /* ── Legend pills ── */
+  .legend-pill {{
+    display: inline-block;
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-size: .76rem;
+    font-weight: 600;
+  }}
+  .best-pill {{ background: #d1fae5; color: #065f46 }}
+  .worst-pill {{ background: #fee2e2; color: #991b1b }}
+  .tag-pill {{
+    background: #dbeafe;
+    color: #1d4ed8;
+    font-weight: 600;
+  }}
 </style>
 </head>
 <body>
 <h1>LiteInfer Benchmark Dashboard</h1>
-<p class="meta">{meta}</p>
+<div class="page-meta">{meta}</div>
 {body}
 </body>
 </html>"""
@@ -169,7 +363,12 @@ def main() -> None:
         description="Generate an HTML dashboard from a benchmark history JSONL file."
     )
     parser.add_argument("--history", type=Path, required=True, help="Path to history.jsonl")
-    parser.add_argument("--output", type=Path, required=True, help="Path to write dashboard.html")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("docs/dashboard.html"),
+        help="Path to write dashboard HTML (default: docs/dashboard.html).",
+    )
     args = parser.parse_args()
 
     runs = load_history(args.history)
