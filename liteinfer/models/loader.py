@@ -84,12 +84,13 @@ def _load_weights(model: nn.Module, model_dir: Path, device: torch.device) -> No
     object.__setattr__(model, "_unexpected_keys", unexpected)
 
 
-def load_hf_model(config: EngineConfig) -> tuple[nn.Module, PretrainedConfig]:
-    """Load model from a local HF-format directory. Returns `(model, hf_config)`."""
-    model_dir = Path(config.model)
-    if not model_dir.is_dir():
-        raise FileNotFoundError(f"{config.model!r} is not a directory; this loader only handles local paths")
+def load_hf_model(config: EngineConfig, model_dir: Path) -> tuple[nn.Module, PretrainedConfig]:
+    """Load model from a local HF-format directory. Returns `(model, hf_config)`.
 
+    *model_dir* must be a resolved local path; call
+    :func:`liteinfer.hub.resolve_model_path` first if the model identifier
+    may be a HuggingFace Hub repo ID.
+    """
     architecture = _read_architecture(model_dir)
     if architecture not in _DISPATCH:
         raise ValueError(f"unsupported architecture {architecture!r}; known: {sorted(_DISPATCH)}")

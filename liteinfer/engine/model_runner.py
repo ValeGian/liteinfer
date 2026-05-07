@@ -9,6 +9,7 @@ from liteinfer.cache.eager_kv_cache import EagerKVCache
 from liteinfer.cache.kv_cache import KVCache
 from liteinfer.config import EngineConfig
 from liteinfer.engine.sequence import SequenceGroup
+from liteinfer.hub import resolve_model_path
 from liteinfer.models.loader import load_hf_model
 from liteinfer.tokenizer import Tokenizer
 
@@ -25,8 +26,9 @@ class ModelRunner:
         self._batch: list[SequenceGroup] = []
 
     def load_model(self) -> None:
-        self.model, self.hf_config = load_hf_model(self.config)
-        self.tokenizer = Tokenizer(self.config.model)
+        model_path = resolve_model_path(self.config.model)
+        self.model, self.hf_config = load_hf_model(self.config, model_path)
+        self.tokenizer = Tokenizer(model_path)
 
     def start_batch(self, scheduled: list[SequenceGroup]) -> None:
         if len(scheduled) != 1:
