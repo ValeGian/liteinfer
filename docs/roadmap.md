@@ -292,3 +292,21 @@ listed.
   `(ISL=512, OSL=512)` to `benchmarks/workloads.py`.
 - **Parity test.** Assert `len(output_token_ids) == OSL` for every
   result in both engines.
+
+### 8.2 Plain HuggingFace `transformers` benchmark runner
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** vLLM is a strong production baseline, but a plain
+  `transformers.AutoModelForCausalLM.generate` runner gives a
+  simpler, dependency-free lower bound and makes liteinfer's
+  overhead vs raw HF visible without the vLLM install requirement.
+- **Scope.** New `benchmarks/runners/hf_runner.py` implementing
+  `EngineRunner`. `setup` loads the model via `AutoModelForCausalLM`
+  and `AutoTokenizer`; `generate` calls `.generate()` with greedy
+  decoding. Register under key `"hf"` in
+  `benchmarks/runners/__init__.py::RUNNERS`. No new dependencies —
+  `transformers` is already required by liteinfer.
+- **Parity test.** HF runner greedy outputs match liteinfer eager
+  outputs on the same prompts (already validated by existing e2e
+  parity tests; benchmark runner just reuses that path).
+  
