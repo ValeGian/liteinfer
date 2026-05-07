@@ -225,7 +225,7 @@ def test_generation_multiple_prompts(llm_no_cache: LLM) -> None:
     ]
     outputs = llm_no_cache.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
     assert len(outputs) == len(prompts)
-    for i, (out, prompt) in enumerate(zip(outputs, prompts)):
+    for i, (out, prompt) in enumerate(zip(outputs, prompts, strict=True)):
         assert out.prompt == prompt, f"prompt mismatch at index {i}"
         assert len(out.token_ids) > 0
         assert len(out.token_ids) <= 8
