@@ -24,16 +24,22 @@ from benchmarks.workloads import WORKLOADS
 
 _MS = 1000.0
 
-_COL_DEFS: list[tuple[str, int, str, str | None]] = [
-    # (header, width, attribute, format)
-    ("Engine", 16, "engine", None),
-    ("req/s", 8, "requests_per_second", ".2f"),
-    ("tok/s", 8, "output_tokens_per_second", ".1f"),
-    ("TTFT p50", 11, "ttft_p50_s", "ms"),
-    ("TTFT p99", 11, "ttft_p99_s", "ms"),
-    ("E2E p50", 11, "e2e_latency_p50_s", "ms"),
-    ("E2E p99", 11, "e2e_latency_p99_s", "ms"),
-    ("Tokens", 7, "output_tokens", "d"),
+# Throughput: all requests submitted at once, B=1 queue. Shows req/s and E2E under load.
+_THROUGHPUT_COLS: list[tuple[str, int, str]] = [
+    ("Engine (B=1)", 18, "engine"),
+    ("req/s", 8, "requests_per_second"),
+    ("tok/s", 8, "output_tokens_per_second"),
+    ("E2E p50", 13, "e2e_latency_p50_s"),
+    ("E2E p99", 13, "e2e_latency_p99_s"),
+]
+
+# Latency: one request at a time, no queue. Shows TTFT and per-request E2E.
+_LATENCY_COLS: list[tuple[str, int, str]] = [
+    ("Engine (B=1)", 18, "engine"),
+    ("TTFT p50", 13, "ttft_p50_s"),
+    ("TTFT p99", 13, "ttft_p99_s"),
+    ("E2E p50", 13, "e2e_latency_p50_s"),
+    ("tok/s", 8, "output_tokens_per_second"),
 ]
 
 
@@ -47,6 +53,12 @@ def main() -> None:
         choices=sorted(RUNNERS),
     )
     parser.add_argument("--workload", default="throughput", choices=sorted(WORKLOADS))
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Number of single-prompt warmup calls before timing.",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Write JSON result to this path.")
     parser.add_argument(
         "--append-history",
@@ -70,8 +82,11 @@ def main() -> None:
         runner = RUNNERS[engine_name]()
         runner.setup(args.model)
         try:
+            for _ in range(args.warmup):
+                runner.generate([workload.prompts[0]], workload.sampling)
+
             t0 = time.perf_counter()
-            results = runner.generate(workload.prompts, workload.sampling)
+            results = _run_workload(runner, workload)
             wall = time.perf_counter() - t0
         finally:
             runner.teardown()
@@ -80,13 +95,16 @@ def main() -> None:
         metrics = summarize(engine_name, results, wall_time_s=wall, peak_memory_bytes=peak_memory)
         all_metrics.append(metrics)
 
-    _print_table(all_metrics, workload.name, args.model, timestamp, args.tag)
+    _print_table(all_metrics, workload, timestamp, args.tag)
 
     run_record = {
         "timestamp": timestamp,
         "tag": args.tag,
         "workload": workload.name,
         "model": args.model,
+        "batch_size": 1,
+        "sequential": workload.sequential,
+        "num_prompts": len(workload.prompts),
         "results": [m.as_dict() for m in all_metrics],
     }
 
@@ -101,43 +119,59 @@ def main() -> None:
         print(f"\nAppended to history: {args.append_history}")
 
 
+def _run_workload(runner, workload) -> list:
+    """Execute workload respecting sequential vs batch submission semantics."""
+    from benchmarks.runners.base import GenerationResult
+
+    if workload.sequential:
+        results: list[GenerationResult] = []
+        for prompt in workload.prompts:
+            results.extend(runner.generate([prompt], workload.sampling))
+        return results
+    else:
+        return runner.generate(workload.prompts, workload.sampling)
+
+
 def _print_table(
     all_metrics: list[BenchmarkMetrics],
-    workload_name: str,
-    model: str,
+    workload,
     timestamp: str,
     tag: str | None,
 ) -> None:
+    cols = _LATENCY_COLS if workload.sequential else _THROUGHPUT_COLS
+    submission = "sequential (no queue)" if workload.sequential else "all submitted at once"
+
     tag_part = f"  [{tag}]" if tag else ""
-    print(f"\nWorkload: {workload_name}  |  Model: {model}  |  {timestamp}{tag_part}\n")
+    print(
+        f"\nWorkload: {workload.name}  |  {len(workload.prompts)} prompts  |  {submission}"
+        f"\nbatch_size=1  |  {timestamp}{tag_part}\n"
+    )
 
     header = "  ".join(
         f"{label:<{w}}" if i == 0 else f"{label:>{w}}"
-        for i, (label, w, _, _) in enumerate(_COL_DEFS)
+        for i, (label, w, _) in enumerate(cols)
     )
-    separator = "  ".join("-" * w for _, w, _, _ in _COL_DEFS)
+    separator = "  ".join("-" * w for _, w, _ in cols)
     print(header)
     print(separator)
 
     for m in all_metrics:
-        print(_format_row(m))
+        print(_format_row(m, cols))
 
     if len(all_metrics) > 1:
         _print_speedup(all_metrics)
 
 
-def _format_row(m: BenchmarkMetrics) -> str:
+def _format_row(m: BenchmarkMetrics, cols: list[tuple[str, int, str]]) -> str:
     cells = []
-    for i, (_, w, attr, fmt) in enumerate(_COL_DEFS):
+    for i, (_, w, attr) in enumerate(cols):
         val = getattr(m, attr)
         if i == 0:
             cells.append(f"{val:<{w}}")
-        elif fmt == "ms":
+        elif attr.endswith("_s"):
             cells.append(f"{val * _MS:.1f} ms".rjust(w))
-        elif fmt == "d":
-            cells.append(f"{int(val):>{w}}")
         else:
-            cells.append(f"{val:{fmt}}".rjust(w))
+            cells.append(f"{val:.2f}".rjust(w))
     return "  ".join(cells)
 
 
@@ -150,11 +184,10 @@ def _print_speedup(all_metrics: list[BenchmarkMetrics]) -> None:
             if baseline.requests_per_second > 0
             else 0.0
         )
-        # For latency, lower is better: speedup = baseline / current
-        ttft_ratio = baseline.ttft_p50_s / m.ttft_p50_s if m.ttft_p50_s > 0 else 0.0
+        e2e_ratio = baseline.e2e_latency_p50_s / m.e2e_latency_p50_s if m.e2e_latency_p50_s > 0 else 0.0
         direction = "faster" if thr_ratio > 1.0 else "slower"
         print(
-            f"  {m.engine}:  {thr_ratio:.2f}x throughput  |  {ttft_ratio:.2f}x TTFT p50  ({direction})"
+            f"  {m.engine}:  {thr_ratio:.2f}x throughput  |  {e2e_ratio:.2f}x E2E p50  ({direction})"
         )
 
 

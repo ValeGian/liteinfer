@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from benchmarks.runners.base import GenerationResult, SamplingSpec
 
 
 class VLLMRunner:
     name = "vllm"
+
+    def __init__(self) -> None:
+        self._llm: Any = None
+        self.peak_memory_bytes: int | None = None
 
     def setup(self, model: str, **kwargs) -> None:
         from vllm import LLM  # deferred: vllm is an optional dependency
@@ -22,8 +27,9 @@ class VLLMRunner:
         # default, which leaves RequestOutput.metrics=None and forces us into
         # the wall-time fallback path.
         kwargs.setdefault("disable_log_stats", False)
+        # max_num_seqs=1 forces sequential processing to match liteinfer v0 (B=1).
+        kwargs.setdefault("max_num_seqs", 1)
         self._llm = LLM(model=model, dtype="bfloat16", **kwargs)
-        self.peak_memory_bytes: int | None = None
 
     def generate(self, prompts: list[str], sampling: SamplingSpec) -> list[GenerationResult]:
         from vllm import SamplingParams as VLLMSamplingParams
