@@ -65,11 +65,7 @@ def _workload_section(workload: str, runs: list[dict], all_engines: list[str]) -
 def _thead(all_engines: list[str]) -> str:
     n = len(_METRIC_DEFS)
     engine_cols = "".join(f'<th colspan="{n}">{e}</th>' for e in all_engines)
-    metric_cols = "".join(
-        f"<th>{label}</th>"
-        for _ in all_engines
-        for _, label, _ in _METRIC_DEFS
-    )
+    metric_cols = "".join(f"<th>{label}</th>" for _ in all_engines for _, label, _ in _METRIC_DEFS)
     return (
         "<thead>"
         f"<tr>"

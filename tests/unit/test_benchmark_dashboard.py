@@ -10,6 +10,7 @@ from benchmarks.dashboard import _delta_class, _fmt, build_html, load_history
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _engine_metrics(**overrides) -> dict:
     base = {
         "engine": "liteinfer",
@@ -42,6 +43,7 @@ def _run(tag: str = "run", engine: str = "liteinfer", **metric_overrides) -> dic
 # load_history
 # ---------------------------------------------------------------------------
 
+
 def test_load_history_parses_jsonl(tmp_path) -> None:
     history_file = tmp_path / "history.jsonl"
     runs = [_run("a"), _run("b")]
@@ -63,6 +65,7 @@ def test_load_history_skips_blank_lines(tmp_path) -> None:
 # _fmt
 # ---------------------------------------------------------------------------
 
+
 def test_fmt_latency_converts_to_ms() -> None:
     assert _fmt("ttft_p50_s", 0.05) == "50.0 ms"
     assert _fmt("e2e_latency_p99_s", 1.234) == "1234.0 ms"
@@ -76,6 +79,7 @@ def test_fmt_throughput_uses_two_decimals() -> None:
 # ---------------------------------------------------------------------------
 # _delta_class
 # ---------------------------------------------------------------------------
+
 
 def test_delta_class_improvement_higher_is_better() -> None:
     assert _delta_class(1.1, 1.0, higher_is_better=True) == "ok"
@@ -106,6 +110,7 @@ def test_delta_class_no_previous_is_neutral() -> None:
 # ---------------------------------------------------------------------------
 # build_html
 # ---------------------------------------------------------------------------
+
 
 def test_build_html_empty_runs_returns_no_table() -> None:
     html = build_html([])

@@ -1,16 +1,11 @@
-"""Scheduler — chooses which sequences run on the next forward pass.
-
-Continuous-batching aware. Will eventually be prefix-cache aware: with
-prefix caching enabled, scheduling decisions depend on which prefixes
-are already resident in the KV cache.
-"""
+"""Scheduler — v0 policy: static batching."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.sequence import SequenceGroup
+from liteinfer.engine.sequence import SequenceGroup, SequenceStatus
 
 
 @dataclass
@@ -20,8 +15,12 @@ class SchedulerOutput:
     scheduled: list[SequenceGroup] = field(default_factory=list)
     """Sequence groups that will run a forward pass this step."""
 
+    is_new_batch: bool = False
+    """True on the first step of a new static batch (engine triggers prefill)."""
+
     preempted: list[SequenceGroup] = field(default_factory=list)
-    """Sequences evicted from the running set (e.g., to free KV blocks)."""
+    """Reserved for future variants that evict running sequences. Always
+    empty under the static-batching policy."""
 
 
 class Scheduler:
@@ -31,9 +30,29 @@ class Scheduler:
         self.running: list[SequenceGroup] = []
 
     def add(self, group: SequenceGroup) -> None:
-        """Enqueue a new sequence group for scheduling."""
-        raise NotImplementedError
+        for seq in group.sequences:
+            seq.status = SequenceStatus.WAITING
+        self.waiting.append(group)
 
     def schedule(self) -> SchedulerOutput:
-        """Pick the next batch under token / sequence / KV-block budgets."""
-        raise NotImplementedError
+        is_new_batch = False
+        if not self.running and self.waiting:
+            n = min(len(self.waiting), self.config.max_num_seqs)
+            batch, self.waiting = self.waiting[:n], self.waiting[n:]
+            for group in batch:
+                for seq in group.sequences:
+                    seq.status = SequenceStatus.RUNNING
+            self.running = batch
+            is_new_batch = True
+        return SchedulerOutput(scheduled=list(self.running), is_new_batch=is_new_batch)
+
+    def remove_finished(self) -> list[SequenceGroup]:
+        """Drop finished groups from running, return them."""
+        finished, self.running = (
+            [g for g in self.running if g.is_finished],
+            [g for g in self.running if not g.is_finished],
+        )
+        return finished
+
+    def has_unfinished(self) -> bool:
+        return bool(self.waiting or self.running)
