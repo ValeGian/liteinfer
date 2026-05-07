@@ -12,6 +12,8 @@ Run:
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import torch
 from transformers import AutoModelForCausalLM
@@ -55,7 +57,11 @@ def hf_model(model_dir):
     )
     model.eval()
     yield model
+    # Move to CPU before del: pytest's fixture cache still holds a reference to
+    # the yielded value during teardown, so del alone won't free CUDA memory.
+    model.cpu()
     del model
+    gc.collect()
     torch.cuda.empty_cache()
 
 
@@ -63,7 +69,12 @@ def hf_model(model_dir):
 def llm_no_cache(model_dir):
     llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="none")
     yield llm
+    # Move to CPU before del: pytest's fixture cache still holds a reference to
+    # the yielded value during teardown, so del alone won't free CUDA memory.
+    if llm.engine.model_runner.model is not None:
+        llm.engine.model_runner.model.cpu()
     del llm
+    gc.collect()
     torch.cuda.empty_cache()
 
 
@@ -71,7 +82,12 @@ def llm_no_cache(model_dir):
 def llm_eager_cache(model_dir):
     llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="eager")
     yield llm
+    # Move to CPU before del: pytest's fixture cache still holds a reference to
+    # the yielded value during teardown, so del alone won't free CUDA memory.
+    if llm.engine.model_runner.model is not None:
+        llm.engine.model_runner.model.cpu()
     del llm
+    gc.collect()
     torch.cuda.empty_cache()
 
 

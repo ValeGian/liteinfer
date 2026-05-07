@@ -83,3 +83,4 @@ nsight_*.sqlite
 # Agent artifacts / local sandbox
 CLAUDE.md
 .bench/
+.dev/
