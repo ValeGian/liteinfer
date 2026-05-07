@@ -60,7 +60,7 @@ logs/
 *.ggml
 
 # Local model / cache directories
-models/
+/models/
 checkpoints/
 hf_cache/
 .cache/
@@ -79,3 +79,8 @@ benchmarks/results/
 *.lprof
 nsight_*.qdrep
 nsight_*.sqlite
+
+# Agent artifacts / local sandbox
+CLAUDE.md
+.bench/
+.dev/

@@ -1,50 +1,41 @@
-"""Engine configuration.
-
-`EngineConfig` is owned by `LLMEngine` and consumed by every component
-below it (model loader, KV cache, scheduler, model runner). Treat
-instances as immutable after construction.
-"""
+# pyright: reportPrivateImportUsage=false
+"""Engine configuration. Immutable after construction."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
+
+CacheMode = Literal["eager", "none"]
 
 
 @dataclass
 class EngineConfig:
     model: str
-    """HuggingFace repo ID or local path to a model directory."""
 
     dtype: torch.dtype = torch.bfloat16
-    device: str = "cuda"
+    device: str = "auto"
 
-    # KV cache / batching
-    max_num_seqs: int = 256
-    max_num_batched_tokens: int = 8192
-    block_size: int = 16
-    gpu_memory_utilization: float = 0.9
+    cache_mode: CacheMode = "none"
+    max_num_seqs: int = 32
+    max_model_len: int = 4096
 
-    # Parallelism
-    tensor_parallel_size: int = 1
+    seed: int = 42
 
-    # Optimization toggles — opt-in, off by default while features mature.
-    enable_torch_compile: bool = False
-    enable_cuda_graph: bool = False
-    enable_prefix_caching: bool = False
-
-    # Reproducibility
-    seed: int | None = None
+    collect_stats: bool = True
 
     def __post_init__(self) -> None:
-        if self.tensor_parallel_size < 1:
-            raise ValueError("tensor_parallel_size must be >= 1")
-        if not 0.0 < self.gpu_memory_utilization <= 1.0:
-            raise ValueError("gpu_memory_utilization must be in (0, 1]")
-        if self.block_size < 1:
-            raise ValueError("block_size must be >= 1")
         if self.max_num_seqs < 1:
             raise ValueError("max_num_seqs must be >= 1")
-        if self.max_num_batched_tokens < 1:
-            raise ValueError("max_num_batched_tokens must be >= 1")
+        if self.max_model_len < 1:
+            raise ValueError("max_model_len must be >= 1")
+        if self.cache_mode not in ("eager", "none"):
+            raise ValueError(f"cache_mode must be 'eager' or 'none', got {self.cache_mode!r}")
+
+    def resolved_device(self) -> torch.device:
+        """Return the concrete `torch.device` after resolving ``"auto"``."""
+        if self.device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(self.device)

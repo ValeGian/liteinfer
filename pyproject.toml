@@ -26,6 +26,7 @@ dependencies = [
     "safetensors>=0.4",
     "huggingface-hub>=0.24",
     "numpy>=1.26",
+    "accelerate"
 ]
 
 [project.optional-dependencies]
