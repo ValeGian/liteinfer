@@ -1,5 +1,7 @@
 # liteinfer
 
+[![PyPI](https://img.shields.io/pypi/v/liteinfer)](https://pypi.org/project/liteinfer/)
+
 A lightweight, hackable LLM inference engine built from scratch — designed
 to make state-of-the-art inference techniques (paged KV cache, prefix
 caching, tensor parallelism, `torch.compile`, CUDA graphs, …) easy to read,
@@ -20,6 +22,12 @@ Single-prompt at a time, no continuous batching, no paged cache. See
 [`docs/roadmap.md`](docs/roadmap.md) for what is queued.
 
 ## Installation
+
+```bash
+pip install liteinfer
+```
+
+For development or benchmark comparisons:
 
 ```bash
 git clone https://github.com/ValeGian/liteinfer.git
