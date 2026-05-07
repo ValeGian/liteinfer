@@ -14,10 +14,10 @@ test, and benchmark.
 
 ## Status
 
-Pre-alpha. The repository is a skeleton — most components currently raise
-`NotImplementedError`. The structure, contracts, and test/benchmark
-harness are in place so that each feature can be implemented and verified
-in isolation.
+v0 — minimal end-to-end greedy/sampled inference on local safetensors.
+Single-prompt at a time, no continuous batching, no paged cache. See
+[`docs/milestones.md`](docs/milestones.md) for what is in, and
+[`docs/roadmap.md`](docs/roadmap.md) for what is queued.
 
 ## Installation
 
@@ -82,11 +82,17 @@ swapped without touching the engine.
 pin its contract.
 
 ```bash
-pytest                              # everything that runs in this env
-pytest -m "not gpu and not slow"    # the fast suite
-pytest -m gpu                       # GPU-only tests
+pytest                              # full suite — runs sequentially, GPU-safe
+pytest -m "not gpu and not slow"    # fast suite (no model downloads, no GPU)
+pytest -m gpu                       # GPU tests only — sequential, never use -n auto
+pytest -n auto                      # parallel mode — CPU-only tests only
 pytest tests/unit/                  # one directory
 ```
+
+> **GPU tests**: always run sequentially. The e2e tests (`tests/e2e/`) load
+> real models onto GPU. Running them in parallel (`-n auto`) will cause OOM or
+> cross-process interference. `tests/e2e/test_vllm_runner.py` additionally
+> requires the `bench` extras (`pip install -e ".[dev,bench]"`).
 
 Test layout:
 
@@ -116,14 +122,18 @@ workloads or new engines.
 
 ## Roadmap
 
-- [ ] Single-GPU greedy generation on Llama-family models
-- [ ] Continuous batching
-- [ ] Paged KV cache
-- [ ] Prefix caching
-- [ ] `torch.compile` integration
-- [ ] CUDA graph capture for decode
+High-level direction:
+
+- [x] Single-prompt greedy/sampled generation from local safetensors
+- [ ] Static batching (B > 1)
+- [ ] Paged KV cache → continuous batching → prefix caching
+- [ ] `torch.compile` and CUDA graphs for decode
 - [ ] Tensor parallelism (single node)
 - [ ] Speculative decoding
+
+Detailed, fine-grained backlog with scope and parity-test notes lives
+in [`docs/roadmap.md`](docs/roadmap.md). Achieved milestones are
+tracked separately in [`docs/milestones.md`](docs/milestones.md).
 
 ## License
 
