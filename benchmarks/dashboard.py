@@ -78,16 +78,41 @@ _ENGINE_TIPS: dict[str, str] = {
 }
 
 
+_DELTA_THRESHOLD = 0.05
+
+
+def _delta_class(current: float, previous: float | None, higher_is_better: bool) -> str:
+    """Return CSS class reflecting change from *previous* to *current*.
+
+    Returns "ok" for improvements > threshold, "bad" for regressions > threshold,
+    and "" when the delta is within threshold or there is no valid baseline.
+    """
+    if not previous:
+        return ""
+    ratio = current / previous if higher_is_better else previous / current
+    if ratio > 1 + _DELTA_THRESHOLD:
+        return "ok"
+    if ratio < 1 - _DELTA_THRESHOLD:
+        return "bad"
+    return ""
+
+
 def load_history(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def build_html(runs: list[dict]) -> str:
     latest: dict[str, dict] = {}
+    previous: dict[str, dict] = {}
     for run in runs:
-        latest[run["workload"]] = run
+        workload = run["workload"]
+        if workload in latest:
+            previous[workload] = latest[workload]
+        latest[workload] = run
 
-    sections = "\n".join(_workload_section(run) for run in latest.values())
+    sections = "\n".join(
+        _workload_section(run, previous.get(run["workload"])) for run in latest.values()
+    )
     n_engines = max((len(r["results"]) for r in latest.values()), default=0)
     meta = (
         f"{len(runs)} run(s) in history &nbsp;·&nbsp; "
@@ -99,7 +124,7 @@ def build_html(runs: list[dict]) -> str:
     return _page(meta, sections)
 
 
-def _workload_section(run: dict) -> str:
+def _workload_section(run: dict, prev_run: dict | None = None) -> str:
     workload = run["workload"]
     metrics = _WORKLOAD_METRICS.get(workload, _THROUGHPUT_METRICS)
     subtitle = _WORKLOAD_SUBTITLES.get(workload, "")
@@ -120,7 +145,7 @@ def _workload_section(run: dict) -> str:
         + f"<span class='meta-item'>{num_prompts} prompts · {submission}</span>"
     )
 
-    table = _comparison_table(run, metrics)
+    table = _comparison_table(run, metrics, prev_run)
     return (
         f"<section>"
         f"<h2>{workload}</h2>"
@@ -131,9 +156,12 @@ def _workload_section(run: dict) -> str:
     )
 
 
-def _comparison_table(run: dict, metrics: list[tuple[str, str, bool, str]]) -> str:
+def _comparison_table(
+    run: dict, metrics: list[tuple[str, str, bool, str]], prev_run: dict | None = None
+) -> str:
     engines = [e["engine"] for e in run["results"]]
     by_engine = {e["engine"]: e for e in run["results"]}
+    prev_by_engine = {e["engine"]: e for e in prev_run["results"]} if prev_run else {}
 
     # Baseline = first engine.
     baseline_engine = engines[0] if engines else None
@@ -161,6 +189,7 @@ def _comparison_table(run: dict, metrics: list[tuple[str, str, bool, str]]) -> s
     for engine in engines:
         data = by_engine[engine]
         is_baseline = engine == baseline_engine
+        prev_data = prev_by_engine.get(engine, {})
 
         engine_tip = _ENGINE_TIPS.get(engine, "")
         engine_cell = (
@@ -187,7 +216,7 @@ def _comparison_table(run: dict, metrics: list[tuple[str, str, bool, str]]) -> s
                 ratio_cls = "ratio-better" if ratio >= 1.0 else "ratio-worse"
                 ratio_html = f"<small class='{ratio_cls}'>{ratio:.2f}x</small>"
 
-            # Best/worst cell coloring + tooltip.
+            # Best/worst cell coloring + tooltip; fall back to cross-run delta class.
             extremes = col_extremes.get(key)
             css = ""
             cell_tip = ""
@@ -203,6 +232,8 @@ def _comparison_table(run: dict, metrics: list[tuple[str, str, bool, str]]) -> s
                     if best != 0:
                         gap = (best / worst) if higher_is_better else (worst / best)
                         cell_tip = f"Worst in column — {gap:.2f}x slower than best"
+            if not css:
+                css = _delta_class(val, prev_data.get(key), higher_is_better)
 
             inner = f'{text}{ratio_html}'
             if cell_tip:
@@ -217,8 +248,7 @@ def _comparison_table(run: dict, metrics: list[tuple[str, str, bool, str]]) -> s
 
 def _fmt(key: str, value: float) -> str:
     if key in _LATENCY_KEYS:
-        ms = value * 1000
-        return f"{ms:.0f}&thinsp;ms" if ms >= 10 else f"{ms:.1f}&thinsp;ms"
+        return f"{value * 1000:.1f} ms"
     return f"{value:.2f}"
 
 
