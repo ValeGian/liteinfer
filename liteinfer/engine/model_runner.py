@@ -8,7 +8,7 @@ import torch
 from liteinfer.cache.eager_kv_cache import EagerKVCache
 from liteinfer.cache.kv_cache import KVCache
 from liteinfer.config import EngineConfig
-from liteinfer.engine.sequence import SequenceGroup
+from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.loader import load_hf_model
 from liteinfer.tokenizer import Tokenizer
@@ -23,14 +23,14 @@ class ModelRunner:
         self.tokenizer: Tokenizer | None = None
 
         self._cache: KVCache | None = None
-        self._batch: list[SequenceGroup] = []
+        self._batch: list[Sequence] = []
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
 
-    def start_batch(self, scheduled: list[SequenceGroup]) -> None:
+    def start_batch(self, scheduled: list[Sequence]) -> None:
         if len(scheduled) != 1:
             raise NotImplementedError(
                 "v0 supports batch size 1; static batching of multiple "
@@ -50,18 +50,18 @@ class ModelRunner:
 
     @torch.inference_mode()
     def execute(
-        self, scheduled: list[SequenceGroup], is_new_batch: bool
+        self, scheduled: list[Sequence], is_new_batch: bool
     ) -> tuple[torch.Tensor, int]:
         """Run one forward pass. Returns (logits [batch, vocab], input_tokens)."""
         if scheduled != self._batch:
             raise RuntimeError("scheduled batch differs from registered batch")
 
-        seq = scheduled[0].primary
+        seq = scheduled[0]
         if self.config.cache_mode == "eager":
             return self._execute_eager(seq, is_new_batch)
         return self._execute_no_cache(seq)
 
-    def _execute_eager(self, seq, is_new_batch: bool) -> tuple[torch.Tensor, int]:
+    def _execute_eager(self, seq: Sequence, is_new_batch: bool) -> tuple[torch.Tensor, int]:
         cache_payload = self._cache.payload if self._cache is not None else None
 
         if is_new_batch:
@@ -80,7 +80,7 @@ class ModelRunner:
         logits = out.logits[:, -1, :]
         return logits, int(input_ids.shape[1])
 
-    def _execute_no_cache(self, seq) -> tuple[torch.Tensor, int]:
+    def _execute_no_cache(self, seq: Sequence) -> tuple[torch.Tensor, int]:
         all_tokens = seq.all_token_ids()
         input_ids = torch.tensor([all_tokens], dtype=torch.long, device=self.device)
         position_ids = torch.arange(input_ids.shape[1], device=self.device).unsqueeze(0)

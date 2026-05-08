@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from itertools import count
-
 from liteinfer.config import EngineConfig
 from liteinfer.engine.metrics import (
     EngineStats,
@@ -14,11 +12,7 @@ from liteinfer.engine.metrics import (
 )
 from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.scheduler import Scheduler
-from liteinfer.engine.sequence import (
-    Sequence,
-    SequenceGroup,
-    SequenceStatus,
-)
+from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
 from liteinfer.tokenizer import Tokenizer
@@ -33,7 +27,6 @@ class LLMEngine:
         self.model_runner = ModelRunner(config)
         self.sampler = Sampler()
         self.stats = EngineStats()
-        self._seq_id_gen = count(0)
         self._step_idx = 0
 
     @property
@@ -49,21 +42,20 @@ class LLMEngine:
         prompt: str,
         sampling_params: SamplingParams,
     ) -> None:
-        """Tokenize, wrap as a `SequenceGroup`, and enqueue with the scheduler."""
+        """Tokenize prompt and enqueue it with the scheduler."""
         token_ids = self.tokenizer.encode(prompt)
         if len(token_ids) >= self.config.max_model_len:
             raise ValueError(f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}")
-        seq = Sequence(seq_id=next(self._seq_id_gen), prompt_token_ids=list(token_ids))
-        group = SequenceGroup(
+        seq = Sequence(
             request_id=request_id,
-            sequences=[seq],
-            sampling_params=sampling_params,
             prompt=prompt,
+            prompt_token_ids=list(token_ids),
+            sampling_params=sampling_params,
         )
-        self.scheduler.add(group)
+        self.scheduler.add(seq)
 
-    def step(self) -> list[SequenceGroup]:
-        """Run one schedule + forward iteration. Return finished groups (if any)."""
+    def step(self) -> list[Sequence]:
+        """Run one schedule + forward iteration. Return finished sequences (if any)."""
         sched_out = self.scheduler.schedule()
         if not sched_out.scheduled:
             return []
@@ -75,7 +67,7 @@ class LLMEngine:
 
         with StepTimer(self.model_runner.device) as timer:
             logits, input_tokens = self.model_runner.execute(sched_out.scheduled, is_new_batch=sched_out.is_new_batch)
-            sampling_params = [g.sampling_params for g in sched_out.scheduled]
+            sampling_params = [seq.sampling_params for seq in sched_out.scheduled]
             sampled = self.sampler(logits, sampling_params)
 
         new_tokens = self._apply_sampled(sched_out.scheduled, sampled)
@@ -109,27 +101,22 @@ class LLMEngine:
 
     def _apply_sampled(
         self,
-        scheduled: list[SequenceGroup],
+        scheduled: list[Sequence],
         sampled,
     ) -> int:
         """Append sampled tokens, update statuses. Returns count of new tokens."""
         new_count = 0
-        for i, group in enumerate(scheduled):
-            seq = group.primary
+        for i, seq in enumerate(scheduled):
             if seq.is_finished:
                 continue
             token_id = int(sampled[i].item())
             seq.output_token_ids.append(token_id)
             new_count += 1
-            self._maybe_finish(seq, group.sampling_params, token_id)
+            self._maybe_finish(seq, token_id)
         return new_count
 
-    def _maybe_finish(
-        self,
-        seq: Sequence,
-        params: SamplingParams,
-        last_token_id: int,
-    ) -> None:
+    def _maybe_finish(self, seq: Sequence, last_token_id: int) -> None:
+        params = seq.sampling_params
         if last_token_id in self.tokenizer.eos_token_ids:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
