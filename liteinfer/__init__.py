@@ -14,4 +14,4 @@ __all__ = [
     "SamplingParams",
     "StepMetrics",
 ]
-__version__ = "0.0.6"
+__version__ = "0.1.0"
