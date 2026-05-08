@@ -75,9 +75,8 @@ class LiteInferRunner:
         finished_data: dict[str, tuple[str, list[int], float]] = {}
         try:
             while self.llm.engine.has_unfinished_requests():
-                for group in self.llm.engine.step():
-                    seq = group.primary
-                    finished_data[group.request_id] = (
+                for seq in self.llm.engine.step():
+                    finished_data[seq.request_id] = (
                         self.llm.tokenizer.decode(seq.output_token_ids),
                         list(seq.output_token_ids),
                         time.perf_counter() - t0,

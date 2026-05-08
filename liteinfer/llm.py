@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import count
 
@@ -50,7 +49,7 @@ class LLM:
 
     def generate(
         self,
-        prompts: str | Sequence[str],
+        prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
     ) -> list[RequestOutput]:
         """Generate completions. Drains all requests before returning."""
@@ -66,12 +65,11 @@ class LLM:
             req_id = f"req-{next(self._req_id_gen)}"
             self.engine.add_request(req_id, prompt, params)
             while self.engine.has_unfinished_requests():
-                for group in self.engine.step():
-                    seq = group.primary
+                for seq in self.engine.step():
                     results.append(
                         RequestOutput(
-                            request_id=group.request_id,
-                            prompt=group.prompt,
+                            request_id=seq.request_id,
+                            prompt=seq.prompt,
                             text=self.tokenizer.decode(seq.output_token_ids),
                             token_ids=list(seq.output_token_ids),
                             finish_reason=_FINISH_REASONS.get(seq.status, "stop"),

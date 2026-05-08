@@ -60,17 +60,6 @@ listed.
 - **Parity test.** Same multi-prompt workload: continuous mode produces
   the same outputs as static, with strictly higher throughput.
 
-### 1.3 Multi-sequence per request (`n > 1`)
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Sampling `n` candidates from one prompt is a common UX
-  pattern; v0 rejects it.
-- **Scope.** `SequenceGroup` already supports a list of sequences. The
-  runner must duplicate the prompt KV across `n` rows once and then
-  diverge per row. Sampler must consume one params instance per row.
-- **Parity test.** `n=1` reproduces v0; `n=4` with seeded sampling
-  produces 4 distinct, deterministic outputs.
-
 ---
 
 ## 2. KV cache implementations
