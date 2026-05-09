@@ -54,15 +54,13 @@ All 32 requests are queued at t₀; the engine processes them up to `max_num_seq
 
 20 calls of the same prompt · **sequential, no queue** · greedy · max 128 tokens · 1 warmup
 
-Each request is submitted only after the previous has finished — no queue contamination. B>1 has no effect because at most one prompt is in flight; the B=4 rows are reported only for completeness.
+Each request is submitted only after the previous has finished — no queue contamination.
 
 | Engine | B | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
 |---|---:|---:|---:|---:|---:|
 | liteinfer | 1 | 13 ms | 14 ms | 1654 ms | 75 |
 | liteinfer-kvcache | 1 | 15 ms | 16 ms | 1490 ms | 75 |
-| liteinfer-b4 | 4 | 15 ms | 15 ms | 1501 ms | 75 |
 | vllm | 1 | 26 ms | 27 ms | 693 ms | 183 |
-| vllm-b4 | 4 | 26 ms | 29 ms | 693 ms | 183 |
 
 **TTFT:** liteinfer variants show lower TTFT than vLLM for this short prompt (7 tokens). In RECOMPUTE mode the "prefill" is a 7-token forward pass with no KV-cache setup. In KV-cache mode, prefill populates the cache but there is still no subprocess IPC. vLLM's higher TTFT reflects its multi-process architecture (IPC to EngineCore subprocess, chunked-prefill scheduler) regardless of prompt length.
 

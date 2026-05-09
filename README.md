@@ -126,15 +126,13 @@ Engines: `liteinfer` (no KV cache, RECOMPUTE) · `liteinfer-kvcache` (eager KV c
 | vllm | 1 | 2.89 | 180 | 5785 ms | 11023 ms |
 | vllm-b4 | 4 | 10.67 | 650 | 1656 ms | 2963 ms |
 
-**Latency** — sequential, no queue; each request sent only after previous finishes. B>1 has no effect because at most one prompt is in flight.
+**Latency** — sequential, no queue; each request sent only after previous finishes.
 
 | Engine | B | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
 |---|---:|---:|---:|---:|---:|
 | liteinfer | 1 | 13 ms | 14 ms | 1654 ms | 75 |
 | liteinfer-kvcache | 1 | 15 ms | 16 ms | 1490 ms | 75 |
-| liteinfer-b4 | 4 | 15 ms | 15 ms | 1501 ms | 75 |
 | vllm | 1 | 26 ms | 27 ms | 693 ms | 183 |
-| vllm-b4 | 4 | 26 ms | 29 ms | 693 ms | 183 |
 
 ## Benchmarking against vLLM
 
