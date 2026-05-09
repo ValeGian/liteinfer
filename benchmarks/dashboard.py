@@ -70,6 +70,11 @@ _ENGINE_TIPS: dict[str, str] = {
         "Prefill runs once to populate the KV cache. "
         "Each decode step passes only the new token — O(1) input, O(n) attention lookup."
     ),
+    "liteinfer-native-kvcache": (
+        "liteinfer · cache_mode=native_eager (plain-tensor KV cache), max_num_seqs=1\n"
+        "Prefill runs once; each decode step passes only the new token. "
+        "KV cache stored as plain tensors — no DynamicCache wrapper overhead."
+    ),
     "liteinfer-b4": (
         "liteinfer · cache_mode=eager, max_num_seqs=4\n"
         "Static batching with B=4: up to four prompts share one PREFILL "
