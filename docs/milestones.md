@@ -4,6 +4,13 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 2026-05 — §2.4 Native eager KV cache (plain tensors, no `DynamicCache`)
+
+- **PRs.** [#11](https://github.com/ValeGian/liteinfer/pull/11)
+- **What.** `NativeEagerKVCache` stores per-layer `(K, V)` as plain tensors; duck-types `DynamicCache.update()` so attention layers consume it transparently. New `cache_mode="native_eager"`. Perf matches `EagerKVCache` (1.12× vs RECOMPUTE, Llama-3.2-1B B=1).
+
+---
+
 ## 2026-05 — §1.1 Static batching with B > 1
 
 - **PRs.** [#10](https://github.com/ValeGian/liteinfer/pull/10)
