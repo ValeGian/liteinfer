@@ -180,3 +180,137 @@ def test_pipeline_stops_on_eos(tiny_llama_dir: Path) -> None:
 
     assert out.finish_reason == "stop"
     assert len(out.token_ids) < 20
+
+
+# ---------------------------------------------------------------------------
+# Static batching with B > 1
+# ---------------------------------------------------------------------------
+
+
+def _make_llm_batched(
+    model_dir: Path, cache_mode: str = "none", max_num_seqs: int = 4
+) -> LLM:
+    return LLM(
+        str(model_dir),
+        device="cpu",
+        dtype=torch.float32,
+        cache_mode=cache_mode,  # type: ignore[arg-type]
+        max_num_seqs=max_num_seqs,
+    )
+
+
+def _by_request_id(outputs):
+    return {out.request_id: out for out in outputs}
+
+
+def test_pipeline_batched_no_cache_returns_all_outputs(tiny_llama_dir: Path) -> None:
+    """B>1 with mixed-length prompts returns one output per prompt, in input order."""
+    llm = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
+    prompts = ["tok2", "tok3 tok4 tok5", "tok6 tok7", "tok8 tok9 tok10 tok11 tok12"]
+    outputs = llm.generate(prompts, SamplingParams(max_tokens=4, temperature=0.0))
+
+    assert len(outputs) == len(prompts)
+    for prompt, out in zip(prompts, outputs, strict=True):
+        assert out.prompt == prompt
+        assert 0 < len(out.token_ids) <= 4
+        for token_id in out.token_ids:
+            assert 0 <= token_id < _VOCAB_SIZE
+
+
+def test_pipeline_batched_eager_cache_returns_all_outputs(tiny_llama_dir: Path) -> None:
+    llm = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=4)
+    prompts = ["tok2 tok3", "tok4 tok5 tok6", "tok7"]
+    outputs = llm.generate(prompts, SamplingParams(max_tokens=5, temperature=0.0))
+    assert len(outputs) == len(prompts)
+    for out in outputs:
+        assert 0 < len(out.token_ids) <= 5
+
+
+def test_pipeline_batched_greedy_parity_b1_vs_bN_no_cache(tiny_llama_dir: Path) -> None:
+    """Greedy outputs must be identical regardless of max_num_seqs (no-cache path)."""
+    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+
+    llm_b1 = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=1)
+    llm_bN = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
+    out_b1 = _by_request_id(llm_b1.generate(prompts, params))
+    out_bN = _by_request_id(llm_bN.generate(prompts, params))
+
+    assert set(out_b1) == set(out_bN)
+    for req_id, o1 in out_b1.items():
+        oN = out_bN[req_id]
+        assert o1.token_ids == oN.token_ids, (
+            f"req_id={req_id} prompt={o1.prompt!r}\n"
+            f"  B=1: {o1.token_ids}\n"
+            f"  B=N: {oN.token_ids}"
+        )
+
+
+def test_pipeline_batched_greedy_parity_b1_vs_bN_eager_cache(tiny_llama_dir: Path) -> None:
+    """Greedy outputs must be identical regardless of max_num_seqs (eager-cache path)."""
+    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+
+    llm_b1 = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=1)
+    llm_bN = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=4)
+    out_b1 = _by_request_id(llm_b1.generate(prompts, params))
+    out_bN = _by_request_id(llm_bN.generate(prompts, params))
+
+    for req_id, o1 in out_b1.items():
+        oN = out_bN[req_id]
+        assert o1.token_ids == oN.token_ids
+
+
+def test_pipeline_batched_mid_batch_eos_isolated(tiny_llama_dir: Path) -> None:
+    """When one seq in a batch hits EOS mid-decode, others continue uninterrupted."""
+    llm = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
+    original_execute = llm.engine.model_runner.execute
+
+    target_request_id = "req-1"  # second prompt only
+
+    def _execute_forcing_eos_for_target(scheduled, is_new_batch):
+        logits, n_tokens = original_execute(scheduled, is_new_batch)
+        if not is_new_batch:
+            logits = logits.clone()
+            for i, seq in enumerate(scheduled):
+                if seq.request_id == target_request_id and seq.num_output_tokens >= 2:
+                    logits[i] = float("-inf")
+                    logits[i, _EOS_ID] = 0.0
+        return logits, n_tokens
+
+    llm.engine.model_runner.execute = _execute_forcing_eos_for_target  # type: ignore[method-assign]
+
+    prompts = ["tok2", "tok3", "tok4", "tok5"]
+    outputs = llm.generate(prompts, SamplingParams(max_tokens=10, temperature=0.0))
+    by_req = _by_request_id(outputs)
+
+    finished_early = by_req[target_request_id]
+    assert finished_early.finish_reason == "stop"
+    assert len(finished_early.token_ids) < 10
+
+    for req_id, out in by_req.items():
+        if req_id == target_request_id:
+            continue
+        assert out.finish_reason == "length"
+        assert len(out.token_ids) == 10
+
+
+def test_pipeline_batched_multiple_static_batches_via_stats(tiny_llama_dir: Path) -> None:
+    """5 prompts with max_num_seqs=2 must form exactly 3 static batches.
+
+    Observable via engine.stats: count of PREFILL phases (or RECOMPUTE on no-cache)
+    equals the number of distinct batches scheduled.
+    """
+    from liteinfer.engine.metrics import Phase
+
+    llm = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=2)
+    prompts = ["tok2", "tok3", "tok4", "tok5", "tok6"]
+    outputs = llm.generate(prompts, SamplingParams(max_tokens=3, temperature=0.0))
+
+    assert len(outputs) == 5
+    prefill_steps = [s for s in llm.engine.stats.steps if s.phase == Phase.PREFILL]
+    # 5 prompts, max_num_seqs=2 → batches of size 2, 2, 1 → 3 prefill steps.
+    assert len(prefill_steps) == 3, (
+        f"expected 3 PREFILL phases, got {len(prefill_steps)}: "
+        f"{[s.phase for s in llm.engine.stats.steps]}"
+    )

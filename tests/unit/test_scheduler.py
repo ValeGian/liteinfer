@@ -70,3 +70,45 @@ def test_next_batch_starts_after_drain() -> None:
     out = sched.schedule()
     assert out.is_new_batch
     assert out.scheduled[0].request_id == "req-2"
+
+
+def test_schedule_pulls_up_to_max_num_seqs() -> None:
+    """With max_num_seqs=3 and 5 waiting, first batch has 3 and 2 remain waiting."""
+    sched = _make_scheduler(max_num_seqs=3)
+    for i in range(5):
+        sched.add(_make_sequence(f"req-{i}"))
+    out = sched.schedule()
+    assert out.is_new_batch
+    assert len(out.scheduled) == 3
+    assert [s.request_id for s in out.scheduled] == ["req-0", "req-1", "req-2"]
+    assert [s.request_id for s in sched.waiting] == ["req-3", "req-4"]
+
+
+def test_schedule_does_not_refill_partial_running_batch() -> None:
+    """Strict static policy: no new seqs join a batch while it is still running."""
+    sched = _make_scheduler(max_num_seqs=4)
+    for i in range(2):
+        sched.add(_make_sequence(f"req-{i}"))
+    sched.schedule()  # 2 running, capacity for 2 more
+
+    sched.add(_make_sequence("req-2"))
+    sched.add(_make_sequence("req-3"))
+
+    out = sched.schedule()
+    assert not out.is_new_batch
+    assert [s.request_id for s in out.scheduled] == ["req-0", "req-1"]
+    assert [s.request_id for s in sched.waiting] == ["req-2", "req-3"]
+
+
+def test_schedule_drains_all_then_starts_new_batch() -> None:
+    """After every running seq finishes, scheduler picks a fresh batch from waiting."""
+    sched = _make_scheduler(max_num_seqs=2)
+    for i in range(4):
+        sched.add(_make_sequence(f"req-{i}"))
+    sched.schedule()  # batch [0,1]
+    for s in sched.running:
+        s.status = SequenceStatus.FINISHED_STOPPED
+    sched.remove_finished()
+    out = sched.schedule()
+    assert out.is_new_batch
+    assert [s.request_id for s in out.scheduled] == ["req-2", "req-3"]
