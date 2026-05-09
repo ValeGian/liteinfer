@@ -15,6 +15,7 @@ import torch
 
 from liteinfer.cache.eager_kv_cache import EagerKVCache
 from liteinfer.cache.kv_cache import KVCache
+from liteinfer.cache.native_eager_kv_cache import NativeEagerKVCache
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import build_for_model
 from liteinfer.engine.sequence import Sequence
@@ -49,6 +50,8 @@ class ModelRunner:
         self._max_prompt_len = max(self._prompt_lens)
         if self.config.cache_mode == "eager":
             self._cache = EagerKVCache(self.config, self.hf_config)
+        elif self.config.cache_mode == "native_eager":
+            self._cache = NativeEagerKVCache(self.config)
         else:
             self._cache = None
 
@@ -68,7 +71,7 @@ class ModelRunner:
         if scheduled != self._batch:
             raise RuntimeError("scheduled batch differs from registered batch")
 
-        if self.config.cache_mode == "eager":
+        if self.config.cache_mode in ("eager", "native_eager"):
             return self._execute_eager(is_new_batch)
         return self._execute_no_cache()
 

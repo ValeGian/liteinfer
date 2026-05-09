@@ -85,17 +85,6 @@ listed.
 - **Risk.** Quality regression on long contexts; needs a tolerance
   parity test against fp16/bf16.
 
-### 2.4 Native `EagerKVCache` (drop `DynamicCache` wrapper)
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Removes last inference-path dependency on
-  `transformers.cache_utils`.
-- **Scope.** Rewrite `cache/eager_kv_cache.py` as per-layer
-  `(K, V)` tensor list; update vendored attention layers to consume
-  it directly.
-- **Parity test.** Greedy outputs identical to wrapper-based eager
-  cache on Llama-3.2-1B.
-
 ---
 
 ## 3. Performance optimizations

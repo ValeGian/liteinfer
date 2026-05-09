@@ -9,5 +9,6 @@ which cache is in use.
 
 from liteinfer.cache.eager_kv_cache import EagerKVCache
 from liteinfer.cache.kv_cache import KVCache
+from liteinfer.cache.native_eager_kv_cache import NativeEagerKVCache
 
-__all__ = ["EagerKVCache", "KVCache"]
+__all__ = ["EagerKVCache", "KVCache", "NativeEagerKVCache"]

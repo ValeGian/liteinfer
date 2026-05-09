@@ -261,6 +261,77 @@ def test_pipeline_batched_greedy_parity_b1_vs_bN_eager_cache(tiny_llama_dir: Pat
         assert o1.token_ids == oN.token_ids
 
 
+# ---------------------------------------------------------------------------
+# Native eager KV cache
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_native_eager_cache_returns_request_output(tiny_llama_dir: Path) -> None:
+    llm = _make_llm(tiny_llama_dir, cache_mode="native_eager")
+    outputs = llm.generate("hello world", SamplingParams(max_tokens=4, temperature=0.0))
+    assert len(outputs) == 1
+    out = outputs[0]
+    assert isinstance(out.token_ids, list)
+    assert 0 < len(out.token_ids) <= 4
+
+
+def test_pipeline_native_eager_cache_token_ids_in_vocab_range(tiny_llama_dir: Path) -> None:
+    llm = _make_llm(tiny_llama_dir, cache_mode="native_eager")
+    out = llm.generate("hello world", SamplingParams(max_tokens=8, temperature=0.0))[0]
+    for token_id in out.token_ids:
+        assert 0 <= token_id < _VOCAB_SIZE
+
+
+def test_pipeline_greedy_parity_eager_cache_vs_native_eager_cache(tiny_llama_dir: Path) -> None:
+    """native_eager must produce the same token sequence as eager (DynamicCache)."""
+    llm_eager = _make_llm(tiny_llama_dir, cache_mode="eager")
+    llm_native = _make_llm(tiny_llama_dir, cache_mode="native_eager")
+    params = SamplingParams(max_tokens=10, temperature=0.0)
+    prompt = "tok2 tok3 tok4"
+    out_eager = llm_eager.generate(prompt, params)[0]
+    out_native = llm_native.generate(prompt, params)[0]
+    assert out_eager.token_ids == out_native.token_ids, (f"cache-mode mismatch: eager={out_eager.token_ids} native_eager={out_native.token_ids}")
+
+
+def test_pipeline_batched_native_eager_cache_returns_all_outputs(tiny_llama_dir: Path) -> None:
+    llm = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=4)
+    prompts = ["tok2 tok3", "tok4 tok5 tok6", "tok7"]
+    outputs = llm.generate(prompts, SamplingParams(max_tokens=5, temperature=0.0))
+    assert len(outputs) == len(prompts)
+    for out in outputs:
+        assert 0 < len(out.token_ids) <= 5
+
+
+def test_pipeline_batched_greedy_parity_b1_vs_bN_native_eager_cache(tiny_llama_dir: Path) -> None:
+    """Greedy outputs must be identical regardless of max_num_seqs (native-eager path)."""
+    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+
+    llm_b1 = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=1)
+    llm_bN = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=4)
+    out_b1 = _by_request_id(llm_b1.generate(prompts, params))
+    out_bN = _by_request_id(llm_bN.generate(prompts, params))
+
+    for req_id, o1 in out_b1.items():
+        oN = out_bN[req_id]
+        assert o1.token_ids == oN.token_ids
+
+
+def test_pipeline_batched_greedy_parity_eager_vs_native_eager_batched(tiny_llama_dir: Path) -> None:
+    """Batched native_eager must match batched eager (DynamicCache) token-for-token."""
+    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
+    params = SamplingParams(max_tokens=6, temperature=0.0)
+
+    llm_eager = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=4)
+    llm_native = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=4)
+    out_eager = _by_request_id(llm_eager.generate(prompts, params))
+    out_native = _by_request_id(llm_native.generate(prompts, params))
+
+    for req_id, oe in out_eager.items():
+        on = out_native[req_id]
+        assert oe.token_ids == on.token_ids, f"req_id={req_id}\n  eager={oe.token_ids}\n  native_eager={on.token_ids}"
+
+
 def test_pipeline_batched_mid_batch_eos_isolated(tiny_llama_dir: Path) -> None:
     """When one seq in a batch hits EOS mid-decode, others continue uninterrupted."""
     llm = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
