@@ -45,11 +45,16 @@ class Scheduler:
         return SchedulerOutput(scheduled=list(self.running), is_new_batch=is_new_batch)
 
     def remove_finished(self) -> list[Sequence]:
-        """Drop finished sequences from running, return them."""
-        finished, self.running = (
-            [s for s in self.running if s.is_finished],
-            [s for s in self.running if not s.is_finished],
-        )
+        """Drain the running batch only when *every* member has finished.
+
+        Strict static-batching policy: a batch enters together (one prefill),
+        decodes together, and leaves together. Members that finish early stay
+        in ``running`` so the runner keeps a stable shape until the slowest
+        sequence is done.
+        """
+        if not self.running or any(not s.is_finished for s in self.running):
+            return []
+        finished, self.running = self.running, []
         return finished
 
     def has_unfinished(self) -> bool:
