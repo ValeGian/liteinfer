@@ -8,7 +8,7 @@ from typing import Literal
 
 import torch
 
-CacheMode = Literal["eager", "none"]
+CacheMode = Literal["eager", "native_eager", "none"]
 
 
 @dataclass
@@ -31,8 +31,10 @@ class EngineConfig:
             raise ValueError("max_num_seqs must be >= 1")
         if self.max_model_len < 1:
             raise ValueError("max_model_len must be >= 1")
-        if self.cache_mode not in ("eager", "none"):
-            raise ValueError(f"cache_mode must be 'eager' or 'none', got {self.cache_mode!r}")
+        if self.cache_mode not in ("eager", "native_eager", "none"):
+            raise ValueError(
+                f"cache_mode must be 'eager', 'native_eager', or 'none', got {self.cache_mode!r}"
+            )
 
     def resolved_device(self) -> torch.device:
         """Return the concrete `torch.device` after resolving ``"auto"``."""
