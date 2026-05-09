@@ -37,17 +37,6 @@ listed.
 
 ## 1. Batching and scheduling
 
-### 1.1 Static batching with B > 1
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** v0 caps the runner at batch size 1; throughput on multi-prompt
-  workloads is a fraction of single-GPU peak.
-- **Scope.** `engine/model_runner.py` (left-padding, attention masks,
-  per-seq position ids), `engine/scheduler.py` (`start_batch` >1),
-  finish-mask bookkeeping in `engine/llm_engine.py`. Early-finished
-  sequences either masked out or dropped from cache mid-batch.
-- **Parity test.** B=1 vs B=8: greedy outputs identical.
-
 ### 1.2 Continuous batching
 - **Status.** `planned`
 - **PRs.** _none yet_
