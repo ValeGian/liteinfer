@@ -12,6 +12,7 @@ from liteinfer.engine.metrics import Phase, StepMetrics
 
 class LiteInferRunner:
     name = "liteinfer"
+    batch_size = 1
 
     def __init__(self) -> None:
         self.llm: LLM | None = None

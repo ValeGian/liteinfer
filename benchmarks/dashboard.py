@@ -61,19 +61,30 @@ _WORKLOAD_SUBTITLES: dict[str, str] = {
 
 _ENGINE_TIPS: dict[str, str] = {
     "liteinfer": (
-        "liteinfer v0 · cache_mode=none (RECOMPUTE)\n"
+        "liteinfer · cache_mode=none (RECOMPUTE), max_num_seqs=1\n"
         "Every step re-feeds the full and growing sequence. "
-        "No KV cache — decode cost grows linearly with sequence length. v0 default."
+        "No KV cache — decode cost grows linearly with sequence length."
     ),
     "liteinfer-kvcache": (
-        "liteinfer v0 · cache_mode=eager (DynamicCache)\n"
+        "liteinfer · cache_mode=eager (DynamicCache), max_num_seqs=1\n"
         "Prefill runs once to populate the KV cache. "
         "Each decode step passes only the new token — O(1) input, O(n) attention lookup."
+    ),
+    "liteinfer-b4": (
+        "liteinfer · cache_mode=eager, max_num_seqs=4\n"
+        "Static batching with B=4: up to four prompts share one PREFILL "
+        "and decode together until every member finishes. Eager KV cache; "
+        "left-padded prefill with pad-aware additive attention mask."
     ),
     "vllm": (
         "vLLM 0.20.0 · max_num_seqs=1 (B=1)\n"
         "FlashAttention 2, torch.compile, CUDA graphs for decode, "
         "paged KV cache, prefix caching enabled."
+    ),
+    "vllm-b4": (
+        "vLLM 0.20.0 · max_num_seqs=4 (B=4)\n"
+        "Continuous batching of up to 4 sequences. Same kernels as vllm B=1: "
+        "FlashAttention 2, torch.compile, CUDA graphs, paged KV, prefix caching."
     ),
 }
 
@@ -129,7 +140,6 @@ def _workload_section(run: dict, prev_run: dict | None = None) -> str:
     metrics = _WORKLOAD_METRICS.get(workload, _THROUGHPUT_METRICS)
     subtitle = _WORKLOAD_SUBTITLES.get(workload, "")
     num_prompts = run.get("num_prompts", "?")
-    batch_size = run.get("batch_size", 1)
     tag = run.get("tag", "")
     model = run.get("model", "")
     model_short = model.split("/")[-1]
@@ -141,7 +151,6 @@ def _workload_section(run: dict, prev_run: dict | None = None) -> str:
         f"<span class='meta-item'>📅 {ts}</span>"
         + (f"<span class='meta-item tag-pill'>{tag}</span>" if tag else "")
         + f"<span class='meta-item' title='{model}'>🤖 {model_short}</span>"
-        + f"<span class='meta-item'>batch_size={batch_size}</span>"
         + f"<span class='meta-item'>{num_prompts} prompts · {submission}</span>"
     )
 
@@ -182,7 +191,15 @@ def _comparison_table(
         f'<th><span class="tip-host" data-tip="{_escape(tip)}">{label}</span></th>'
         for _, label, _, tip in metrics
     )
-    thead = f"<thead><tr><th class='l'>Engine (B=1)</th>{metric_headers}</tr></thead>"
+    batch_tip = (
+        "max_num_seqs the engine was configured with. B=1 disables batching; "
+        "B=N lets the scheduler run up to N sequences in one forward pass."
+    )
+    thead = (
+        f"<thead><tr><th class='l'>Engine</th>"
+        f"<th><span class='tip-host' data-tip='{_escape(batch_tip)}'>B</span></th>"
+        f"{metric_headers}</tr></thead>"
+    )
 
     # Data rows.
     rows: list[str] = []
@@ -196,8 +213,10 @@ def _comparison_table(
             f'<td class="engine"><span class="tip-host" data-tip="{_escape(engine_tip)}">'
             f'{engine}</span></td>'
         )
+        batch_size = data.get("batch_size", 1)
+        batch_cell = f'<td class="batch">{batch_size}</td>'
 
-        cells: list[str] = [engine_cell]
+        cells: list[str] = [engine_cell, batch_cell]
         for key, _, higher_is_better, _ in metrics:
             val = data.get(key)
             if val is None:
