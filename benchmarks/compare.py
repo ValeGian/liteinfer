@@ -82,6 +82,9 @@ def main() -> None:
 
     for engine_name in args.engines:
         runner = RUNNERS[engine_name]()
+        if workload.sequential and int(getattr(runner, "batch_size", 1)) > 1:
+            print(f"Skipping {engine_name}: batch_size > 1 not allowed in latency workloads.")
+            continue
         runner.setup(args.model)
         try:
             for _ in range(args.warmup):
