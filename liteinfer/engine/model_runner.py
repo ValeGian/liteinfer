@@ -16,7 +16,7 @@ import torch
 from liteinfer.cache.eager_kv_cache import EagerKVCache
 from liteinfer.cache.kv_cache import KVCache
 from liteinfer.config import EngineConfig
-from liteinfer.engine.attention_mask import build_additive_mask
+from liteinfer.engine.attention_mask import build_for_model
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.loader import load_hf_model
@@ -85,7 +85,9 @@ class ModelRunner:
             input_ids, position_ids = self._build_decode_inputs()
             past_len = self._max_prompt_len + (self._current_decode_step() - 1)
 
-        attention_mask = build_additive_mask(
+        attention_mask = build_for_model(
+            type(self.model).__name__,
+            hf_config=self.hf_config,
             prompt_lens=self._prompt_lens,
             query_len=int(input_ids.shape[1]),
             past_len=past_len,
@@ -120,7 +122,9 @@ class ModelRunner:
             input_ids[i, offset:] = torch.tensor(tokens, dtype=torch.long, device=self.device)
             position_ids[i, offset:] = torch.arange(len(tokens), device=self.device)
 
-        attention_mask = build_additive_mask(
+        attention_mask = build_for_model(
+            type(self.model).__name__,
+            hf_config=self.hf_config,
             prompt_lens=seq_lens,
             query_len=max_len,
             past_len=0,

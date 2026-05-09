@@ -29,6 +29,7 @@ def build_additive_mask(
     past_len: int,
     dtype: torch.dtype,
     device: torch.device,
+    sliding_window: int | None = None,
 ) -> torch.Tensor:
     """Build the additive attention mask for a static batch.
 
@@ -42,6 +43,12 @@ def build_additive_mask(
             decode steps.
         dtype: Mask dtype; must match the attention score tensor's dtype.
         device: Mask device.
+        sliding_window: When set, additionally masks key columns more
+            than ``sliding_window - 1`` positions before each query.
+            Because all batch rows share the same left-padding scheme,
+            the column distance between query and key equals the true
+            position distance — the constraint is therefore batch- and
+            pad-independent.
 
     Returns:
         Tensor shaped ``[B, 1, query_len, past_len + query_len]``.
@@ -52,6 +59,8 @@ def build_additive_mask(
     is_prefill = past_len == 0
     if is_prefill and query_len < max_prompt_len:
         raise ValueError(f"prefill query_len={query_len} cannot be smaller than max prompt length {max_prompt_len}")
+    if sliding_window is not None and sliding_window < 1:
+        raise ValueError(f"sliding_window must be >= 1, got {sliding_window}")
 
     batch_size = len(prompt_lens)
     key_len = past_len + query_len
@@ -65,6 +74,15 @@ def build_additive_mask(
             diagonal=1,
         )
         mask[:, :, :, past_len:] = causal[None, None]
+
+    if sliding_window is not None and sliding_window < key_len:
+        # Mask key columns farther than (sliding_window - 1) before each query.
+        # Query at column index (past_len + q) sees keys at columns
+        # [past_len + q - sliding_window + 1, past_len + q].
+        for q in range(query_len):
+            cutoff = past_len + q - sliding_window + 1
+            if cutoff > 0:
+                mask[:, :, q, :cutoff] = neg_inf
 
     if is_prefill:
         # Left padding lives in the first (max_prompt_len - prompt_len_i) columns
@@ -88,3 +106,79 @@ def build_additive_mask(
             mask[i, 0, :, :pad] = neg_inf
 
     return mask
+
+
+def build_for_model(
+    model_class_name: str,
+    *,
+    hf_config,
+    prompt_lens: Sequence[int],
+    query_len: int,
+    past_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Per-model dispatch returning the right ``attention_mask`` payload.
+
+    ``LlamaForCausalLM`` consumes a single additive tensor; Gemma4 consumes a
+    ``{"full_attention", "sliding_attention"}`` dict because its layers mix
+    full and sliding attention. New architectures register themselves by
+    extending this dispatch.
+    """
+    if model_class_name == "LlamaForCausalLM":
+        return build_additive_mask(
+            prompt_lens=prompt_lens,
+            query_len=query_len,
+            past_len=past_len,
+            dtype=dtype,
+            device=device,
+        )
+    if model_class_name == "Gemma4ForCausalLM":
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sliding_window = int(text_config.sliding_window)
+        return build_gemma4_mask_dict(
+            prompt_lens=prompt_lens,
+            query_len=query_len,
+            past_len=past_len,
+            dtype=dtype,
+            device=device,
+            sliding_window=sliding_window,
+        )
+    raise NotImplementedError(f"no attention-mask builder registered for model class {model_class_name!r}")
+
+
+def build_gemma4_mask_dict(
+    prompt_lens: Sequence[int],
+    query_len: int,
+    past_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: int,
+) -> dict[str, torch.Tensor]:
+    """Two-layer-type mask dict consumed by ``Gemma4TextModel.forward``.
+
+    Returns a ``{"full_attention": ..., "sliding_attention": ...}`` map
+    whose values are pad- and causal-aware additive masks. The full
+    layers receive a standard causal+pad mask; sliding layers receive
+    the same plus a sliding-window cutoff. The dict is passed verbatim
+    via ``attention_mask=`` so the model skips its internal
+    ``create_causal_mask`` / ``create_sliding_window_causal_mask``
+    helpers, which expect a 2D ``[B, S]`` boolean and would otherwise
+    drop our padding information.
+    """
+    full = build_additive_mask(
+        prompt_lens=prompt_lens,
+        query_len=query_len,
+        past_len=past_len,
+        dtype=dtype,
+        device=device,
+    )
+    sliding = build_additive_mask(
+        prompt_lens=prompt_lens,
+        query_len=query_len,
+        past_len=past_len,
+        dtype=dtype,
+        device=device,
+        sliding_window=sliding_window,
+    )
+    return {"full_attention": full, "sliding_attention": sliding}
