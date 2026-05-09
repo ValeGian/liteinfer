@@ -4,6 +4,13 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 2026-05 — §1.1 Static batching with B > 1
+
+- **PRs.** [#10](https://github.com/ValeGian/liteinfer/pull/10)
+- **What.** Static batching now respects `EngineConfig.max_num_seqs` end-to-end. `LLM.generate` submits all prompts up front and drains the engine, letting the scheduler form batches of up to `max_num_seqs` sequences. `ModelRunner` left-pads variable-length prompts for prefill and threads an additive attention mask (new `liteinfer/engine/attention_mask.py`) through each model's `forward(attention_mask=...)`. Strict-static policy: a batch enters together (one prefill), runs to completion, exits together — early finishers stay in the running set so tensor shapes are stable. Both Llama (single-tensor mask) and Gemma4 (dict of `full_attention` / `sliding_attention` tensors with sliding-window cutoff) are batched; per-model mask shape is selected by `attention_mask.build_for_model`.
+
+---
+
 ## 2026-05 — §4.1 e2e parity test vs `transformers`
 
 - **PRs.** [#3](https://github.com/ValeGian/liteinfer/pull/3)

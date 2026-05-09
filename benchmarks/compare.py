@@ -24,9 +24,10 @@ from benchmarks.workloads import WORKLOADS
 
 _MS = 1000.0
 
-# Throughput: all requests submitted at once, B=1 queue. Shows req/s and E2E under load.
+# Throughput: all requests submitted at once, engine queues at its max_num_seqs. Shows req/s and E2E under load.
 _THROUGHPUT_COLS: list[tuple[str, int, str]] = [
-    ("Engine (B=1)", 18, "engine"),
+    ("Engine", 20, "engine"),
+    ("B", 4, "batch_size"),
     ("req/s", 8, "requests_per_second"),
     ("tok/s", 8, "output_tokens_per_second"),
     ("E2E p50", 13, "e2e_latency_p50_s"),
@@ -35,7 +36,8 @@ _THROUGHPUT_COLS: list[tuple[str, int, str]] = [
 
 # Latency: one request at a time, no queue. Shows TTFT and per-request E2E.
 _LATENCY_COLS: list[tuple[str, int, str]] = [
-    ("Engine (B=1)", 18, "engine"),
+    ("Engine", 20, "engine"),
+    ("B", 4, "batch_size"),
     ("TTFT p50", 13, "ttft_p50_s"),
     ("TTFT p99", 13, "ttft_p99_s"),
     ("E2E p50", 13, "e2e_latency_p50_s"),
@@ -80,6 +82,9 @@ def main() -> None:
 
     for engine_name in args.engines:
         runner = RUNNERS[engine_name]()
+        if workload.sequential and int(getattr(runner, "batch_size", 1)) > 1:
+            print(f"Skipping {engine_name}: batch_size > 1 not allowed in latency workloads.")
+            continue
         runner.setup(args.model)
         try:
             for _ in range(args.warmup):
@@ -92,7 +97,14 @@ def main() -> None:
             runner.teardown()
 
         peak_memory = getattr(runner, "peak_memory_bytes", None)
-        metrics = summarize(engine_name, results, wall_time_s=wall, peak_memory_bytes=peak_memory)
+        batch_size = int(getattr(runner, "batch_size", 1))
+        metrics = summarize(
+            engine_name,
+            results,
+            wall_time_s=wall,
+            peak_memory_bytes=peak_memory,
+            batch_size=batch_size,
+        )
         all_metrics.append(metrics)
 
     _print_table(all_metrics, workload, timestamp, args.tag)
@@ -102,7 +114,6 @@ def main() -> None:
         "tag": args.tag,
         "workload": workload.name,
         "model": args.model,
-        "batch_size": 1,
         "sequential": workload.sequential,
         "num_prompts": len(workload.prompts),
         "results": [m.as_dict() for m in all_metrics],
@@ -144,7 +155,7 @@ def _print_table(
     tag_part = f"  [{tag}]" if tag else ""
     print(
         f"\nWorkload: {workload.name}  |  {len(workload.prompts)} prompts  |  {submission}"
-        f"\nbatch_size=1  |  {timestamp}{tag_part}\n"
+        f"\n{timestamp}{tag_part}\n"
     )
 
     header = "  ".join(
@@ -168,6 +179,8 @@ def _format_row(m: BenchmarkMetrics, cols: list[tuple[str, int, str]]) -> str:
         val = getattr(m, attr)
         if i == 0:
             cells.append(f"{val:<{w}}")
+        elif isinstance(val, int):
+            cells.append(f"{val}".rjust(w))
         elif attr.endswith("_s"):
             cells.append(f"{val * _MS:.1f} ms".rjust(w))
         else:

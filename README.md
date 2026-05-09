@@ -112,26 +112,27 @@ See `tests/README.md` for conventions.
 
 ## Performance
 
-Llama-3.2-1B-Instruct · greedy · NVIDIA A40 · **batch size 1** (all engines)
-liteinfer v0.0.6 vs vLLM 0.20.0 — see [`docs/benchmarks.md`](docs/benchmarks.md) for full setup and methodology, or open the **[interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)** for a visual comparison.
+Llama-3.2-1B-Instruct · greedy · NVIDIA A40 — see [`docs/benchmarks.md`](docs/benchmarks.md) for full setup and methodology, or open the **[interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)** for a visual comparison.
 
-`liteinfer` = no KV cache (RECOMPUTE mode, v0 default) · `liteinfer-kvcache` = eager KV cache enabled
+Engines: `liteinfer` (no KV cache, RECOMPUTE) · `liteinfer-kvcache` (eager KV cache) · `liteinfer-b4` (eager KV cache + static batching B=4) · `vllm` (B=1) · `vllm-b4` (B=4).
 
-**Throughput** — 32 requests submitted at once, engine queues them (B=1 → sequential). E2E includes queue wait time.
+**Throughput** — 32 requests submitted at once. E2E includes queue wait time.
 
-| Engine (B=1) | req/s | tok/s | E2E p50 | E2E p99 |
-|---|---:|---:|---:|---:|
-| liteinfer | 1.69 | 70 | 11956 ms | 18914 ms |
-| liteinfer-kvcache | 1.77 | 71 | 10480 ms | 18114 ms |
-| vllm | 2.89 | 180 | 5786 ms | 11042 ms |
+| Engine | B | req/s | tok/s | E2E p50 | E2E p99 |
+|---|---:|---:|---:|---:|---:|
+| liteinfer | 1 | 1.81 | 75 | 11193 ms | 17662 ms |
+| liteinfer-kvcache | 1 | 1.87 | 75 | 9865 ms | 17100 ms |
+| liteinfer-b4 | 4 | 4.42 | 182 | 4096 ms | 7234 ms |
+| vllm | 1 | 2.89 | 180 | 5785 ms | 11023 ms |
+| vllm-b4 | 4 | 10.67 | 650 | 1656 ms | 2963 ms |
 
 **Latency** — sequential, no queue; each request sent only after previous finishes.
 
-| Engine (B=1) | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
-|---|---:|---:|---:|---:|
-| liteinfer | 14 ms | 16 ms | 1726 ms | 72 |
-| liteinfer-kvcache | 15 ms | 17 ms | 1541 ms | 72 |
-| vllm | 26 ms | 31 ms | 694 ms | 182 |
+| Engine | B | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
+|---|---:|---:|---:|---:|---:|
+| liteinfer | 1 | 13 ms | 14 ms | 1654 ms | 75 |
+| liteinfer-kvcache | 1 | 15 ms | 16 ms | 1490 ms | 75 |
+| vllm | 1 | 26 ms | 27 ms | 693 ms | 183 |
 
 ## Benchmarking against vLLM
 

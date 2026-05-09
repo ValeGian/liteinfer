@@ -15,6 +15,7 @@ from benchmarks.runners.base import GenerationResult
 @dataclass
 class BenchmarkMetrics:
     engine: str
+    batch_size: int
     num_requests: int
     output_tokens: int
     wall_time_s: float
@@ -39,12 +40,14 @@ def summarize(
     results: list[GenerationResult],
     wall_time_s: float,
     peak_memory_bytes: int | None = None,
+    batch_size: int = 1,
 ) -> BenchmarkMetrics:
     output_tokens = sum(len(r.output_token_ids) for r in results)
     ttfts = sorted(r.ttft_s for r in results)
     e2e = sorted(r.total_time_s for r in results)
     return BenchmarkMetrics(
         engine=engine,
+        batch_size=batch_size,
         num_requests=len(results),
         output_tokens=output_tokens,
         wall_time_s=wall_time_s,

@@ -245,6 +245,7 @@ class LlamaModel(nn.Module):
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> CausalLMOutput:
         inputs_embeds = self.embed_tokens(input_ids)
         seq_len = inputs_embeds.shape[1]
@@ -255,9 +256,8 @@ class LlamaModel(nn.Module):
                 past_len, past_len + seq_len, device=inputs_embeds.device
             ).unsqueeze(0)
 
-        attention_mask = _build_causal_mask(
-            seq_len, past_len, inputs_embeds.dtype, inputs_embeds.device
-        )
+        if attention_mask is None:
+            attention_mask = _build_causal_mask(seq_len, past_len, inputs_embeds.dtype, inputs_embeds.device)
 
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
@@ -296,11 +296,13 @@ class LlamaForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            attention_mask=attention_mask,
         )
         logits = self.lm_head(outputs.logits)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)

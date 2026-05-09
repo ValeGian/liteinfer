@@ -71,4 +71,15 @@ def test_as_dict_includes_e2e_fields() -> None:
     assert "e2e_latency_p99_s" in d
 
 
+def test_summarize_batch_size_defaults_to_one() -> None:
+    m = summarize("engine", [_make_result(0.1, 0.5)], wall_time_s=1.0)
+    assert m.batch_size == 1
+
+
+def test_summarize_batch_size_passed_through() -> None:
+    m = summarize("engine", [_make_result(0.1, 0.5)], wall_time_s=1.0, batch_size=4)
+    assert m.batch_size == 4
+    assert m.as_dict()["batch_size"] == 4
+
+
 pytest_approx = pytest.approx

@@ -52,27 +52,30 @@ class LLM:
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
     ) -> list[RequestOutput]:
-        """Generate completions. Drains all requests before returning."""
+        """Generate completions. Submits all requests, then drains the engine.
+
+        Output order matches input ``prompts`` order regardless of which
+        sequences finish first inside a static batch.
+        """
         if isinstance(prompts, str):
             prompts = [prompts]
         params = sampling_params or SamplingParams()
 
-        # v0 runs one prompt per static batch — submit and drain each
-        # request before moving on. Collapses into one submit-then-drain
-        # once batched execution lands.
-        results: list[RequestOutput] = []
+        request_ids: list[str] = []
         for prompt in prompts:
             req_id = f"req-{next(self._req_id_gen)}"
             self.engine.add_request(req_id, prompt, params)
-            while self.engine.has_unfinished_requests():
-                for seq in self.engine.step():
-                    results.append(
-                        RequestOutput(
-                            request_id=seq.request_id,
-                            prompt=seq.prompt,
-                            text=self.tokenizer.decode(seq.output_token_ids),
-                            token_ids=list(seq.output_token_ids),
-                            finish_reason=_FINISH_REASONS.get(seq.status, "stop"),
-                        )
-                    )
-        return results
+            request_ids.append(req_id)
+
+        finished_by_id: dict[str, RequestOutput] = {}
+        while self.engine.has_unfinished_requests():
+            for seq in self.engine.step():
+                finished_by_id[seq.request_id] = RequestOutput(
+                    request_id=seq.request_id,
+                    prompt=seq.prompt,
+                    text=self.tokenizer.decode(seq.output_token_ids),
+                    token_ids=list(seq.output_token_ids),
+                    finish_reason=_FINISH_REASONS.get(seq.status, "stop"),
+                )
+
+        return [finished_by_id[req_id] for req_id in request_ids]

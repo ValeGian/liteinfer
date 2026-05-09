@@ -10,6 +10,7 @@ from benchmarks.runners.base import GenerationResult, SamplingSpec
 
 class VLLMRunner:
     name = "vllm"
+    batch_size = 1
 
     def __init__(self) -> None:
         self._llm: Any = None
