@@ -157,7 +157,7 @@ workloads or new engines.
 High-level direction:
 
 - [x] Single-prompt greedy/sampled generation from local safetensors
-- [ ] Static batching (B > 1)
+- [x] Static batching (B > 1)
 - [ ] Paged KV cache → continuous batching → prefix caching
 - [ ] `torch.compile` and CUDA graphs for decode
 - [ ] Tensor parallelism (single node)
