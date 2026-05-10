@@ -17,7 +17,7 @@ test, and benchmark.
 ## Status
 
 v0 — minimal end-to-end greedy/sampled inference on local safetensors.
-Single-prompt at a time, no continuous batching, no paged cache. See
+Static batching (B > 1), paged KV cache. No continuous batching yet. See
 [`docs/milestones.md`](docs/milestones.md) for what is in, and
 [`docs/roadmap.md`](docs/roadmap.md) for what is queued.
 
@@ -114,25 +114,27 @@ See `tests/README.md` for conventions.
 
 Llama-3.2-1B-Instruct · greedy · NVIDIA A40 — see [`docs/benchmarks.md`](docs/benchmarks.md) for full setup and methodology, or open the **[interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)** for a visual comparison.
 
-Engines: `liteinfer` (no KV cache, RECOMPUTE) · `liteinfer-kvcache` (eager KV cache) · `liteinfer-b4` (eager KV cache + static batching B=4) · `vllm` (B=1) · `vllm-b4` (B=4).
+Engines: `liteinfer` (no KV cache, RECOMPUTE) · `liteinfer-kvcache` (eager KV cache) · `liteinfer-paged-kvcache` (paged KV cache) · `liteinfer-b4` (eager KV cache + static batching B=4) · `vllm` (B=1) · `vllm-b4` (B=4).
 
 **Throughput** — 32 requests submitted at once. E2E includes queue wait time.
 
 | Engine | B | req/s | tok/s | E2E p50 | E2E p99 |
 |---|---:|---:|---:|---:|---:|
-| liteinfer | 1 | 1.81 | 75 | 11193 ms | 17662 ms |
-| liteinfer-kvcache | 1 | 1.87 | 75 | 9865 ms | 17100 ms |
-| liteinfer-b4 | 4 | 4.42 | 182 | 4096 ms | 7234 ms |
-| vllm | 1 | 2.89 | 180 | 5785 ms | 11023 ms |
-| vllm-b4 | 4 | 10.67 | 650 | 1656 ms | 2963 ms |
+| liteinfer | 1 | 1.75 | 73 | 11607 ms | 18249 ms |
+| liteinfer-kvcache | 1 | 1.81 | 72 | 10190 ms | 17648 ms |
+| liteinfer-paged-kvcache | 1 | 1.57 | 63 | 11772 ms | 20397 ms |
+| liteinfer-b4 | 4 | 4.31 | 177 | 4220 ms | 7421 ms |
+| vllm | 1 | 2.90 | 181 | 5796 ms | 10999 ms |
+| vllm-b4 | 4 | 10.77 | 656 | 1625 ms | 2932 ms |
 
 **Latency** — sequential, no queue; each request sent only after previous finishes.
 
 | Engine | B | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
 |---|---:|---:|---:|---:|---:|
-| liteinfer | 1 | 13 ms | 14 ms | 1654 ms | 75 |
-| liteinfer-kvcache | 1 | 15 ms | 16 ms | 1490 ms | 75 |
-| vllm | 1 | 26 ms | 27 ms | 693 ms | 183 |
+| liteinfer | 1 | 13.7 ms | 15.4 ms | 1710 ms | 72 |
+| liteinfer-kvcache | 1 | 14.6 ms | 16.8 ms | 1541 ms | 73 |
+| liteinfer-paged-kvcache | 1 | 14.7 ms | 16.7 ms | 1829 ms | 61 |
+| vllm | 1 | 25.9 ms | 28.8 ms | 693 ms | 182 |
 
 ## Benchmarking against vLLM
 
@@ -158,7 +160,8 @@ High-level direction:
 
 - [x] Single-prompt greedy/sampled generation from local safetensors
 - [x] Static batching (B > 1)
-- [ ] Paged KV cache → continuous batching → prefix caching
+- [x] Paged KV cache
+- [ ] Continuous batching → prefix caching
 - [ ] `torch.compile` and CUDA graphs for decode
 - [ ] Tensor parallelism (single node)
 - [ ] Speculative decoding

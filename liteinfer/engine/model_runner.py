@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import torch
 
+from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.eager_kv_cache import EagerKVCache
 from liteinfer.cache.kv_cache import KVCache
 from liteinfer.cache.native_eager_kv_cache import NativeEagerKVCache
+from liteinfer.cache.paged_kv_cache import PagedKVCache
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import build_for_model
 from liteinfer.engine.sequence import Sequence
@@ -36,11 +38,14 @@ class ModelRunner:
         self._batch: list[Sequence] = []
         self._prompt_lens: list[int] = []
         self._max_prompt_len: int = 0
+        self._block_pool: BlockPool | None = None
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
+        if self.config.cache_mode == "paged":
+            self._block_pool = self._create_block_pool()
 
     def start_batch(self, scheduled: list[Sequence]) -> None:
         if not scheduled:
@@ -52,6 +57,9 @@ class ModelRunner:
             self._cache = EagerKVCache(self.config, self.hf_config)
         elif self.config.cache_mode == "native_eager":
             self._cache = NativeEagerKVCache(self.config)
+        elif self.config.cache_mode == "paged":
+            assert self._block_pool is not None, "block pool not initialised — call load_model() first"
+            self._cache = PagedKVCache(self.config, self._block_pool, self._prompt_lens)
         else:
             self._cache = None
 
@@ -64,22 +72,20 @@ class ModelRunner:
         self._max_prompt_len = 0
 
     @torch.inference_mode()
-    def execute(
-        self, scheduled: list[Sequence], is_new_batch: bool
-    ) -> tuple[torch.Tensor, int]:
+    def execute(self, scheduled: list[Sequence], is_new_batch: bool) -> tuple[torch.Tensor, int]:
         """Run one forward pass. Returns ``(logits[B, vocab], input_tokens)``."""
         if scheduled != self._batch:
             raise RuntimeError("scheduled batch differs from registered batch")
 
-        if self.config.cache_mode in ("eager", "native_eager"):
-            return self._execute_eager(is_new_batch)
+        if self.config.cache_mode in ("eager", "native_eager", "paged"):
+            return self._execute_with_cache(is_new_batch)
         return self._execute_no_cache()
 
     # -----------------------------------------------------------------------
     # Eager KV-cache path
     # -----------------------------------------------------------------------
 
-    def _execute_eager(self, is_new_batch: bool) -> tuple[torch.Tensor, int]:
+    def _execute_with_cache(self, is_new_batch: bool) -> tuple[torch.Tensor, int]:
         cache_payload = self._cache.payload if self._cache is not None else None
         if is_new_batch:
             input_ids, position_ids = self._build_prefill_inputs()
@@ -118,8 +124,12 @@ class ModelRunner:
         max_len = max(seq_lens)
 
         pad_id = 0
-        input_ids = torch.full((len(self._batch), max_len), pad_id, dtype=torch.long, device=self.device)
-        position_ids = torch.zeros((len(self._batch), max_len), dtype=torch.long, device=self.device)
+        input_ids = torch.full(
+            (len(self._batch), max_len), pad_id, dtype=torch.long, device=self.device
+        )
+        position_ids = torch.zeros(
+            (len(self._batch), max_len), dtype=torch.long, device=self.device
+        )
         for i, tokens in enumerate(token_lists):
             offset = max_len - len(tokens)
             input_ids[i, offset:] = torch.tensor(tokens, dtype=torch.long, device=self.device)
@@ -154,11 +164,17 @@ class ModelRunner:
         (their attention is fully masked, so the value is irrelevant)."""
         batch_size = len(self._batch)
         pad_id = 0
-        input_ids = torch.full((batch_size, self._max_prompt_len), pad_id, dtype=torch.long, device=self.device)
-        position_ids = torch.zeros((batch_size, self._max_prompt_len), dtype=torch.long, device=self.device)
+        input_ids = torch.full(
+            (batch_size, self._max_prompt_len), pad_id, dtype=torch.long, device=self.device
+        )
+        position_ids = torch.zeros(
+            (batch_size, self._max_prompt_len), dtype=torch.long, device=self.device
+        )
         for i, seq in enumerate(self._batch):
             offset = self._max_prompt_len - self._prompt_lens[i]
-            input_ids[i, offset:] = torch.tensor(seq.prompt_token_ids, dtype=torch.long, device=self.device)
+            input_ids[i, offset:] = torch.tensor(
+                seq.prompt_token_ids, dtype=torch.long, device=self.device
+            )
             position_ids[i, offset:] = torch.arange(self._prompt_lens[i], device=self.device)
         return input_ids, position_ids
 
@@ -198,7 +214,9 @@ class ModelRunner:
                 device=logits.device,
             )
         else:
-            last_indices = torch.full((batch_size,), logits.shape[1] - 1, dtype=torch.long, device=logits.device)
+            last_indices = torch.full(
+                (batch_size,), logits.shape[1] - 1, dtype=torch.long, device=logits.device
+            )
         return logits[torch.arange(batch_size, device=logits.device), last_indices]
 
     def _current_decode_step(self) -> int:
@@ -208,3 +226,43 @@ class ModelRunner:
         Subsequent steps grow ``output_token_ids`` for non-finished members.
         """
         return max(seq.num_output_tokens for seq in self._batch)
+
+    # -----------------------------------------------------------------------
+    # Paged KV cache setup
+    # -----------------------------------------------------------------------
+
+    def _create_block_pool(self) -> BlockPool:
+        num_layers: int = self.hf_config.num_hidden_layers
+        num_kv_heads: int = self.hf_config.num_key_value_heads
+        head_dim: int = getattr(
+            self.hf_config,
+            "head_dim",
+            self.hf_config.hidden_size // self.hf_config.num_attention_heads,
+        )
+        return BlockPool(
+            num_blocks=self._compute_num_gpu_blocks(num_layers, num_kv_heads, head_dim),
+            block_size=self.config.block_size,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=self.config.dtype,
+            device=self.device,
+        )
+
+    def _compute_num_gpu_blocks(self, num_layers: int, num_kv_heads: int, head_dim: int) -> int:
+        if self.config.num_gpu_blocks is not None:
+            return self.config.num_gpu_blocks
+
+        dtype_bytes = torch.finfo(self.config.dtype).bits // 8
+        # Memory for one block: all layers * K and V * tokens * heads * head_dim
+        bytes_per_block = (
+            self.config.block_size * num_kv_heads * head_dim * dtype_bytes * 2 * num_layers
+        )
+
+        if self.device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            usable_bytes = int(free_bytes * 0.85)
+        else:
+            usable_bytes = 1 << 30  # 1 GiB fallback for CPU (tests / debug only)
+
+        return max(1, usable_bytes // bytes_per_block)
