@@ -4,6 +4,13 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 10-05-2026 — §2.1 Paged KV cache (block-pool allocator)
+
+- **PRs.** [#12](https://github.com/ValeGian/liteinfer/pull/12)
+- **What.** `PagedKVCache` stores tokens in fixed-size blocks drawn from a pre-allocated pool. Block table maps logical sequence positions to physical block slots. `cache_mode="paged"` enabled in `EngineConfig`. Foundation for prefix sharing (§2.2) and continuous batching (§1.2). Initial overhead vs eager: ~13% throughput, ~19% E2E latency at B=1 (Llama-3.2-1B).
+
+---
+
 ## 10-05-2026 — §2.4 Native eager KV cache (plain tensors, no `DynamicCache`)
 
 - **PRs.** [#11](https://github.com/ValeGian/liteinfer/pull/11)

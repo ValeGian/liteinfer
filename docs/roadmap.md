@@ -45,24 +45,12 @@ listed.
 - **Scope.** New `engine/scheduler_continuous.py` (or behind a config
   flag). Scheduler must merge new arrivals into the running set
   step-by-step, evict on KV-block pressure once paging lands.
-- **Pre-req.** §2.1 paged KV cache.
 - **Parity test.** Same multi-prompt workload: continuous mode produces
   the same outputs as static, with strictly higher throughput.
 
 ---
 
 ## 2. KV cache implementations
-
-### 2.1 Paged KV cache
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Eager cache wastes memory on padding and forbids prefix
-  reuse. Paged blocks are the foundation for §2.2 and §1.2.
-- **Scope.** New `liteinfer/cache/paged_kv_cache.py`: block-allocated
-  tensors with free list. Vendored attention reads via block table.
-  `KVCache` ABC needs richer `payload` protocol.
-- **Parity test.** Greedy identical to eager on Llama-3.2-1B for
-  prompt lengths 1, 17, 512.
 
 ### 2.2 Prefix sharing
 - **Status.** `planned`
@@ -75,6 +63,23 @@ listed.
 - **Pre-req.** §2.1.
 - **Parity test.** Identical greedy output to non-shared paged cache
   on a workload designed to share prefixes.
+
+### 2.3 Paged KV cache performance (fused kernel)
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous
+  KV blocks into a contiguous buffer before attention — ~13% throughput
+  and ~19% E2E regression vs eager at B=1. A fused paged-attention
+  kernel reads the block table directly inside the CUDA kernel,
+  eliminating the gather entirely (same approach as vLLM's
+  PagedAttention kernel). Closes the performance gap and makes paged
+  faster than eager at high occupancy.
+- **Scope.** Custom CUDA/Triton kernel for block-table attention;
+  `ModelRunner` switches to it when `cache_mode="paged"`.
+- **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the
+  entry point to swap in a custom attention backend.
+- **Parity test.** Paged greedy output identical to eager; benchmark
+  shows paged ≥ eager tok/s at B=1.
 
 ### 2.3 Quantized cache (KV-cache fp8 / int8)
 - **Status.** `planned`
@@ -233,8 +238,7 @@ listed.
   lands.
 - Vectorize `Sampler.__call__` per-row loop when params are
   homogeneous across batch.
-- Tighten `KVCache` ABC after §2.1 — richer `payload` may obviate
-  eager wrapper.
+- Tighten `KVCache` ABC — richer `payload` contract landed with §2.1; may still obviate eager wrapper.
 - Add `tests/integration/` B=1 vs B=N parity tests once §1.1 lands.
 
 ---
