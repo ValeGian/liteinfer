@@ -75,6 +75,11 @@ _ENGINE_TIPS: dict[str, str] = {
         "Prefill runs once; each decode step passes only the new token. "
         "KV cache stored as plain tensors — no DynamicCache wrapper overhead."
     ),
+    "liteinfer-paged-kvcache": (
+        "liteinfer · cache_mode=paged (block-allocated KV cache), max_num_seqs=1\n"
+        "Tokens stored in fixed-size blocks drawn from a pre-allocated pool. "
+        "Eliminates memory fragmentation; foundation for prefix sharing (§2.2)."
+    ),
     "liteinfer-b4": (
         "liteinfer · cache_mode=eager, max_num_seqs=4\n"
         "Static batching with B=4: up to four prompts share one PREFILL "
