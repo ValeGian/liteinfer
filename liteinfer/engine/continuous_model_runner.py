@@ -68,7 +68,6 @@ class ContinuousModelRunner:
         input_ids, position_ids = self._build_prefill_inputs(seqs, prompt_lens, max_prompt_len)
         attention_mask = build_for_model(
             type(self.model).__name__,
-            hf_config=self.hf_config,
             prompt_lens=prompt_lens,
             query_len=max_prompt_len,
             past_len=0,
@@ -100,7 +99,6 @@ class ContinuousModelRunner:
         seq_total_lens = [len(s.prompt_token_ids) + len(s.output_token_ids) for s in seqs]
         attention_mask = build_continuous_decode_for_model(
             type(self.model).__name__,
-            hf_config=self.hf_config,
             seq_total_lens=seq_total_lens,
             dtype=self.config.dtype,
             device=self.device,
