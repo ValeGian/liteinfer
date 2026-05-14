@@ -86,6 +86,22 @@ _ENGINE_TIPS: dict[str, str] = {
         "and decode together until every member finishes. Eager KV cache; "
         "left-padded prefill with pad-aware additive attention mask."
     ),
+    "liteinfer-native-kvcache-b4": (
+        "liteinfer · cache_mode=native_eager, max_num_seqs=4\n"
+        "Static batching B=4 with the plain-tensor native KV cache. "
+        "No DynamicCache wrapper overhead."
+    ),
+    "liteinfer-paged-b4": (
+        "liteinfer · cache_mode=paged, max_num_seqs=4\n"
+        "Static batching B=4 with paged KV cache. Block-allocated tokens; "
+        "same static-batch policy as liteinfer-b4 but with paged memory management."
+    ),
+    "liteinfer-continuous": (
+        "liteinfer · async continuous batching, cache_mode=paged, max_num_seqs=32\n"
+        "Sequences are admitted into free slots every step and evicted individually "
+        "when they finish. Prefill and decode run as two separate forward passes when "
+        "new sequences join a running decode batch (roadmap §1.3 will merge them)."
+    ),
     "vllm": (
         "vLLM 0.20.0 · max_num_seqs=1 (B=1)\n"
         "FlashAttention 2, torch.compile, CUDA graphs for decode, "
@@ -95,6 +111,11 @@ _ENGINE_TIPS: dict[str, str] = {
         "vLLM 0.20.0 · max_num_seqs=4 (B=4)\n"
         "Continuous batching of up to 4 sequences. Same kernels as vllm B=1: "
         "FlashAttention 2, torch.compile, CUDA graphs, paged KV, prefix caching."
+    ),
+    "vllm-continuous": (
+        "vLLM 0.20.0 · continuous batching, max_num_seqs=32\n"
+        "Full continuous batching with FlashAttention 2, torch.compile, CUDA graphs, "
+        "paged KV cache, and prefix caching. Reference baseline for §1.2."
     ),
 }
 

@@ -84,3 +84,4 @@ nsight_*.sqlite
 CLAUDE.md
 .bench/
 .dev/
+.trtllm/

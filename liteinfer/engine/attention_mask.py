@@ -147,6 +147,86 @@ def build_for_model(
     raise NotImplementedError(f"no attention-mask builder registered for model class {model_class_name!r}")
 
 
+def build_continuous_decode_mask(
+    seq_total_lens: list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """Additive attention mask for a continuous-batching decode step.
+
+    Unlike ``build_additive_mask``, sequences in a continuous batch may have
+    different total cached lengths (prompt + output tokens so far). The paged
+    KV cache returns tensors LEFT-PADDED to ``max(seq_total_lens)``. This mask
+    unmasks each sequence's real token positions (right side) and masks the
+    left-pad zeros.
+
+    Args:
+        seq_total_lens: total token count per sequence (prompt + output so far
+            PLUS the one new token being decoded). The length of this list
+            equals the batch size.
+        dtype: must match the attention score tensor.
+        device: target device.
+        sliding_window: when set, also masks key columns farther than
+            ``sliding_window - 1`` positions before the current query.
+
+    Returns:
+        Tensor shaped ``[B, 1, 1, max_total]``.
+    """
+    if not seq_total_lens:
+        raise ValueError("seq_total_lens must be non-empty")
+    max_total = max(seq_total_lens)
+    neg_inf = torch.finfo(dtype).min
+    mask = torch.zeros((len(seq_total_lens), 1, 1, max_total), dtype=dtype, device=device)
+    for i, total in enumerate(seq_total_lens):
+        pad_len = max_total - total
+        if pad_len > 0:
+            mask[i, 0, 0, :pad_len] = neg_inf
+        if sliding_window is not None:
+            # Mask keys more than (sliding_window - 1) positions before the query.
+            # The query is at logical position (total - 1); the earliest
+            # attendable key is at logical position (total - sliding_window).
+            # In the left-padded layout the earliest attendable column is
+            # max_total - sliding_window.
+            cutoff = max_total - sliding_window
+            if cutoff > pad_len:
+                mask[i, 0, 0, pad_len:cutoff] = neg_inf
+    return mask
+
+
+def build_continuous_decode_for_model(
+    model_class_name: str,
+    *,
+    hf_config,
+    seq_total_lens: list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Per-model dispatch for continuous-batching decode masks."""
+    if model_class_name == "LlamaForCausalLM":
+        return build_continuous_decode_mask(
+            seq_total_lens=seq_total_lens,
+            dtype=dtype,
+            device=device,
+        )
+    if model_class_name == "Gemma4ForCausalLM":
+        text_config = getattr(hf_config, "text_config", hf_config)
+        sliding_window = int(text_config.sliding_window)
+        full = build_continuous_decode_mask(
+            seq_total_lens=seq_total_lens,
+            dtype=dtype,
+            device=device,
+        )
+        sliding = build_continuous_decode_mask(
+            seq_total_lens=seq_total_lens,
+            dtype=dtype,
+            device=device,
+            sliding_window=sliding_window,
+        )
+        return {"full_attention": full, "sliding_attention": sliding}
+    raise NotImplementedError(f"no continuous-decode mask builder for model class {model_class_name!r}")
+
+
 def build_gemma4_mask_dict(
     prompt_lens: Sequence[int],
     query_len: int,

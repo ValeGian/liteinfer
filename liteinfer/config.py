@@ -45,3 +45,20 @@ class EngineConfig:
         if self.device == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(self.device)
+
+
+@dataclass
+class AsyncEngineConfig(EngineConfig):
+    """Configuration for the async continuous-batching engine.
+
+    Identical to ``EngineConfig`` but forces ``cache_mode="paged"``:
+    continuous batching requires per-sequence block management that only
+    the paged KV cache provides.
+    """
+
+    cache_mode: CacheMode = "paged"  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.cache_mode != "paged":
+            raise ValueError(f"AsyncEngineConfig requires cache_mode='paged', got {self.cache_mode!r}")
+        super().__post_init__()

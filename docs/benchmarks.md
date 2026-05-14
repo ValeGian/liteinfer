@@ -2,7 +2,7 @@
 
 Comparison of liteinfer variants against vLLM as a reference engine, with and without static batching (B=4).
 
-> Last updated: 2026-05-10 · tag: `paged-kv-cache` · [interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)
+> Last updated: 2026-05-12 · tag: `v0.1.5` · [interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)
 
 ---
 
@@ -20,13 +20,17 @@ Comparison of liteinfer variants against vLLM as a reference engine, with and wi
 
 | Key | B | Description |
 |---|---:|---|
-| `liteinfer` | 1 | liteinfer, no KV cache (`cache_mode="none"`); every step re-feeds the full and growing sequence (RECOMPUTE) |
+| `liteinfer` | 1 | liteinfer, no KV cache (`cache_mode="none"`); every step re-feeds the full and growing sequence (RECOMPUTE). Baseline. |
 | `liteinfer-kvcache` | 1 | liteinfer, eager KV cache (`cache_mode="eager"`); prefill populates a `DynamicCache`, decode steps pass only the new token |
-| `liteinfer-native-kvcache` | 1 | liteinfer, native eager KV cache (`cache_mode="native_eager"`); plain per-layer tensor store, no `DynamicCache` wrapper (roadmap §2.4) |
-| `liteinfer-paged-kvcache` | 1 | liteinfer, paged KV cache (`cache_mode="paged"`); tokens stored in fixed-size blocks drawn from a pre-allocated pool (roadmap §2.1) |
-| `liteinfer-b4` | 4 | liteinfer, eager KV cache + `max_num_seqs=4`; static batching from roadmap §1.1 — left-padded prefill with pad-aware additive attention mask |
+| `liteinfer-native-kvcache` | 1 | liteinfer, native eager KV cache (`cache_mode="native_eager"`); plain per-layer tensor store, no `DynamicCache` wrapper |
+| `liteinfer-paged-kvcache` | 1 | liteinfer, paged KV cache (`cache_mode="paged"`); tokens stored in fixed-size blocks drawn from a pre-allocated pool |
+| `liteinfer-b4` | 4 | liteinfer, eager KV cache, `max_num_seqs=4`; static batching — left-padded prefill with pad-aware additive attention mask |
+| `liteinfer-native-kvcache-b4` | 4 | liteinfer, native eager KV cache, `max_num_seqs=4`; same static-batching policy as `liteinfer-b4`, no `DynamicCache` wrapper |
+| `liteinfer-paged-b4` | 4 | liteinfer, paged KV cache, `max_num_seqs=4`; static batching with block-allocated memory |
+| `liteinfer-continuous` | 4 | liteinfer, async continuous batching (`AsyncLLM`, `cache_mode="paged"`, `max_num_seqs=4`); sequences admitted every step, evicted individually on completion |
 | `vllm` | 1 | vLLM 0.20.0, `max_num_seqs=1`, FlashAttention 2, CUDA graphs, paged KV cache |
 | `vllm-b4` | 4 | vLLM 0.20.0, `max_num_seqs=4`; same kernels as `vllm`, four sequences in flight |
+| `vllm-continuous` | 4 | vLLM 0.20.0, `max_num_seqs=4`, full continuous batching with FlashAttention 2, CUDA graphs, paged KV cache, prefix caching |
 
 **TTFT measurement:** wall-clock time from request submission to when the first token is ready (measured via `time.perf_counter()` at step-listener fire time — includes Python/scheduling overhead, CUDA sync, forward pass, sampling, and token application).
 
@@ -40,21 +44,24 @@ All 32 requests are queued at t₀; the engine processes them up to `max_num_seq
 
 | Engine | B | req/s | tok/s | E2E p50 | E2E p99 |
 |---|---:|---:|---:|---:|---:|
-| liteinfer | 1 | 1.75 | 73 | 11607 ms | 18249 ms |
-| liteinfer-kvcache | 1 | 1.81 | 72 | 10190 ms | 17648 ms |
-| liteinfer-native-kvcache | 1 | 1.81 | 72 | 10233 ms | 17725 ms |
-| liteinfer-paged-kvcache | 1 | 1.57 | 63 | 11772 ms | 20397 ms |
-| liteinfer-b4 | 4 | 4.31 | 177 | 4220 ms | 7421 ms |
-| vllm | 1 | 2.90 | 181 | 5796 ms | 10999 ms |
-| vllm-b4 | 4 | 10.77 | 656 | 1625 ms | 2932 ms |
+| liteinfer | 1 | 1.41 | 58 | 14832 ms | 22763 ms |
+| liteinfer-b4 | 4 | 3.71 | 152 | 4860 ms | 8624 ms |
+| liteinfer-native-kvcache-b4 | 4 | 3.52 | 144 | 5274 ms | 9094 ms |
+| liteinfer-paged-b4 | 4 | 2.31 | 95 | 8230 ms | 13872 ms |
+| liteinfer-continuous | 4 | 3.14 | 125 | 5756 ms | 10206 ms |
+| vllm | 1 | 2.88 | 179 | 5822 ms | 11098 ms |
+| vllm-b4 | 4 | 10.60 | 645 | 1683 ms | 2974 ms |
+| vllm-continuous | 4 | 10.72 | 653 | 1636 ms | 2947 ms |
 
-**Paged KV cache overhead:** `liteinfer-paged-kvcache` is ~13% slower than `liteinfer-kvcache` (1.57 vs 1.81 req/s). Block-table indirection on every decode step adds overhead not present in the direct-tensor eager path. This is the initial §2.1 implementation — the foundation for prefix sharing (§2.2) and continuous batching (§1.2).
+**Static B=4 comparison:** `liteinfer-b4` (eager, 3.71 req/s) is the fastest liteinfer variant at B=4. `liteinfer-native-kvcache-b4` is within 5% (3.52 req/s). `liteinfer-paged-b4` is ~38% slower (2.31 req/s) — block-table scatter/gather overhead on every decode step with no fused kernel.
 
-**Native KV cache parity:** `liteinfer-native-kvcache` matches `liteinfer-kvcache` exactly (1.81 req/s, 72 tok/s) with no `DynamicCache` dependency. §2.4 landed with zero performance regression.
+**Continuous batching (liteinfer-continuous):** 3.14 req/s — between `liteinfer-paged-b4` (2.31) and `liteinfer-b4` (3.71). Does not yet outperform static at matched B=4: the two-pass step (separate prefill + decode forward calls when new sequences join) adds overhead that cancels the slot-filling benefit. Roadmap §1.3 (chunked prefill) will merge them.
 
-**Static batching impact (liteinfer):** B=4 gives **2.7×** throughput over B=1 eager-cache (4.31 vs 1.81 req/s) and reaches per-token throughput parity with `vllm` at B=1 (177 vs 181 tok/s). Median E2E drops from 10190 ms to 4220 ms because four prompts share each prefill+decode step instead of waiting in queue.
+**vLLM B=1 vs liteinfer B=4:** `vllm` at B=1 reaches 2.88 req/s — lower than all liteinfer B=4 variants. vLLM's higher tok/s (179 vs 152) reflects FlashAttention 2 and CUDA graphs on individual sequences; liteinfer's advantage at B=4 comes from static batching amortising Python/launch overhead across sequences.
 
-**vLLM headroom remaining:** `vllm-b4` is **2.5×** the throughput of `liteinfer-b4` (10.77 vs 4.31 req/s) at the same batch size — gap is now CUDA graphs, FlashAttention 2, and continuous batching, not paging.
+**vllm-continuous vs vllm-b4:** +1% gain (10.72 vs 10.60 req/s) — vLLM's chunked prefill already mixes prefill and decode in one pass, so the scheduling policy difference is minimal at B=4.
+
+**liteinfer vs vLLM gap (B=4):** `liteinfer-b4` is **2.86×** slower than `vllm-b4` (3.71 vs 10.60 req/s). Gap: eager attention, no CUDA graphs, no FlashAttention (§3.1–§3.3).
 
 ---
 
@@ -66,21 +73,21 @@ Each request is submitted only after the previous has finished — no queue cont
 
 | Engine | B | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
 |---|---:|---:|---:|---:|---:|
-| liteinfer | 1 | 13.7 ms | 15.4 ms | 1710 ms | 72 |
-| liteinfer-kvcache | 1 | 14.6 ms | 16.8 ms | 1541 ms | 73 |
-| liteinfer-native-kvcache | 1 | 13.9 ms | 15.6 ms | 1540 ms | 73 |
-| liteinfer-paged-kvcache | 1 | 14.7 ms | 16.7 ms | 1829 ms | 61 |
-| vllm | 1 | 25.9 ms | 28.8 ms | 693 ms | 182 |
+| liteinfer | 1 | 16.1 ms | 17.0 ms | 1948 ms | 64 |
+| liteinfer-kvcache | 1 | 18.8 ms | 29.6 ms | 1936 ms | 54 |
+| liteinfer-native-kvcache | 1 | 18.4 ms | 26.6 ms | 1974 ms | 56 |
+| liteinfer-paged-kvcache | 1 | 18.1 ms | 27.6 ms | 2104 ms | 51 |
+| vllm | 1 | 25.9 ms | 29.4 ms | 692 ms | 183 |
 
-**Paged KV cache latency:** `liteinfer-paged-kvcache` E2E is ~19% higher than `liteinfer-kvcache` (1829 ms vs 1541 ms) and tok/s drops from 73 to 61. Block-table scatter/gather on each decode step adds per-step overhead beyond what the eager path pays.
+**KV cache vs no-cache:** KV cache gives marginal E2E improvement at B=1 (~1%: 1936 ms vs 1948 ms). Modest because liteinfer uses eager PyTorch attention without CUDA graphs — each decode step still pays full Python/GPU launch overhead.
 
-**TTFT:** liteinfer variants show lower TTFT than vLLM for this short prompt (7 tokens). In RECOMPUTE mode the "prefill" is a 7-token forward pass with no KV-cache setup. In KV-cache mode, prefill populates the cache but there is still no subprocess IPC. vLLM's higher TTFT reflects its multi-process architecture (IPC to EngineCore subprocess, chunked-prefill scheduler) regardless of prompt length.
+**Native KV cache:** matches eager cache on E2E (1974 ms vs 1936 ms). No `DynamicCache` wrapper.
 
-**Native KV cache TTFT:** `liteinfer-native-kvcache` shows slightly lower TTFT p50 than `liteinfer-kvcache` (13.9 ms vs 14.6 ms) — no `DynamicCache` initialization overhead on prefill. E2E and tok/s are identical.
+**Paged KV cache latency:** slightly higher E2E (2104 ms vs 1936 ms) — block-table scatter/gather on each decode step.
 
-**KV cache vs no cache:** KV cache reduces E2E by ~10% (1541 ms vs 1710 ms) and tightens TTFT p99 variance. The improvement is modest because liteinfer uses eager PyTorch attention without CUDA graphs — each decode step still pays full Python/GPU launch overhead.
+**TTFT:** liteinfer variants show lower TTFT than vLLM for this short prompt. vLLM's multi-process architecture (IPC to EngineCore subprocess) adds fixed overhead regardless of prompt length.
 
-**E2E gap vs vLLM (~2.2×):** comes from decode. vLLM uses CUDA graphs (near-zero Python overhead per decode step) and FlashAttention 2, while liteinfer uses standard eager attention without any fusion or graph capture.
+**E2E gap vs vLLM (~2.8×):** decode-bound. vLLM uses CUDA graphs and FlashAttention 2; liteinfer uses standard eager attention (§3.1–§3.3).
 
 ---
 
@@ -88,10 +95,10 @@ Each request is submitted only after the previous has finished — no queue cont
 
 | Gap | Root cause | Roadmap item |
 |---|---|---|
-| 2.5× slower decode tok/s at B=4 (`liteinfer-b4` vs `vllm-b4`) | Eager attention, no CUDA graphs, no FlashAttention | §3.1 `torch.compile`, §3.2 CUDA graphs, §3.3 FlashAttention |
-| Modest KV cache gain (~10%) at B=1 | KV cache without CUDA graphs still pays per-step Python overhead | §3.2 CUDA graphs for decode |
-| Paged KV ~13–19% slower than eager at B=1 | Block-table scatter/gather overhead; no fused paged-attention kernel | §3.3 FlashAttention (paged attn kernel), future §2.1 optimisation pass |
+| 2.86× slower throughput at B=4 (`liteinfer-b4` vs `vllm-b4`) | Eager attention, no CUDA graphs, no FlashAttention | §3.1 `torch.compile`, §3.2 CUDA graphs, §3.3 FlashAttention |
+| `liteinfer-paged-b4` 38% slower than `liteinfer-b4` at B=4 | Block-table scatter/gather on each decode step; no fused kernel | §2.3 fused paged-attention kernel, §3.3 FlashAttention |
+| `liteinfer-continuous` ≈ `liteinfer-paged-b4` at matched B | Two-pass step overhead when new seqs join decode batch | §1.3 chunked prefill (single-pass mixed batching) |
+| ~2.8× slower decode tok/s at B=1 vs vLLM | No CUDA graphs, no FlashAttention | §3.2 CUDA graphs, §3.3 FlashAttention |
 | No prefix-cache benefit yet | Prefix caching not implemented | §2.2 prefix sharing |
-| Continuous batching not yet supported | Static batches drain to completion before refilling | §1.2 continuous batching |
 
 See [`docs/roadmap.md`](roadmap.md) for the full backlog.
