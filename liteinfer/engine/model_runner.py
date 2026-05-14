@@ -96,7 +96,6 @@ class ModelRunner:
 
         attention_mask = build_for_model(
             type(self.model).__name__,
-            hf_config=self.hf_config,
             prompt_lens=self._prompt_lens,
             query_len=int(input_ids.shape[1]),
             past_len=past_len,
@@ -137,7 +136,6 @@ class ModelRunner:
 
         attention_mask = build_for_model(
             type(self.model).__name__,
-            hf_config=self.hf_config,
             prompt_lens=seq_lens,
             query_len=max_len,
             past_len=0,

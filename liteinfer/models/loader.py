@@ -13,7 +13,6 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from liteinfer.config import EngineConfig
-from liteinfer.models.gemma4 import Gemma4ForCausalLM
 from liteinfer.models.llama import LlamaForCausalLM
 
 if TYPE_CHECKING:
@@ -22,7 +21,6 @@ if TYPE_CHECKING:
 # Architecture name (from `config.json["architectures"][0]`) → liteinfer class.
 _DISPATCH: dict[str, type[nn.Module]] = {
     "LlamaForCausalLM": LlamaForCausalLM,
-    "Gemma4ForCausalLM": Gemma4ForCausalLM,
 }
 
 
@@ -101,7 +99,6 @@ def load_hf_model(config: EngineConfig, model_dir: Path) -> tuple[nn.Module, Pre
     hf_config._attn_implementation = "eager"
 
     model_cls = _DISPATCH[architecture]
-    text_config = getattr(hf_config, "text_config", hf_config)
     device = config.resolved_device()
 
     # Initialize on the target device so non-persistent buffers (e.g.
@@ -109,7 +106,7 @@ def load_hf_model(config: EngineConfig, model_dir: Path) -> tuple[nn.Module, Pre
     # leave those buffers as garbage, since they're not stored in
     # safetensors and never get re-derived.
     with torch.device(device):
-        model = model_cls(text_config)
+        model = model_cls(hf_config)
     model = model.to(dtype=config.dtype)
     model.eval()
 

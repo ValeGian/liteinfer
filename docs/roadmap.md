@@ -150,13 +150,10 @@ listed.
 ### 4.2 Detangle remaining transformers helpers from modeling files
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** `gemma4.py` still imports `transformers.{masking_utils,
-  modeling_layers, modeling_utils, modeling_rope_utils, integrations}`
-  and subclasses `PreTrainedModel`. Llama still depends on
-  `ROPE_INIT_FUNCTIONS` and `ACT2FN`.
+- **Why.** Llama still imports `ROPE_INIT_FUNCTIONS` and `ACT2FN` from
+  `transformers` and subclasses `PreTrainedModel`.
 - **Scope.** Bring in-tree incrementally: Llama-3.x RoPE init
-  (~15 lines), `ACT2FN["silu"]`, Gemma4 causal/sliding-window mask.
-  `DynamicCache` tracked separately in §2.4.
+  (~15 lines), `ACT2FN["silu"]`. `DynamicCache` tracked separately in §2.4.
 - **Parity test.** `tests/e2e/test_llama_parity.py` stays bit-exact
   vs `transformers.AutoModelForCausalLM.generate`.
 
@@ -164,7 +161,7 @@ listed.
 - **Status.** `planned`
 - **PRs.** _none yet_
 - **Why.** Exercise the dispatch table and stretch the engine to a
-  classical top-k MoE, complementing Gemma4.
+  classical top-k MoE.
 - **Scope.** New entry in `_DISPATCH`, vendored modeling file, parity
   test.
 
