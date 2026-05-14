@@ -37,16 +37,22 @@ listed.
 
 ## 1. Batching and scheduling
 
-### 1.2 Continuous batching
+### 1.3 Chunked prefill / single-pass mixed batching
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** Static batching wastes compute when prompts finish at
-  different steps and new requests arrive mid-batch.
-- **Scope.** New `engine/scheduler_continuous.py` (or behind a config
-  flag). Scheduler must merge new arrivals into the running set
-  step-by-step, evict on KV-block pressure once paging lands.
-- **Parity test.** Same multi-prompt workload: continuous mode produces
-  the same outputs as static, with strictly higher throughput.
+- **Why.** The current continuous-batching step issues two separate
+  forward passes when newly admitted sequences (prefill) and running
+  sequences (decode) coexist: one prefill pass and one decode pass.
+  Chunked prefill merges both into a single forward pass by interleaving
+  prefill tokens and decode tokens in the same batch tensor. This halves
+  kernel launches in the common case and reduces TTFT for waiting
+  sequences.
+- **Scope.** Requires a flash-attention-style kernel that accepts
+  per-sequence key-length metadata (block tables + variable query
+  lengths). `ContinuousModelRunner` grows a `mixed_step(prefill_seqs,
+  decode_seqs)` path; `AsyncLLMEngine._step` uses it once §3.3 (SDPA /
+  Flash) lands. The two-pass path stays as a fallback for eager attention.
+- **Pre-req.** §3.3 (Flash / SDPA attention backend).
 
 ---
 
@@ -81,7 +87,7 @@ listed.
 - **Parity test.** Paged greedy output identical to eager; benchmark
   shows paged ≥ eager tok/s at B=1.
 
-### 2.3 Quantized cache (KV-cache fp8 / int8)
+### 2.5 Quantized cache (KV-cache fp8 / int8)
 - **Status.** `planned`
 - **PRs.** _none yet_
 - **Why.** Memory bound on long contexts.
@@ -110,7 +116,10 @@ listed.
 - **PRs.** _none yet_
 - **Scope.** Capture the single-token-decode step (fixed shape after
   prefill) and replay. Behind `enable_cuda_graph`. Requires §1.1
-  (fixed batch size during capture).
+  (fixed batch size during capture). Graph capture also eliminates the
+  per-step `torch.zeros` allocation in `build_additive_mask` and the
+  associated Python-side slice fills, which currently incur a GPU
+  allocation + multiple kernel launches every forward pass.
 - **Pre-req.** §3.1 helps but is not strictly required.
 
 ### 3.3 Flash / SDPA attention
@@ -163,14 +172,6 @@ listed.
 
 ## 5. Engine ergonomics
 
-### 5.1 Streaming output
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** UX for long generations.
-- **Scope.** New iterator API on `LLM`: `for token in llm.stream(...)`.
-  Probably yields `TokenEvent{request_id, token_id, text_delta,
-   step_metrics}`.
-
 ### 5.2 Incremental detokenization
 - **Status.** `planned`
 - **PRs.** _none yet_
@@ -179,21 +180,6 @@ listed.
   v0; pathological on long outputs.
 - **Scope.** Cache the last decoded suffix and only decode the new
   token's contribution.
-
-### 5.3 Async / server interface
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Multiple concurrent clients without one blocking another.
-- **Scope.** `LLM.add_request_async` + `await response`. Probably a
-  thin asyncio wrapper around the existing engine loop running in a
-  background thread.
-
-### 5.4 Chat templating
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Tokenizer wrapper exposes `apply_chat_template` but the
-  facade does not. Users must call into `tokenizer` themselves.
-- **Scope.** `LLM.chat(messages: list[dict], ...)` shortcut.
 
 ---
 
@@ -216,24 +202,10 @@ listed.
   prefill/decode tok/s, batch size, KV usage. Builds on §1.1 to be
   meaningful.
 
-### 6.3 Trace export
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Profiling deep dives benefit from a Chrome-trace JSON.
-- **Scope.** `EngineStats.to_chrome_trace()` emitting one event per
-  step.
-
 ---
 
 ## 7. Hygiene / housekeeping
 
-- Strip HF training-flow decorators from `gemma4.py`
-  (`@auto_docstring`, `@can_return_tuple`, `@capture_outputs`,
-  `@merge_with_config_defaults`, `@use_kernelized_func`,
-  `@use_experts_implementation`, `@dynamic_rope_update`). No-ops at
-  inference; drag in `transformers.utils` imports.
-- Replace `Gemma4PreTrainedModel(PreTrainedModel)` with `nn.Module`
-  once weight-tying / `_attn_implementation` plumbing is in-tree.
 - Drop loader's `_attn_implementation = "eager"` override once §3.3
   lands.
 - Vectorize `Sampler.__call__` per-row loop when params are
@@ -280,4 +252,25 @@ listed.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
-  
+
+### 8.3 Sequence-length sweep workload
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** At short sequence lengths (small prompts, low `max_tokens`)
+  the RECOMPUTE engine outperforms KV-cache engines because single-token
+  decode steps are memory-bandwidth-bound and GPU-underutilised, while
+  `torch.cat` KV growth adds per-step copy overhead. The crossover point
+  — where KV cache starts winning — is model- and hardware-dependent and
+  currently invisible in the benchmark suite. A sequence-length sweep
+  makes this crossover explicit, validates that §2.6 (pre-allocated
+  buffer) actually closes the gap, and guards against regressions.
+- **Scope.** New `sweep` workload factory in `benchmarks/workloads.py`
+  parameterised by `(isl, osl)` pairs (pre-req §8.1). The `compare` CLI
+  gains a `--sweep` flag that iterates over a default grid, e.g.
+  `osl ∈ {16, 64, 128, 256, 512}` at fixed `isl=32`. Results are
+  written to the history JSONL and the dashboard renders a
+  throughput-vs-OSL line chart per engine.
+- **Pre-req.** §8.1 (ISL/OSL-controlled workloads).
+- **Parity test.** Greedy outputs identical across engines at each
+  (ISL, OSL) point.
+
