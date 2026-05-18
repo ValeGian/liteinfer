@@ -58,9 +58,17 @@ class LlamaRotaryEmbedding(nn.Module):
     def __init__(self, config: LlamaConfig, device: torch.device | None = None) -> None:
         super().__init__()
         self.config = config
-        self.rope_type = config.rope_parameters["rope_type"]
-        rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(config, device)
+        rope_params: dict = config.rope_parameters  # always a dict once config is built
+        self.rope_type = rope_params["rope_type"]
+        if self.rope_type == "default":
+            # Standard RoPE: no frequency scaling, custom base theta.
+            theta = rope_params.get("rope_theta", config.default_theta)
+            head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+            inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+            self.attention_scaling = 1.0
+        else:
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            inv_freq, self.attention_scaling = rope_init_fn(config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
