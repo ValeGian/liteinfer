@@ -117,16 +117,19 @@ class LLMEngine:
 
     def _maybe_finish(self, seq: Sequence, last_token_id: int) -> None:
         params = seq.sampling_params
-        if last_token_id in self.tokenizer.eos_token_ids:
+        num_output = seq.num_output_tokens
+        past_min = num_output >= params.min_tokens
+
+        if last_token_id in self.tokenizer.eos_token_ids and not params.ignore_eos and past_min:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
-        if params.stop_token_ids and last_token_id in params.stop_token_ids:
+        if past_min and params.stop_token_ids and last_token_id in params.stop_token_ids:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
-        if seq.num_output_tokens >= params.max_tokens:
+        if num_output >= params.max_tokens:
             seq.status = SequenceStatus.FINISHED_LENGTH
             return
-        if params.stop:
+        if past_min and params.stop:
             text = self.tokenizer.decode(seq.output_token_ids)
             if any(s in text for s in params.stop):
                 seq.status = SequenceStatus.FINISHED_STOPPED
