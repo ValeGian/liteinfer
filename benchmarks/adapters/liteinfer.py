@@ -10,22 +10,28 @@ import asyncio
 import time
 from typing import Literal
 
-from benchmarks.adapters.base import BenchmarkSample, RequestMeasurement
+from benchmarks.adapters.base import THROUGHPUT_MAX_SEQS, BenchmarkSample, RequestMeasurement
 
 _WARMUP_PROMPT = "Hello"
 _WARMUP_MAX_TOKENS = 16
 _WARMUP_COUNT = 4
-_THROUGHPUT_MAX_SEQS = 32
 
 
 class LiteInferAdapter:
     name = "liteinfer"
 
+    def __init__(self, max_num_tokens: int | None = None) -> None:
+        self._max_num_tokens = max_num_tokens
+
     def __enter__(self) -> LiteInferAdapter:
         return self
 
     def __exit__(self, *_) -> None:
-        pass
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def run(
         self,
@@ -49,56 +55,57 @@ class LiteInferAdapter:
         from liteinfer import AsyncLLM
         from liteinfer.sampling import SamplingParams
 
-        llm = AsyncLLM(model=model, cache_mode="paged", max_num_seqs=_THROUGHPUT_MAX_SEQS)
-
-        # Warmup: 4 requests before starting the wall clock
-        warmup_params = SamplingParams(max_tokens=_WARMUP_MAX_TOKENS, min_tokens=_WARMUP_MAX_TOKENS)
-        warmup_tasks = [
-            asyncio.create_task(self._collect_stream(llm, _WARMUP_PROMPT, warmup_params))
-            for _ in range(_WARMUP_COUNT)
-        ]
-        await asyncio.gather(*warmup_tasks)
-
-        # Real benchmark: all coroutines created, semaphore limits concurrency
-        semaphore = asyncio.Semaphore(_THROUGHPUT_MAX_SEQS)
-        wall_start = time.perf_counter()
-
-        async def _run_with_semaphore(
-            sample: BenchmarkSample, idx: int
-        ) -> RequestMeasurement:
-            params = SamplingParams(
-                max_tokens=sample.forced_output_token_count,
-                min_tokens=sample.forced_output_token_count,
-                ignore_eos=True,
+        async with AsyncLLM(model=model, max_num_seqs=THROUGHPUT_MAX_SEQS) as llm:
+            # Warmup: 4 requests before starting the wall clock
+            warmup_params = SamplingParams(
+                max_tokens=_WARMUP_MAX_TOKENS, min_tokens=_WARMUP_MAX_TOKENS
             )
-            async with semaphore:
-                submit_time = time.perf_counter()
-                first_token_time: float | None = None
-                token_times: list[float] = []
+            warmup_tasks = [
+                asyncio.create_task(self._collect_stream(llm, _WARMUP_PROMPT, warmup_params))
+                for _ in range(_WARMUP_COUNT)
+            ]
+            await asyncio.gather(*warmup_tasks)
 
-                async for _event in llm.stream(sample.prompt, params):
-                    now = time.perf_counter()
-                    token_times.append(now)
-                    if first_token_time is None:
-                        first_token_time = now
+            # Real benchmark: all coroutines created, semaphore limits concurrency
+            semaphore = asyncio.Semaphore(THROUGHPUT_MAX_SEQS)
+            wall_start = time.perf_counter()
 
-                end_time = time.perf_counter()
-
-                return RequestMeasurement(
-                    sample_index=idx,
-                    input_token_count=sample.input_token_count,
-                    output_token_count=len(token_times),
-                    ttft_s=(first_token_time - submit_time) if first_token_time else 0.0,
-                    token_timestamps_s=token_times if token_times else None,
-                    e2e_s=end_time - submit_time,
+            async def _run_with_semaphore(
+                sample: BenchmarkSample, idx: int
+            ) -> RequestMeasurement:
+                params = SamplingParams(
+                    max_tokens=sample.forced_output_token_count,
+                    min_tokens=sample.forced_output_token_count,
+                    ignore_eos=True,
                 )
+                async with semaphore:
+                    submit_time = time.perf_counter()
+                    first_token_time: float | None = None
+                    token_times: list[float] = []
 
-        tasks = [
-            asyncio.create_task(_run_with_semaphore(sample, i))
-            for i, sample in enumerate(samples)
-        ]
-        measurements = await asyncio.gather(*tasks)
-        wall_time_s = time.perf_counter() - wall_start
+                    async for _event in llm.stream(sample.prompt, params):
+                        now = time.perf_counter()
+                        token_times.append(now)
+                        if first_token_time is None:
+                            first_token_time = now
+
+                    end_time = time.perf_counter()
+
+                    return RequestMeasurement(
+                        sample_index=idx,
+                        input_token_count=sample.input_token_count,
+                        output_token_count=len(token_times),
+                        ttft_s=(first_token_time - submit_time) if first_token_time else 0.0,
+                        token_timestamps_s=token_times if token_times else None,
+                        e2e_s=end_time - submit_time,
+                    )
+
+            tasks = [
+                asyncio.create_task(_run_with_semaphore(sample, i))
+                for i, sample in enumerate(samples)
+            ]
+            measurements = await asyncio.gather(*tasks)
+            wall_time_s = time.perf_counter() - wall_start
 
         return list(measurements), wall_time_s
 

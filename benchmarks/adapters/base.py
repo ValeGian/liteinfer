@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+THROUGHPUT_MAX_SEQS = 32
+
 
 @dataclass
 class BenchmarkSample:
@@ -23,6 +25,8 @@ class RequestMeasurement:
 
 class EngineAdapter(Protocol):
     name: str
+
+    def __init__(self, max_num_tokens: int | None = None) -> None: ...
 
     def __enter__(self) -> EngineAdapter: ...
 

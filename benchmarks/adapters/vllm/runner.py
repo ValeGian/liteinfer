@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--benchmark-type", required=True, choices=["throughput", "latency"])
+    parser.add_argument("--max-num-seqs", type=int, required=True)
+    parser.add_argument("--max-num-tokens", type=int, default=None)
     return parser.parse_args()
 
 
@@ -35,15 +37,27 @@ def main() -> None:
         samples = json.load(f)
 
     if args.benchmark_type == "throughput":
-        asyncio.run(run_throughput(samples, args.model))
+        asyncio.run(run_throughput(samples, args.model, args.max_num_seqs, args.max_num_tokens))
     else:
-        run_latency(samples, args.model)
+        run_latency(samples, args.model, args.max_num_tokens)
 
 
-async def run_throughput(samples: list[dict], model: str) -> None:
-    from vllm import AsyncLLM, SamplingParams
+async def run_throughput(
+    samples: list[dict], model: str, max_num_seqs: int, max_num_tokens: int | None
+) -> None:
+    from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
-    llm = AsyncLLM(model=model)
+    engine_args = AsyncEngineArgs(
+        model=model,
+        max_num_seqs=max_num_seqs,
+        gpu_memory_utilization=0.95,
+        enable_log_requests=False,
+        disable_log_stats=True,
+        enforce_eager=False,
+    )
+    if max_num_tokens is not None:
+        engine_args.max_num_batched_tokens = max_num_tokens
+    llm = AsyncLLMEngine.from_engine_args(engine_args)
 
     # Warmup
     warmup_params = SamplingParams(
@@ -118,10 +132,19 @@ async def _run_sample(llm, sample: dict, idx: int) -> dict:
     }
 
 
-def run_latency(samples: list[dict], model: str) -> None:
+def run_latency(samples: list[dict], model: str, max_num_tokens: int | None) -> None:
     from vllm import LLM, SamplingParams
 
-    llm = LLM(model=model, max_num_seqs=1)
+    llm_kwargs: dict = dict(
+        model=model,
+        max_num_seqs=1,
+        gpu_memory_utilization=0.95,
+        disable_log_stats=True,
+        enforce_eager=False,
+    )
+    if max_num_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = max_num_tokens
+    llm = LLM(**llm_kwargs)
 
     # Warmup
     warmup_params = SamplingParams(

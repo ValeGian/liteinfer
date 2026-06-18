@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from benchmarks.adapters.base import BenchmarkSample, RequestMeasurement
+from benchmarks.adapters.base import THROUGHPUT_MAX_SEQS, BenchmarkSample, RequestMeasurement
 
 _TRTLLM_PYTHON = Path(
     os.environ.get("BENCH_TRTLLM_PYTHON", "benchmarks/envs/trtllm/bin/python")
@@ -19,6 +19,9 @@ _RUNNER = Path(__file__).parent / "runner.py"
 
 class TRTLLMAdapter:
     name = "trtllm"
+
+    def __init__(self, max_num_tokens: int | None = None) -> None:
+        self._max_num_tokens = max_num_tokens
 
     def __enter__(self) -> TRTLLMAdapter:
         return self
@@ -49,21 +52,19 @@ class TRTLLMAdapter:
             json.dump(samples_data, tmp)
             tmp_path = tmp.name
 
+        cmd = [
+            str(_TRTLLM_PYTHON),
+            str(_RUNNER),
+            "--dataset", tmp_path,
+            "--model", model,
+            "--benchmark-type", benchmark_type,
+            "--max-num-seqs", str(THROUGHPUT_MAX_SEQS),
+        ]
+        if self._max_num_tokens is not None:
+            cmd += ["--max-num-tokens", str(self._max_num_tokens)]
+
         try:
-            proc = subprocess.run(
-                [
-                    str(_TRTLLM_PYTHON),
-                    str(_RUNNER),
-                    "--dataset",
-                    tmp_path,
-                    "--model",
-                    model,
-                    "--benchmark-type",
-                    benchmark_type,
-                ],
-                capture_output=True,
-                text=True,
-            )
+            proc = subprocess.run(cmd, capture_output=True, text=True)
         finally:
             os.unlink(tmp_path)
 
@@ -84,7 +85,7 @@ def _parse_runner_output(stdout: str) -> tuple[list[RequestMeasurement], float]:
 
     for line in stdout.splitlines():
         line = line.strip()
-        if not line:
+        if not line.startswith("{"):
             continue
         record = json.loads(line)
         if "__wall_time_s" in record:
