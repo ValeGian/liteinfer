@@ -4,6 +4,18 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 19-05-2026 — §8.1 ISL/OSL benchmark harness refactor
+
+- **PRs.** _pending merge_
+- **What.** Replaced the old benchmark system (single-append history file + per-engine
+  scripts) with a CLI-driven harness (`bench dataset generate` / `bench run` / `bench dashboard`).
+  Canonical JSONL datasets ensure identical inputs across engines. Per-request
+  `RequestMeasurement` objects enable p50/p95/p99 latency stats. Four engines
+  supported: liteinfer (in-process), vLLM 0.21.0 (subprocess), TRT-LLM 1.2.1 (subprocess, PyTorch backend). Dashboard published
+  to GitHub Pages at `docs/index.html`.
+
+---
+
 ## 12-05-2026 — §1.2 Continuous batching (`AsyncLLM`) + §5.3 Async / server interface + §5.1 Streaming output
 
 - **PRs.** [#13](https://github.com/ValeGian/liteinfer/pull/13)

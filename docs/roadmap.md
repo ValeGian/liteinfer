@@ -215,23 +215,16 @@ listed.
 ## 8. Benchmark harness
 
 ### 8.1 ISL / OSL-controlled workloads
-- **Status.** `planned`
-- **PRs.** _none yet_
+- **Status.** `landed`
+- **PRs.** _pending merge_
 - **Why.** Current workloads let the model decide output length (EOS
   or `max_tokens`), so two engines may generate different numbers of
   tokens for the same prompt. This makes tok/s and E2E comparisons
   unreliable across engines. Fixed ISL (Input Sequence Length) and
   OSL (Output Sequence Length) give reproducible, apples-to-apples
   numbers.
-- **Scope.** Add `isl` / `osl` parameters to `Workload` and to the
-  `--workload` CLI flag. Prompt construction: tokenize a template to
-  exactly ISL tokens (pad or truncate). Output forcing: pass
-  `min_tokens=OSL, max_tokens=OSL` to each engine (requires
-  liteinfer `SamplingParams` to expose `min_tokens`). Add standard
-  workload presets such as `(ISL=128, OSL=128)` and
-  `(ISL=512, OSL=512)` to `benchmarks/workloads.py`.
-- **Parity test.** Assert `len(output_token_ids) == OSL` for every
-  result in both engines.
+- **Scope.** Implemented via canonical JSONL dataset in `benchmarks/dataset.py`. See
+  `plans/benchmark_refactoring_execution_plan.md` for full design.
 
 ### 8.2 Plain HuggingFace `transformers` benchmark runner
 - **Status.** `planned`
@@ -240,12 +233,8 @@ listed.
   `transformers.AutoModelForCausalLM.generate` runner gives a
   simpler, dependency-free lower bound and makes liteinfer's
   overhead vs raw HF visible without the vLLM install requirement.
-- **Scope.** New `benchmarks/runners/hf_runner.py` implementing
-  `EngineRunner`. `setup` loads the model via `AutoModelForCausalLM`
-  and `AutoTokenizer`; `generate` calls `.generate()` with greedy
-  decoding. Register under key `"hf"` in
-  `benchmarks/runners/__init__.py::RUNNERS`. No new dependencies —
-  `transformers` is already required by liteinfer.
+- **Scope.** New adapter at `benchmarks/adapters/hf.py` implementing
+  `EngineAdapter` Protocol. Register in `ADAPTER_REGISTRY` with key `'hf'`.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
@@ -261,12 +250,9 @@ listed.
   currently invisible in the benchmark suite. A sequence-length sweep
   makes this crossover explicit, validates that §2.6 (pre-allocated
   buffer) actually closes the gap, and guards against regressions.
-- **Scope.** New `sweep` workload factory in `benchmarks/workloads.py`
-  parameterised by `(isl, osl)` pairs (pre-req §8.1). The `compare` CLI
-  gains a `--sweep` flag that iterates over a default grid, e.g.
-  `osl ∈ {16, 64, 128, 256, 512}` at fixed `isl=32`. Results are
-  written to the history JSONL and the dashboard renders a
-  throughput-vs-OSL line chart per engine.
+- **Scope.** New `bench run-sweep` subcommand iterating over `(ISL, OSL)` pairs,
+  calling `run_benchmark()` for each; results promoted automatically. Dashboard
+  renders a tok/s-vs-OSL tab.
 - **Pre-req.** §8.1 (ISL/OSL-controlled workloads).
 - **Parity test.** Greedy outputs identical across engines at each
   (ISL, OSL) point.

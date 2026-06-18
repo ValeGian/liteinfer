@@ -34,8 +34,6 @@ git clone https://github.com/ValeGian/liteinfer.git
 cd liteinfer
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-# Optional: install vLLM for benchmark comparisons
-pip install -e ".[dev,bench]"
 ```
 
 ## Quick start
@@ -80,7 +78,7 @@ liteinfer/
 │   ├── cache/             # KV cache (paged, prefix-cached, …)
 │   └── sampling/          # SamplingParams + Sampler
 ├── tests/                 # Unit / integration / e2e tests
-├── benchmarks/            # vLLM comparison harness
+├── benchmarks/            # CLI-driven benchmark harness (dataset, run, dashboard)
 └── pyproject.toml
 ```
 
@@ -116,8 +114,7 @@ pytest tests/unit/                  # one directory
 
 > **GPU tests**: always run sequentially. The e2e tests (`tests/e2e/`) load
 > real models onto GPU. Running them in parallel (`-n auto`) will cause OOM or
-> cross-process interference. `tests/e2e/test_vllm_runner.py` additionally
-> requires the `bench` extras (`pip install -e ".[dev,bench]"`).
+> cross-process interference.
 
 Test layout:
 
@@ -129,50 +126,36 @@ See `tests/README.md` for conventions.
 
 ## Performance
 
-Llama-3.2-1B-Instruct · greedy · NVIDIA A40 — see [`docs/benchmarks.md`](docs/benchmarks.md) for full setup and methodology, or open the **[interactive dashboard](https://htmlpreview.github.io/?https://github.com/ValeGian/liteinfer/blob/master/docs/dashboard.html)** for a visual comparison.
+See the **[live benchmark dashboard](https://valegian.github.io/liteinfer/)** for current results.
 
-Engines: `liteinfer` (B=1, no KV cache) · `liteinfer-b4` (eager, B=4) · `liteinfer-native-kvcache-b4` (native eager, B=4) · `liteinfer-paged-b4` (paged static, B=4) · `liteinfer-continuous` (paged continuous, B=4) · `vllm` (B=1) · `vllm-b4` (B=4) · `vllm-continuous` (continuous B=4).
+Hardware used for published results: NVIDIA A40 · Llama-3.2-1B-Instruct.
 
-**Throughput** — 32 requests submitted at once. E2E includes queue wait time.
+## Benchmarking
 
-| Engine | B | req/s | tok/s | E2E p50 | E2E p99 |
-|---|---:|---:|---:|---:|---:|
-| liteinfer | 1 | 1.41 | 58 | 14832 ms | 22763 ms |
-| liteinfer-b4 | 4 | 3.71 | 152 | 4860 ms | 8624 ms |
-| liteinfer-native-kvcache-b4 | 4 | 3.52 | 144 | 5274 ms | 9094 ms |
-| liteinfer-paged-b4 | 4 | 2.31 | 95 | 8230 ms | 13872 ms |
-| liteinfer-continuous | 4 | 3.14 | 125 | 5756 ms | 10206 ms |
-| vllm | 1 | 2.88 | 179 | 5822 ms | 11098 ms |
-| vllm-b4 | 4 | 10.60 | 645 | 1683 ms | 2974 ms |
-| vllm-continuous | 4 | 10.72 | 653 | 1636 ms | 2947 ms |
-
-**Latency** — sequential, no queue; each request sent only after previous finishes.
-
-| Engine | B | TTFT p50 | TTFT p99 | E2E p50 | tok/s |
-|---|---:|---:|---:|---:|---:|
-| liteinfer | 1 | 16.1 ms | 17.0 ms | 1948 ms | 64 |
-| liteinfer-kvcache | 1 | 18.8 ms | 29.6 ms | 1936 ms | 54 |
-| liteinfer-native-kvcache | 1 | 18.4 ms | 26.6 ms | 1974 ms | 56 |
-| liteinfer-paged-kvcache | 1 | 18.1 ms | 27.6 ms | 2104 ms | 51 |
-| vllm | 1 | 25.9 ms | 29.4 ms | 692 ms | 183 |
-
-## Benchmarking against vLLM
-
-Every engine implements the same `EngineRunner` interface, so comparing
-`liteinfer` against vLLM (or future variants of `liteinfer` itself) is a
-single command:
+Generate a canonical dataset, run any engine, and publish results to the dashboard
+in three steps:
 
 ```bash
-python -m benchmarks.compare \
-    --model meta-llama/Llama-3.2-1B-Instruct \
-    --engines liteinfer vllm \
-    --workload throughput \
-    --output benchmarks/results/throughput.json
+# 1. Generate dataset (once per model/ISL/OSL combination)
+bench dataset generate \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --isl 128 --osl 256 --num-samples 200
+
+# 2. Run benchmark
+bench run \
+  --engine liteinfer --type throughput \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --dataset benchmarks/datasets/isl128_osl256_n200_meta_llama_llama_3_2_1b_instruct.jsonl \
+  --tag my-feature
+
+# 3. Promote to dashboard and publish
+bench dashboard promote <run_id>
+bench dashboard build --output docs/index.html
+git add docs/index.html benchmarks/results/main.json && git commit -m "bench: publish"
 ```
 
-Metrics: requests/sec, output tokens/sec, TTFT (p50/p99), inter-token
-latency, peak GPU memory. See `benchmarks/README.md` for adding
-workloads or new engines.
+Engines: `liteinfer`, `vllm`, `trtllm`. See `benchmarks/envs/README.md` for
+per-engine setup. See `docs/benchmarks.md` for methodology and metric definitions.
 
 ## Roadmap
 
