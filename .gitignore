@@ -18,6 +18,8 @@ pip-wheel-metadata/
 venv/
 env/
 ENV/
+# Benchmark engine virtualenvs (multi-GB; keep README + setup scripts)
+benchmarks/envs/*/
 
 # Testing / coverage
 .pytest_cache/
