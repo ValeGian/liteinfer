@@ -113,7 +113,9 @@ async def _run_sample_async(llm, sample: dict, idx: int) -> dict:
     output_token_count = 0
     token_times: list[float] = []
 
-    async for output in llm.generate_async(sample["prompt"], sampling_params=params):
+    # streaming=True forces one yield per decode step. Without it generate_async
+    # yields a single final result, collapsing TTFT into E2E and ITL into ~0.
+    async for output in llm.generate_async(sample["prompt"], sampling_params=params, streaming=True):
         now = time.perf_counter()
         token_times.append(now)
         if first_token_time is None:
