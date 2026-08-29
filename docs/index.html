@@ -1,140 +1,42 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LiteInfer Benchmark Dashboard</title>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0 }
-  body {
-    font-family: system-ui, -apple-system, sans-serif;
-    background: #f4f4f6;
-    color: #1a1a1a;
-    padding: 2rem 2.5rem;
-    line-height: 1.5;
-  }
-  h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: .3rem }
-  .page-meta {
-    font-size: .8rem; color: #555; margin-bottom: 2rem;
-    display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
-  }
-  section { margin-bottom: 2.8rem }
-  h2 {
-    font-size: 1.05rem; font-weight: 700;
-    text-transform: capitalize; letter-spacing: .01em;
-    margin-bottom: .2rem;
-  }
-  .subtitle { font-size: .82rem; color: #555; margin-bottom: .4rem }
-  .run-meta {
-    display: flex; flex-wrap: wrap; gap: .5rem;
-    margin-bottom: .75rem;
-  }
-  .meta-item {
-    font-size: .76rem; color: #666;
-    background: #ebebeb; border-radius: 4px;
-    padding: 2px 8px;
-  }
-  .wrap { overflow-x: auto }
-  table {
-    border-collapse: collapse;
-    font-size: .83rem;
-    white-space: nowrap;
-    min-width: 360px;
-  }
-  th {
-    background: #e4e4e7;
-    font-weight: 600;
-    padding: 7px 14px;
-    border: 1px solid #ccc;
-    text-align: right;
-  }
-  th.l { text-align: left }
-  td {
-    padding: 6px 14px;
-    border: 1px solid #ddd;
-    text-align: right;
-    background: #fff;
-    vertical-align: middle;
-  }
-  td.engine {
-    text-align: left;
-    font-weight: 600;
-    background: #fafafa;
-    font-family: ui-monospace, monospace;
-    font-size: .8rem;
-  }
-  .best { background: #d1fae5; color: #065f46; font-weight: 700 }
-  .worst { background: #fee2e2; color: #991b1b; font-weight: 700 }
-  small.ratio-base  { display:block; font-size:.68rem; color:#999; font-weight:400 }
-  small.ratio-better { display:block; font-size:.68rem; color:#059669; font-weight:600 }
-  small.ratio-worse  { display:block; font-size:.68rem; color:#dc2626; font-weight:600 }
-
-  /* ── Tooltip ── */
-  .tip-host {
-    position: relative;
-    cursor: help;
-    text-decoration: underline dotted #aaa;
-    text-underline-offset: 2px;
-  }
-  .tip-host::after {
-    content: attr(data-tip);
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
-    background: #18181b;
-    color: #f4f4f5;
-    font-size: .74rem;
-    font-weight: 400;
-    padding: 6px 10px;
-    border-radius: 6px;
-    white-space: pre-wrap;
-    max-width: 280px;
-    width: max-content;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity .15s ease;
-    z-index: 200;
-    text-align: left;
-    box-shadow: 0 4px 12px rgba(0,0,0,.25);
-    line-height: 1.45;
-  }
-  .tip-host:hover::after { opacity: 1 }
-  td.engine .tip-host::after { left: 0; transform: none }
-  tbody tr:first-child td.engine .tip-host::after { bottom: auto; top: calc(100% + 8px) }
-  thead th .tip-host::after { bottom: auto; top: calc(100% + 8px); left: 50%; transform: translateX(-50%) }
-
-  /* ── Legend pills ── */
-  .legend-pill {
-    display: inline-block;
-    border-radius: 4px;
-    padding: 1px 7px;
-    font-size: .76rem;
-    font-weight: 600;
-  }
-  .best-pill { background: #d1fae5; color: #065f46 }
-  .worst-pill { background: #fee2e2; color: #991b1b }
-  .tag-pill {
-    background: #dbeafe;
-    color: #1d4ed8;
-    font-weight: 600;
-  }
-</style>
-</head>
-<body>
-<h1>LiteInfer Benchmark Dashboard</h1>
-<div class="page-meta">8 run(s) in history &nbsp;·&nbsp; 7 engine(s) compared &nbsp;·&nbsp; <span class='legend-pill best-pill'>green = best per column</span> <span class='legend-pill worst-pill'>red = worst per column</span> &nbsp;·&nbsp; x ratio is vs first (baseline) engine</div>
-<section><h2>throughput</h2><p class='subtitle'>All requests submitted at once — engine queues them, processes B=1 at a time. E2E includes queue wait.</p><div class='run-meta'><span class='meta-item'>📅 2026-05-10T17:08:24</span><span class='meta-item tag-pill'>paged-kv-cache</span><span class='meta-item' title='meta-llama/Llama-3.2-1B-Instruct'>🤖 Llama-3.2-1B-Instruct</span><span class='meta-item'>32 prompts · all submitted at once</span></div><div class='wrap'><table><thead><tr><th class='l'>Engine</th><th><span class='tip-host' data-tip='max_num_seqs the engine was configured with. B=1 disables batching; B=N lets the scheduler run up to N sequences in one forward pass.'>B</span></th><th><span class="tip-host" data-tip="Requests completed per wall-second. Measured over the full batch from first submission to last completion. Higher is better.">req/s</span></th><th><span class="tip-host" data-tip="Output tokens emitted per wall-second across all requests. Higher is better.">tok/s</span></th><th><span class="tip-host" data-tip="Median end-to-end latency per request, from batch submission (t₀) to last token. Includes queue wait time — later requests in a B=1 queue have higher E2E. Lower is better.">E2E p50</span></th><th><span class="tip-host" data-tip="99th-percentile end-to-end latency. With 32 requests and B=1, p99 ≈ the last request's E2E. Lower is better.">E2E p99</span></th></tr></thead><tbody><tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=none (RECOMPUTE), max_num_seqs=1&#10;Every step re-feeds the full and growing sequence. No KV cache — decode cost grows linearly with sequence length.">liteinfer</span></td><td class="batch">1</td><td>1.75<small class='ratio-base'>base</small></td><td>72.61<small class='ratio-base'>base</small></td><td>11607.0 ms<small class='ratio-base'>base</small></td><td>18248.8 ms<small class='ratio-base'>base</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=eager (DynamicCache), max_num_seqs=1&#10;Prefill runs once to populate the KV cache. Each decode step passes only the new token — O(1) input, O(n) attention lookup.">liteinfer-kvcache</span></td><td class="batch">1</td><td>1.81<small class='ratio-better'>1.03x</small></td><td>72.47<small class='ratio-worse'>1.00x</small></td><td>10190.2 ms<small class='ratio-better'>1.14x</small></td><td>17647.9 ms<small class='ratio-better'>1.03x</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=native_eager (plain-tensor KV cache), max_num_seqs=1&#10;Prefill runs once; each decode step passes only the new token. KV cache stored as plain tensors — no DynamicCache wrapper overhead.">liteinfer-native-kvcache</span></td><td class="batch">1</td><td>1.81<small class='ratio-better'>1.03x</small></td><td>72.16<small class='ratio-worse'>0.99x</small></td><td>10232.8 ms<small class='ratio-better'>1.13x</small></td><td>17724.8 ms<small class='ratio-better'>1.03x</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=paged (block-allocated KV cache), max_num_seqs=1&#10;Tokens stored in fixed-size blocks drawn from a pre-allocated pool. Eliminates memory fragmentation; foundation for prefix sharing (§2.2).">liteinfer-paged-kvcache</span></td><td class="batch">1</td><td class="worst"><span class="tip-host" data-tip="Worst in column — 6.87x slower than best">1.57<small class='ratio-worse'>0.89x</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 10.46x slower than best">62.70<small class='ratio-worse'>0.86x</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 7.24x slower than best">11771.8 ms<small class='ratio-worse'>0.99x</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 6.96x slower than best">20397.1 ms<small class='ratio-worse'>0.89x</small></span></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=eager, max_num_seqs=4&#10;Static batching with B=4: up to four prompts share one PREFILL and decode together until every member finishes. Eager KV cache; left-padded prefill with pad-aware additive attention mask.">liteinfer-b4</span></td><td class="batch">4</td><td>4.31<small class='ratio-better'>2.46x</small></td><td>177.06<small class='ratio-better'>2.44x</small></td><td>4220.3 ms<small class='ratio-better'>2.75x</small></td><td>7420.9 ms<small class='ratio-better'>2.46x</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="vLLM 0.20.0 · max_num_seqs=1 (B=1)&#10;FlashAttention 2, torch.compile, CUDA graphs for decode, paged KV cache, prefix caching enabled.">vllm</span></td><td class="batch">1</td><td>2.90<small class='ratio-better'>1.65x</small></td><td>180.71<small class='ratio-better'>2.49x</small></td><td>5795.9 ms<small class='ratio-better'>2.00x</small></td><td>10998.8 ms<small class='ratio-better'>1.66x</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="vLLM 0.20.0 · max_num_seqs=4 (B=4)&#10;Continuous batching of up to 4 sequences. Same kernels as vllm B=1: FlashAttention 2, torch.compile, CUDA graphs, paged KV, prefix caching.">vllm-b4</span></td><td class="batch">4</td><td class="best"><span class="tip-host" data-tip="Best in column — 6.87x better than worst">10.77<small class='ratio-better'>6.14x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 10.46x better than worst">655.89<small class='ratio-better'>9.03x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 7.24x better than worst">1625.3 ms<small class='ratio-better'>7.14x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 6.96x better than worst">2931.8 ms<small class='ratio-better'>6.22x</small></span></td></tr></tbody></table></div></section>
-<section><h2>latency</h2><p class='subtitle'>Sequential, no queue — each request sent only after previous finishes. Pure per-request engine latency.</p><div class='run-meta'><span class='meta-item'>📅 2026-05-10T17:12:40</span><span class='meta-item tag-pill'>paged-kv-cache</span><span class='meta-item' title='meta-llama/Llama-3.2-1B-Instruct'>🤖 Llama-3.2-1B-Instruct</span><span class='meta-item'>20 prompts · sequential, no queue</span></div><div class='wrap'><table><thead><tr><th class='l'>Engine</th><th><span class='tip-host' data-tip='max_num_seqs the engine was configured with. B=1 disables batching; B=N lets the scheduler run up to N sequences in one forward pass.'>B</span></th><th><span class="tip-host" data-tip="Median time-to-first-token: wall clock from request submission to when the first output token is ready. No queue contamination in this workload. Lower is better.">TTFT p50</span></th><th><span class="tip-host" data-tip="99th-percentile TTFT. Variance here reflects scheduling jitter and GPU state. Lower is better.">TTFT p99</span></th><th><span class="tip-host" data-tip="Median end-to-end latency per request: submission to last token. Sequential workload — no queue wait. Lower is better.">E2E p50</span></th><th><span class="tip-host" data-tip="Output tokens per wall-second (total tokens / total wall time across all sequential requests). Reflects steady-state decode throughput. Higher is better.">tok/s</span></th></tr></thead><tbody><tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=none (RECOMPUTE), max_num_seqs=1&#10;Every step re-feeds the full and growing sequence. No KV cache — decode cost grows linearly with sequence length.">liteinfer</span></td><td class="batch">1</td><td class="best"><span class="tip-host" data-tip="Best in column — 1.89x better than worst">13.7 ms<small class='ratio-base'>base</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 1.87x better than worst">15.4 ms<small class='ratio-base'>base</small></span></td><td>1710.4 ms<small class='ratio-base'>base</small></td><td>72.37<small class='ratio-base'>base</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=eager (DynamicCache), max_num_seqs=1&#10;Prefill runs once to populate the KV cache. Each decode step passes only the new token — O(1) input, O(n) attention lookup.">liteinfer-kvcache</span></td><td class="batch">1</td><td>14.6 ms<small class='ratio-worse'>0.94x</small></td><td>16.8 ms<small class='ratio-worse'>0.92x</small></td><td>1540.8 ms<small class='ratio-better'>1.11x</small></td><td>72.64<small class='ratio-better'>1.00x</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=native_eager (plain-tensor KV cache), max_num_seqs=1&#10;Prefill runs once; each decode step passes only the new token. KV cache stored as plain tensors — no DynamicCache wrapper overhead.">liteinfer-native-kvcache</span></td><td class="batch">1</td><td>13.9 ms<small class='ratio-worse'>0.99x</small></td><td>15.6 ms<small class='ratio-worse'>0.99x</small></td><td>1539.5 ms<small class='ratio-better'>1.11x</small></td><td>72.65<small class='ratio-better'>1.00x</small></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="liteinfer · cache_mode=paged (block-allocated KV cache), max_num_seqs=1&#10;Tokens stored in fixed-size blocks drawn from a pre-allocated pool. Eliminates memory fragmentation; foundation for prefix sharing (§2.2).">liteinfer-paged-kvcache</span></td><td class="batch">1</td><td>14.7 ms<small class='ratio-worse'>0.94x</small></td><td>16.7 ms<small class='ratio-worse'>0.92x</small></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 2.64x slower than best">1829.0 ms<small class='ratio-worse'>0.94x</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 2.98x slower than best">61.24<small class='ratio-worse'>0.85x</small></span></td></tr>
-<tr><td class="engine"><span class="tip-host" data-tip="vLLM 0.20.0 · max_num_seqs=1 (B=1)&#10;FlashAttention 2, torch.compile, CUDA graphs for decode, paged KV cache, prefix caching enabled.">vllm</span></td><td class="batch">1</td><td class="worst"><span class="tip-host" data-tip="Worst in column — 1.89x slower than best">25.9 ms<small class='ratio-worse'>0.53x</small></span></td><td class="worst"><span class="tip-host" data-tip="Worst in column — 1.87x slower than best">28.8 ms<small class='ratio-worse'>0.54x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 2.64x better than worst">693.1 ms<small class='ratio-better'>2.47x</small></span></td><td class="best"><span class="tip-host" data-tip="Best in column — 2.98x better than worst">182.43<small class='ratio-better'>2.52x</small></span></td></tr></tbody></table></div></section>
-</body>
-</html>
+<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>liteinfer benchmarks</title><style>
+:root { --bg:#fbfbfd; --fg:#17171a; --muted:#6b7280; --line:#e7e7ec; --card:#fff;
+        --good:#0a7f5c; --bad:#b4342a; --bar:#c9d3e8; --bar-vllm:#e2d6c4; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#111114; --fg:#eaeaef; --muted:#9aa0aa; --line:#2b2b32; --card:#191920;
+          --good:#4ade80; --bad:#f87171; --bar:#33405e; --bar-vllm:#4a4032; }
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--fg); padding:44px 22px 72px;
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+main { max-width:1120px; margin:0 auto; }
+h1 { font-size:1.55rem; letter-spacing:-.021em; }
+.lede { color:var(--muted); font-size:.92rem; margin:8px 0 26px; max-width:70ch; }
+.facts { display:flex; flex-wrap:wrap; gap:8px 26px; padding:14px 18px; margin-bottom:34px;
+         background:var(--card); border:1px solid var(--line); border-radius:10px;
+         font-size:.8rem; color:var(--muted); }
+.facts b { color:var(--fg); font-weight:600; }
+h2 { font-size:1.02rem; margin:34px 0 3px; letter-spacing:-.01em; }
+.meta { color:var(--muted); font-size:.81rem; margin-bottom:12px; }
+.warn { color:var(--bad); font-size:.81rem; margin-bottom:12px; font-weight:600; }
+.scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; background:var(--card);
+        border:1px solid var(--line); border-radius:10px; }
+th,td { padding:8px 13px; text-align:right; white-space:nowrap;
+        font-variant-numeric:tabular-nums; }
+th:first-child,td:first-child { text-align:left; }
+th { font-size:.71rem; font-weight:600; color:var(--muted); text-transform:uppercase;
+     letter-spacing:.05em; border-bottom:1px solid var(--line); }
+td { border-bottom:1px solid var(--line); font-size:.86rem; }
+tr:last-child td { border-bottom:none; }
+tr.ref td:first-child { color:var(--muted); }
+.name { position:relative; }
+.name .label { font-weight:500; }
+.name .desc { display:block; color:var(--muted); font-size:.74rem; font-weight:400; }
+.bar { display:block; height:3px; border-radius:2px; background:var(--bar); margin-top:5px; }
+tr.ref .bar { background:var(--bar-vllm); }
+td.best { color:var(--good); font-weight:600; }
+.up { color:var(--good); font-weight:600; }
+.down { color:var(--bad); font-weight:600; }
+.nil { color:var(--muted); }
+footer { color:var(--muted); font-size:.78rem; margin-top:38px; }
+</style></head><body><main><h1>liteinfer benchmarks</h1><p class="lede">Each config is scored against the one it improves on (<b>vs base</b>), against the start of its lineage (<b>vs first</b>), and against vLLM at the same batch width (<b>vs vLLM</b>). Above 1.00x is better. Each row names the config it improves on; vLLM rows are references, not competitors. Bars show standing on the headline metric of each table.</p><div class="facts"><span>model <b>Llama-3.2-1B-Instruct</b></span><span>ISL <b>128</b></span><span>OSL <b>256</b></span><span>prompts <b>50 / 200</b></span><span>decoding <b>greedy, forced length</b></span><span>last run <b>2026-08-29T16:03:49+00:00</b></span></div><h2>latency · Llama-3.2-1B-Instruct · ISL=128 OSL=256</h2><p class="meta">One request in flight at a time. Headline metric: ITL p50. 50 prompts, forced output length 256. Prompt set 7790c497f52d.</p><div class="scroll"><table><thead><tr><th>config</th><th>ITL p50</th><th>ITL p95</th><th>TTFT p50</th><th>TTFT p95</th><th>E2E p50</th><th>vs base</th><th>vs first</th><th>vs vLLM</th></tr></thead><tbody><tr class=""><td class="name"><span class="label">liteinfer-nocache</span><span class="desc">No KV cache: every step re-feeds the whole sequence &middot; reference point</span><span class="bar" style="width:31.9%"></span></td><td>16.5</td><td>16.5</td><td class="best">14.7</td><td class="best">15.9</td><td>4,210.3</td><td class="nil">—</td><td class="nil">—</td><td class="down">0.32x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-eager</span><span class="desc">KV cache via transformers DynamicCache &middot; improves on liteinfer-nocache</span><span class="bar" style="width:38.0%"></span></td><td>13.8</td><td>13.9</td><td>15.7</td><td>17.1</td><td>3,535.1</td><td class="up">1.19x</td><td class="up">1.19x</td><td class="down">0.38x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-native-eager</span><span class="desc">KV cache as plain tensors, no DynamicCache &middot; improves on liteinfer-eager</span><span class="bar" style="width:37.3%"></span></td><td>14.1</td><td>14.1</td><td>15.1</td><td>16.7</td><td>3,598.0</td><td class="down">0.98x</td><td class="up">1.17x</td><td class="down">0.37x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-paged</span><span class="desc">Paged KV cache: fixed-size blocks from a pool &middot; improves on liteinfer-native-eager</span><span class="bar" style="width:27.9%"></span></td><td>18.8</td><td>18.9</td><td>18.5</td><td>20.2</td><td>4,816.7</td><td class="down">0.75x</td><td class="down">0.87x</td><td class="down">0.28x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-eager-b4</span><span class="desc">Static batching, B=4, eager cache &middot; improves on liteinfer-eager</span><span class="bar" style="width:37.5%"></span></td><td>14.0</td><td>14.2</td><td>16.0</td><td>17.8</td><td>3,576.5</td><td class="down">0.99x</td><td class="up">1.18x</td><td class="down">0.38x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-native-eager-b4</span><span class="desc">Static batching, B=4, native eager cache &middot; improves on liteinfer-native-eager</span><span class="bar" style="width:36.8%"></span></td><td>14.2</td><td>14.3</td><td>15.2</td><td>17.1</td><td>3,645.9</td><td class="down">0.99x</td><td class="up">1.16x</td><td class="down">0.37x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-paged-b4</span><span class="desc">Static batching, B=4, paged cache &middot; improves on liteinfer-paged</span><span class="bar" style="width:27.5%"></span></td><td>19.0</td><td>19.1</td><td>18.7</td><td>20.6</td><td>4,870.1</td><td class="down">0.99x</td><td class="down">0.86x</td><td class="down">0.28x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-continuous</span><span class="desc">Continuous batching, up to 32 concurrent sequences &middot; improves on liteinfer-paged-b4</span><span class="bar" style="width:27.7%"></span></td><td>18.9</td><td>19.0</td><td>18.8</td><td>20.5</td><td>4,843.4</td><td class="up">1.01x</td><td class="down">0.87x</td><td class="down">0.28x</td></tr><tr class="ref"><td class="name"><span class="label">vllm</span><span class="desc">vLLM, one sequence at a time &middot; reference point</span><span class="bar" style="width:99.8%"></span></td><td>5.2</td><td>5.3</td><td>21.3</td><td>25.7</td><td>1,359.6</td><td class="nil">—</td><td class="nil">—</td><td class="nil">—</td></tr><tr class="ref"><td class="name"><span class="label">vllm-b4</span><span class="desc">vLLM, up to 4 concurrent sequences &middot; reference point</span><span class="bar" style="width:100.0%"></span></td><td>5.2</td><td>5.3</td><td>22.1</td><td>31.3</td><td>1,358.9</td><td class="nil">—</td><td class="nil">—</td><td class="nil">—</td></tr><tr class="ref"><td class="name"><span class="label">vllm-continuous</span><span class="desc">vLLM, up to 32 concurrent sequences &middot; reference point</span><span class="bar" style="width:100.0%"></span></td><td class="best">5.2</td><td class="best">5.3</td><td>21.6</td><td>33.1</td><td class="best">1,358.8</td><td class="nil">—</td><td class="nil">—</td><td class="nil">—</td></tr></tbody></table></div><h2>throughput · Llama-3.2-1B-Instruct · ISL=128 OSL=256</h2><p class="meta">Every request offered at once. Headline metric: output tok/s. 200 prompts, forced output length 256. Prompt set d97d71495aff.</p><div class="scroll"><table><thead><tr><th>config</th><th>tok/s</th><th>req/s</th><th>wall (s)</th><th>vs base</th><th>vs first</th><th>vs vLLM</th></tr></thead><tbody><tr class=""><td class="name"><span class="label">liteinfer-nocache</span><span class="desc">No KV cache: every step re-feeds the whole sequence &middot; reference point</span><span class="bar" style="width:1.4%"></span></td><td>60.9</td><td>0.2</td><td>840.5</td><td class="nil">—</td><td class="nil">—</td><td class="down">0.32x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-eager</span><span class="desc">KV cache via transformers DynamicCache &middot; improves on liteinfer-nocache</span><span class="bar" style="width:1.6%"></span></td><td>73.2</td><td>0.3</td><td>699.9</td><td class="up">1.20x</td><td class="up">1.20x</td><td class="down">0.39x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-native-eager</span><span class="desc">KV cache as plain tensors, no DynamicCache &middot; improves on liteinfer-eager</span><span class="bar" style="width:1.6%"></span></td><td>73.3</td><td>0.3</td><td>698.1</td><td class="up">1.00x</td><td class="up">1.20x</td><td class="down">0.39x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-paged</span><span class="desc">Paged KV cache: fixed-size blocks from a pool &middot; improves on liteinfer-native-eager</span><span class="bar" style="width:1.2%"></span></td><td>52.7</td><td>0.2</td><td>971.0</td><td class="down">0.72x</td><td class="down">0.87x</td><td class="down">0.28x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-eager-b4</span><span class="desc">Static batching, B=4, eager cache &middot; improves on liteinfer-eager</span><span class="bar" style="width:6.1%"></span></td><td>271.1</td><td>1.1</td><td>188.8</td><td class="up">3.71x</td><td class="up">4.45x</td><td class="down">0.37x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-native-eager-b4</span><span class="desc">Static batching, B=4, native eager cache &middot; improves on liteinfer-native-eager</span><span class="bar" style="width:6.1%"></span></td><td>270.9</td><td>1.1</td><td>189.0</td><td class="up">3.69x</td><td class="up">4.45x</td><td class="down">0.37x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-paged-b4</span><span class="desc">Static batching, B=4, paged cache &middot; improves on liteinfer-paged</span><span class="bar" style="width:2.6%"></span></td><td>116.7</td><td>0.5</td><td>438.6</td><td class="up">2.21x</td><td class="up">1.92x</td><td class="down">0.16x</td></tr><tr class=""><td class="name"><span class="label">liteinfer-continuous</span><span class="desc">Continuous batching, up to 32 concurrent sequences &middot; improves on liteinfer-paged-b4</span><span class="bar" style="width:4.0%"></span></td><td>180.5</td><td>0.7</td><td>283.6</td><td class="up">1.55x</td><td class="up">2.96x</td><td class="down">0.04x</td></tr><tr class="ref"><td class="name"><span class="label">vllm</span><span class="desc">vLLM, one sequence at a time &middot; reference point</span><span class="bar" style="width:4.2%"></span></td><td>188.4</td><td>0.7</td><td>271.8</td><td class="nil">—</td><td class="nil">—</td><td class="nil">—</td></tr><tr class="ref"><td class="name"><span class="label">vllm-b4</span><span class="desc">vLLM, up to 4 concurrent sequences &middot; reference point</span><span class="bar" style="width:16.2%"></span></td><td>724.0</td><td>2.8</td><td>70.7</td><td class="nil">—</td><td class="nil">—</td><td class="nil">—</td></tr><tr class="ref"><td class="name"><span class="label">vllm-continuous</span><span class="desc">vLLM, up to 32 concurrent sequences &middot; reference point</span><span class="bar" style="width:100.0%"></span></td><td class="best">4,465.9</td><td class="best">17.4</td><td class="best">11.5</td><td class="nil">—</td><td class="nil">—</td><td class="nil">—</td></tr></tbody></table></div><footer>Run-to-run variance on this hardware is roughly ±4%. Generated by <code>bench report</code>.</footer></main></body></html>

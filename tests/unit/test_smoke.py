@@ -23,6 +23,24 @@ def test_sampling_params_rejects_zero_max_tokens() -> None:
         SamplingParams(max_tokens=0)
 
 
+def test_sampling_params_rejects_negative_min_tokens() -> None:
+    with pytest.raises(ValueError):
+        SamplingParams(min_tokens=-1)
+
+
+def test_sampling_params_rejects_min_tokens_greater_than_max_tokens() -> None:
+    with pytest.raises(ValueError):
+        SamplingParams(max_tokens=5, min_tokens=10)
+
+
+def test_sampling_params_ignore_eos_defaults_false() -> None:
+    assert SamplingParams().ignore_eos is False
+
+
+def test_sampling_params_min_tokens_defaults_zero() -> None:
+    assert SamplingParams().min_tokens == 0
+
+
 def test_sampling_params_greedy_when_temperature_zero() -> None:
     assert SamplingParams(temperature=0.0).greedy
     assert not SamplingParams(temperature=0.7).greedy

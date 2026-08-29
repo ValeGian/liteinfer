@@ -13,6 +13,8 @@ class SamplingParams:
     top_k: int = -1  # -1 disables top-k
 
     max_tokens: int = 64
+    min_tokens: int = 0
+    ignore_eos: bool = False
     stop: list[str] | None = None
     stop_token_ids: list[int] | None = None
 
@@ -31,6 +33,10 @@ class SamplingParams:
             raise ValueError("top_k must be -1 (disabled) or >= 1")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
+        if self.min_tokens < 0:
+            raise ValueError("min_tokens must be >= 0")
+        if self.min_tokens > self.max_tokens:
+            raise ValueError("min_tokens must be <= max_tokens")
 
     @property
     def greedy(self) -> bool:

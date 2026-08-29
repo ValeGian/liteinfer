@@ -18,7 +18,6 @@ pip-wheel-metadata/
 venv/
 env/
 ENV/
-
 # Testing / coverage
 .pytest_cache/
 .coverage
@@ -65,9 +64,10 @@ checkpoints/
 hf_cache/
 .cache/
 
-# Benchmark output
-benchmarks/results/
-!benchmarks/results/.gitkeep
+# Results are committed so the report rebuilds from a clean clone. Datasets are
+# not: they carry raw scraped text (secrets included) and regenerate exactly from
+# the pinned corpus revision + seed via `bench dataset`.
+benchmarks/datasets/
 
 # Environment files
 .env
@@ -84,4 +84,3 @@ nsight_*.sqlite
 CLAUDE.md
 .bench/
 .dev/
-.trtllm/

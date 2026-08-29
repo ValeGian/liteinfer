@@ -1,120 +1,84 @@
 # Benchmarks
 
-Compare `liteinfer` against `vllm` (and any other engine or variant you wire up)
-on identical workloads, with the same measurement code on both sides.
+Measures every liteinfer configuration against the one it improves on, and
+against vLLM, on byte-identical prompts.
 
-## Design
-
-Every engine implements the `EngineRunner` interface in
-`benchmarks/runners/base.py`:
-
-```python
-class EngineRunner(Protocol):
-    name: str
-    def setup(self, model: str, **kwargs) -> None: ...
-    def generate(self, prompts: list[str], sampling: SamplingSpec) -> list[GenerationResult]: ...
-    def teardown(self) -> None: ...
-```
-
-Workloads (`benchmarks/workloads.py`) are pure data — a list of prompts
-plus sampling parameters. Measurement (`benchmarks/metrics.py`) is
-engine-agnostic.
-
-## Running a single comparison
+## Quick start
 
 ```bash
-python -m benchmarks.compare \
-    --model meta-llama/Llama-3.2-1B-Instruct \
-    --engines liteinfer vllm \
-    --workload throughput
+pip install -e ".[dev,bench]"
+
+# 1. Build a dataset (once per model + ISL/OSL)
+bench dataset --model meta-llama/Llama-3.2-1B-Instruct --isl 128 --osl 256 -n 200
+
+DS=benchmarks/datasets/isl128_osl256_n200_meta_llama_llama_3_2_1b_instruct.json
+
+# 2. Run. Throughput can spread over GPUs; latency must not (see Controls).
+bench run --all --dataset "$DS" --mode throughput -n 200 --gpus 0 1 2 3 4 5 6 7
+bench run --all --dataset "$DS" --mode latency    -n 50
+
+# 3. Report
+bench report --out docs/index.html
 ```
 
-The terminal prints a side-by-side table of all metrics plus a speedup
-summary vs the first engine listed.
-
-## Tracking optimization impact over time
-
-Tag every run with `--tag` and accumulate results in a JSONL history file
-with `--append-history`:
+Run one config while iterating:
 
 ```bash
-# Before the optimization
-python -m benchmarks.compare \
-    --model meta-llama/Llama-3.2-1B-Instruct \
-    --engines liteinfer vllm \
-    --workload throughput \
-    --tag baseline \
-    --append-history benchmarks/results/history.jsonl
-
-# After implementing the optimization
-python -m benchmarks.compare \
-    --model meta-llama/Llama-3.2-1B-Instruct \
-    --engines liteinfer vllm \
-    --workload throughput \
-    --tag prefix-cache \
-    --append-history benchmarks/results/history.jsonl
+bench run --config liteinfer-paged --dataset "$DS" --mode latency -n 20
 ```
 
-Generate the HTML dashboard from the accumulated history:
+## The two modes measure different things
 
-```bash
-python -m benchmarks.dashboard \
-    --history benchmarks/results/history.jsonl \
-    --output benchmarks/results/dashboard.html
-```
+| | `throughput` | `latency` |
+|---|---|---|
+| Offered load | every prompt at once | one request at a time |
+| Reports | output tok/s, req/s | TTFT, ITL, E2E percentiles |
 
-Open `dashboard.html` in a browser. Rows are ordered chronologically;
-cells that improved ≥5 % vs the previous run are **green**, regressions
-are **red**. Each workload gets its own section; all engines appear as
-column groups so you can read across a run horizontally and down a column
-to see the trend.
+They report disjoint metrics on purpose. Under saturation a per-request latency
+mostly records where the request sat in the queue, so it says little about the
+engine; at one request in flight there is no throughput to speak of. Mixing the
+two is how benchmarks end up comparing queue depth and calling it speed.
 
-## Comparing two liteinfer variants
+ITL is derived, not instrumented: with one request in flight and a forced output
+length, `(e2e - ttft) / (osl - 1)` is the mean decode-step cost. TTFT comes from a
+separate pass capped at a single token. Both engines are therefore measured by
+the same clock, with no per-token hooks that each would implement differently.
 
-Register a second runner alongside the default one:
+## Configs
 
-1. Copy `benchmarks/runners/liteinfer_runner.py` to e.g. `liteinfer_prefix_runner.py`.
-2. Adjust `setup()` to enable the feature (e.g. `enable_prefix_caching=True`).
-3. Register it in `benchmarks/runners/__init__.py`:
-   ```python
-   RUNNERS["liteinfer-prefix"] = LiteInferPrefixRunner
-   ```
-4. Pass both names to `--engines`:
-   ```bash
-   python -m benchmarks.compare \
-       --engines liteinfer liteinfer-prefix vllm ...
-   ```
+`benchmarks/configs.py` is the matrix. Each entry names the config it improves
+on via `baseline`, and the report turns that into a 1:1 delta — which is how a
+change is judged. Adding a config is one entry; no other file changes.
 
-## Saving raw results to JSON
+## Controls
 
-`--output PATH` writes the full run record (timestamp, tag, workload,
-model, per-engine metrics) as JSON to the given path.
+- **Identical prompts.** One dataset file per (model, ISL, OSL). Datasets are not
+  committed — they hold raw scraped text, secrets and all — but regenerate byte
+  for byte from the pinned corpus revision and seed. Every result records the
+  SHA-256 of its prompt set, and the report flags any group whose members disagree.
+- **Forced output length.** `min_tokens = max_tokens = OSL`, `ignore_eos=True`, so
+  output-length variance can never be mistaken for an engine difference. A run
+  whose lengths come back wrong fails rather than reporting.
+- **Warmup.** Before the clock starts, each run exercises the path it is about to
+  measure — real prompts at the benchmark's ISL, at the real batch width — so
+  kernel autotuning and CUDA graph capture land outside the timed region.
+- **Isolation.** Each (config, mode) runs in a fresh process, so no GPU state or
+  allocator fragmentation carries between configs. `--gpus` spreads runs over
+  several GPUs, each worker pinned to its own block of CPU cores.
+- **Latency runs sequentially.** TTFT is largely fixed per-call overhead, which is
+  CPU-scheduling sensitive: measured inside an 8-worker sweep, vLLM's TTFT read 24%
+  high while its ITL was untouched. Throughput is GPU-bound and parallelises safely.
+  `bench run` warns if you combine `--gpus` with latency mode.
+- **Greedy decoding**, fixed seed.
 
-## Adding a new engine
+## Layout
 
-1. Drop a file in `benchmarks/runners/` implementing the interface.
-2. Register it in `benchmarks/runners/__init__.py`.
-
-## Workloads
-
-| Workload       | Stresses                                       |
-| -------------- | ---------------------------------------------- |
-| `throughput`   | Continuous batching, request scheduling.       |
-| `latency`      | TTFT, end-to-end latency on a single request.  |
-| `prefix_share` | Prefix caching (shared system prompts).        |
-
-Add new workloads by appending to `benchmarks/workloads.py`.
-
-## Metrics
-
-| Metric             | Description                                                          |
-| ------------------ | -------------------------------------------------------------------- |
-| `req/s`            | Requests completed per wall-second.                                  |
-| `tok/s`            | Output tokens emitted per wall-second.                               |
-| `TTFT p50/p99`     | Wall time from request start to first emitted token.                 |
-| `E2E p50/p99`      | Wall time for the full generation of one request.                    |
-| `peak_memory_bytes`| Peak GPU memory allocated during `generate()` (when measurable).    |
-
-Runners that track peak CUDA memory expose a `peak_memory_bytes`
-attribute after `generate()` returns; `compare.py` reads it with
-`getattr` so runners without it are unaffected.
+| Module | Responsibility |
+|---|---|
+| `configs.py` | The benchmark matrix and its comparison lineage |
+| `dataset.py` | Build / load a canonical dataset; prompt-set digest |
+| `adapters.py` | Per-engine translation of one primitive: prompts → output lengths |
+| `harness.py` | Warm up, time, verify, write the result file |
+| `stats.py` | Percentiles and rates |
+| `report.py` | Result files → text table and a standalone HTML page |
+| `cli.py` | `bench dataset` / `bench run` / `bench report` |

@@ -73,13 +73,20 @@ listed.
 ### 2.3 Paged KV cache performance (fused kernel)
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous
-  KV blocks into a contiguous buffer before attention — ~13% throughput
-  and ~19% E2E regression vs eager at B=1. A fused paged-attention
-  kernel reads the block table directly inside the CUDA kernel,
-  eliminating the gather entirely (same approach as vLLM's
-  PagedAttention kernel). Closes the performance gap and makes paged
-  faster than eager at high occupancy.
+- **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous KV blocks
+  into a contiguous buffer before attention. Measured 29-08-2026 at ISL 128 /
+  OSL 256 that costs far more than the ~13% first recorded at OSL 64: paged runs
+  at **0.72x of native-eager** on both throughput (73.3 -> 52.7 tok/s) and ITL
+  (13.8 -> 19.0 ms), and is **slower per decode step than running with no KV cache
+  at all** (19.0 vs 16.5 ms). `PagedKVCache._gather_all` rebuilds the whole K/V
+  history into a fresh padded tensor once per layer per step — roughly 8k Python
+  tensor ops and ~200 MB copied per step at B=32, so a batch-32 step costs 130 ms
+  against 19 ms at batch 1, where a bandwidth-bound decode should cost about the
+  same at both widths. Continuous batching (§1.2) is built on paged and inherits
+  it: batch occupancy is full (measured: every step at width 32) yet an 8x wider
+  batch yields only 1.55x throughput, where vLLM gets 6.17x. A fused
+  paged-attention kernel reads the block table inside the CUDA kernel and removes
+  the gather entirely, the same approach as vLLM's PagedAttention.
 - **Scope.** Custom CUDA/Triton kernel for block-table attention;
   `ModelRunner` switches to it when `cache_mode="paged"`.
 - **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the
@@ -99,6 +106,22 @@ listed.
 ---
 
 ## 3. Performance optimizations
+
+### 2.7 Async engine step metrics
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** `AsyncLLMEngine` never calls `stats.record()`, so the continuous
+  path emits no `StepMetrics` at all — no phase, batch width, token count or
+  per-step wall time. `LLMEngine` records all of it. Diagnosing the continuous
+  batching shortfall behind §2.3 required monkey-patching
+  `ContinuousScheduler.schedule` from a throwaway script to recover batch
+  occupancy, which is not a workflow anyone should need to repeat.
+- **Scope.** Record a `StepMetrics` per step in `AsyncLLMEngine._step`, with a
+  phase for the mixed prefill+decode case the two-pass step creates. Reuse
+  `EngineStats`; no new types.
+- **Parity test.** A continuous run reports the same total token count through
+  `EngineStats` as the returned outputs contain, and batch width never exceeds
+  `max_num_seqs`.
 
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
@@ -214,25 +237,6 @@ listed.
 
 ## 8. Benchmark harness
 
-### 8.1 ISL / OSL-controlled workloads
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Current workloads let the model decide output length (EOS
-  or `max_tokens`), so two engines may generate different numbers of
-  tokens for the same prompt. This makes tok/s and E2E comparisons
-  unreliable across engines. Fixed ISL (Input Sequence Length) and
-  OSL (Output Sequence Length) give reproducible, apples-to-apples
-  numbers.
-- **Scope.** Add `isl` / `osl` parameters to `Workload` and to the
-  `--workload` CLI flag. Prompt construction: tokenize a template to
-  exactly ISL tokens (pad or truncate). Output forcing: pass
-  `min_tokens=OSL, max_tokens=OSL` to each engine (requires
-  liteinfer `SamplingParams` to expose `min_tokens`). Add standard
-  workload presets such as `(ISL=128, OSL=128)` and
-  `(ISL=512, OSL=512)` to `benchmarks/workloads.py`.
-- **Parity test.** Assert `len(output_token_ids) == OSL` for every
-  result in both engines.
-
 ### 8.2 Plain HuggingFace `transformers` benchmark runner
 - **Status.** `planned`
 - **PRs.** _none yet_
@@ -240,12 +244,8 @@ listed.
   `transformers.AutoModelForCausalLM.generate` runner gives a
   simpler, dependency-free lower bound and makes liteinfer's
   overhead vs raw HF visible without the vLLM install requirement.
-- **Scope.** New `benchmarks/runners/hf_runner.py` implementing
-  `EngineRunner`. `setup` loads the model via `AutoModelForCausalLM`
-  and `AutoTokenizer`; `generate` calls `.generate()` with greedy
-  decoding. Register under key `"hf"` in
-  `benchmarks/runners/__init__.py::RUNNERS`. No new dependencies —
-  `transformers` is already required by liteinfer.
+- **Scope.** New adapter class in `benchmarks/adapters.py`, plus one
+  `BenchmarkConfig` entry in `benchmarks/configs.py`.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
@@ -261,12 +261,8 @@ listed.
   currently invisible in the benchmark suite. A sequence-length sweep
   makes this crossover explicit, validates that §2.6 (pre-allocated
   buffer) actually closes the gap, and guards against regressions.
-- **Scope.** New `sweep` workload factory in `benchmarks/workloads.py`
-  parameterised by `(isl, osl)` pairs (pre-req §8.1). The `compare` CLI
-  gains a `--sweep` flag that iterates over a default grid, e.g.
-  `osl ∈ {16, 64, 128, 256, 512}` at fixed `isl=32`. Results are
-  written to the history JSONL and the dashboard renders a
-  throughput-vs-OSL line chart per engine.
+- **Scope.** New `bench run-sweep` subcommand iterating over `(ISL, OSL)` pairs,
+  calling `harness.run()` for each. `report.py` renders a tok/s-vs-OSL section.
 - **Pre-req.** §8.1 (ISL/OSL-controlled workloads).
 - **Parity test.** Greedy outputs identical across engines at each
   (ISL, OSL) point.

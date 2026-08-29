@@ -1,0 +1,26 @@
+{
+  "config": "liteinfer-paged",
+  "engine": "liteinfer",
+  "description": "Paged KV cache: fixed-size blocks from a pool",
+  "baseline": "liteinfer-native-eager",
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 1,
+  "timestamp": "2026-08-29T15:03:28+00:00",
+  "dataset": {
+    "path": "benchmarks/datasets/isl128_osl256_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": 128,
+    "target_osl": 256,
+    "num_samples": 200,
+    "sha256": "d97d71495aff03159e2deb9e9a6e918dc6698b03311bd955a7d6f8b306273cb8"
+  },
+  "summary": {
+    "output_tokens_per_s": 52.73047292278799,
+    "requests_per_s": 0.20597840985464058,
+    "wall_time_s": 970.9755509868264
+  },
+  "raw": {
+    "wall_time_s": 970.9755509868264,
+    "output_tokens": 51200
+  }
+}

@@ -1,10 +1,9 @@
 """E2E test configuration.
 
-vLLM 0.20.0 forks worker processes by default on Linux.  CUDA cannot be
-re-initialised inside a forked child when the parent already called into
-CUDA (which pytest does via the root conftest's torch.cuda.is_available()).
-Setting VLLM_WORKER_MULTIPROC_METHOD=spawn here — before any fixture that
-calls LLM() — avoids the RuntimeError.
+vLLM forks worker processes by default on Linux. CUDA cannot be re-initialised
+inside a forked child once the parent has called into CUDA (which pytest does
+via the root conftest's torch.cuda.is_available()), so force spawn before any
+fixture constructs an engine.
 """
 
 from __future__ import annotations

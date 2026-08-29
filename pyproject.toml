@@ -38,16 +38,17 @@ dev = [
     "pyright>=1.1.380",
 ]
 bench = [
-    "vllm==0.20.0",
-    "pandas>=2.2",
-    "tabulate>=0.9",
+    "vllm==0.28.0",
 ]
+
+[project.scripts]
+bench = "benchmarks.cli:main"
 
 [project.urls]
 Repository = "https://github.com/ValeGian/liteinfer"
 
 [tool.hatch.build.targets.wheel]
-packages = ["liteinfer"]
+packages = ["liteinfer", "benchmarks"]
 
 # ---------------------------------------------------------------------------
 # Tooling
