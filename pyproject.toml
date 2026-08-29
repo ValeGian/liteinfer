@@ -37,6 +37,9 @@ dev = [
     "ruff>=0.6",
     "pyright>=1.1.380",
 ]
+bench = [
+    "vllm==0.28.0",
+]
 
 [project.scripts]
 bench = "benchmarks.cli:main"
@@ -45,7 +48,7 @@ bench = "benchmarks.cli:main"
 Repository = "https://github.com/ValeGian/liteinfer"
 
 [tool.hatch.build.targets.wheel]
-packages = ["liteinfer"]
+packages = ["liteinfer", "benchmarks"]
 
 # ---------------------------------------------------------------------------
 # Tooling

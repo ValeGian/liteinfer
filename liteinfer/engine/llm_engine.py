@@ -12,7 +12,8 @@ from liteinfer.engine.metrics import (
 )
 from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.scheduler import Scheduler
-from liteinfer.engine.sequence import Sequence, SequenceStatus
+from liteinfer.engine.sequence import Sequence
+from liteinfer.engine.stopping import resolve_stop_status
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
 from liteinfer.tokenizer import Tokenizer
@@ -116,23 +117,6 @@ class LLMEngine:
         return new_count
 
     def _maybe_finish(self, seq: Sequence, last_token_id: int) -> None:
-        params = seq.sampling_params
-        num_output = seq.num_output_tokens
-        past_min = num_output >= params.min_tokens
-
-        if last_token_id in self.tokenizer.eos_token_ids and not params.ignore_eos and past_min:
-            seq.status = SequenceStatus.FINISHED_STOPPED
-            return
-        if past_min and params.stop_token_ids and last_token_id in params.stop_token_ids:
-            seq.status = SequenceStatus.FINISHED_STOPPED
-            return
-        if num_output >= params.max_tokens:
-            seq.status = SequenceStatus.FINISHED_LENGTH
-            return
-        if past_min and params.stop:
-            text = self.tokenizer.decode(seq.output_token_ids)
-            if any(s in text for s in params.stop):
-                seq.status = SequenceStatus.FINISHED_STOPPED
-                return
-        if len(seq) >= self.config.max_model_len:
-            seq.status = SequenceStatus.FINISHED_LENGTH
+        status = resolve_stop_status(seq, last_token_id, self.tokenizer, self.config.max_model_len)
+        if status is not None:
+            seq.status = status

@@ -18,9 +18,6 @@ pip-wheel-metadata/
 venv/
 env/
 ENV/
-# Benchmark engine virtualenvs (multi-GB; keep README + setup scripts)
-benchmarks/envs/*/
-
 # Testing / coverage
 .pytest_cache/
 .coverage
@@ -67,11 +64,10 @@ checkpoints/
 hf_cache/
 .cache/
 
-# Benchmark output
-benchmarks/results/*.json
-!benchmarks/results/main.json
+# Results are committed so the report rebuilds from a clean clone. Datasets are
+# not: they carry raw scraped text (secrets included) and regenerate exactly from
+# the pinned corpus revision + seed via `bench dataset`.
 benchmarks/datasets/
-benchmarks/dashboards/
 
 # Environment files
 .env
@@ -88,5 +84,3 @@ nsight_*.sqlite
 CLAUDE.md
 .bench/
 .dev/
-.trtllm/
-plans/

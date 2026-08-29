@@ -43,5 +43,6 @@ pytest tests/unit/test_smoke.py     # one file
 - For numerical checks against a reference (HF, naive impl), use
   `torch.testing.assert_close`, not `torch.equal`.
 - New optimizations must come with: (1) a unit test for the new code
-  path, (2) a parity test against the existing path, and (3) a benchmark run via
-  `bench run --engine liteinfer --tag <feature-name>` to quantify the impact.
+  path, (2) a parity test against the existing path, and (3) a `BenchmarkConfig`
+  in `benchmarks/configs.py` whose `baseline` names the config it improves on,
+  so `bench report` quantifies the change 1:1.

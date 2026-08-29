@@ -74,8 +74,22 @@ listed.
 - **Status.** `planned`
 - **PRs.** _none yet_
 - **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous
-  KV blocks into a contiguous buffer before attention — ~13% throughput
-  and ~19% E2E regression vs eager at B=1. A fused paged-attention
+  KV blocks into a contiguous buffer before attention. Measured 29-08-2026 at
+  ISL 128 / OSL 256 the regression is far larger than the ~13% first recorded
+  at OSL 64: paged reaches **0.72x of native-eager** on both throughput
+  (73.3 -> 52.7 tok/s) and ITL (13.8 -> 19.0 ms), and is now **slower per decode
+  step than running with no KV cache at all** (19.0 vs 16.5 ms). The penalty
+  grows with sequence length and batch width, so it worsens as workloads become
+  realistic. `PagedKVCache._gather_all` (`liteinfer/cache/paged_kv_cache.py:193`)
+  runs once per layer per step: a Python loop over every sequence that slices
+  each block and `torch.cat`s the whole K/V history into a fresh padded
+  `[B, H, max_total, D]` tensor. At B=32 with 16 layers that is roughly 8k
+  Python-level tensor ops and ~200 MB copied per decode step — a batch-32 step
+  costs 130 ms against 19 ms at batch 1, where a bandwidth-bound decode should
+  cost about the same at both widths. Continuous batching (§1.2) is built on
+  paged and inherits all of it: it reaches full batch occupancy (measured: every
+  step at width 32) yet converts an 8x wider batch into only 1.55x throughput,
+  where vLLM gets 6.17x. A fused paged-attention
   kernel reads the block table directly inside the CUDA kernel,
   eliminating the gather entirely (same approach as vLLM's
   PagedAttention kernel). Closes the performance gap and makes paged
@@ -86,6 +100,22 @@ listed.
   entry point to swap in a custom attention backend.
 - **Parity test.** Paged greedy output identical to eager; benchmark
   shows paged ≥ eager tok/s at B=1.
+
+### 2.4 Async engine step metrics
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** `AsyncLLMEngine` never calls `stats.record()`, so the continuous
+  path emits no `StepMetrics` at all — no phase, batch width, token count or
+  per-step wall time. `LLMEngine` records all of it. Diagnosing the continuous
+  batching shortfall in §1.3/§2.3 required monkey-patching
+  `ContinuousScheduler.schedule` from a throwaway script to recover batch
+  occupancy, which is not a workflow anyone should need to repeat.
+- **Scope.** Record a `StepMetrics` per step in `AsyncLLMEngine._step`, with a
+  phase for the mixed prefill+decode case the two-pass step creates. Reuse
+  `EngineStats`; no new types.
+- **Parity test.** A continuous run reports the same total token count through
+  `EngineStats` as the returned outputs contain, and batch width never exceeds
+  `max_num_seqs`.
 
 ### 2.5 Quantized cache (KV-cache fp8 / int8)
 - **Status.** `planned`
@@ -233,8 +263,8 @@ listed.
   `transformers.AutoModelForCausalLM.generate` runner gives a
   simpler, dependency-free lower bound and makes liteinfer's
   overhead vs raw HF visible without the vLLM install requirement.
-- **Scope.** New adapter at `benchmarks/adapters/hf.py` implementing
-  `EngineAdapter` Protocol. Register in `ADAPTER_REGISTRY` with key `'hf'`.
+- **Scope.** New adapter class in `benchmarks/adapters.py`, plus one
+  `BenchmarkConfig` entry in `benchmarks/configs.py`.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
@@ -251,8 +281,7 @@ listed.
   makes this crossover explicit, validates that §2.6 (pre-allocated
   buffer) actually closes the gap, and guards against regressions.
 - **Scope.** New `bench run-sweep` subcommand iterating over `(ISL, OSL)` pairs,
-  calling `run_benchmark()` for each; results promoted automatically. Dashboard
-  renders a tok/s-vs-OSL tab.
+  calling `harness.run()` for each. `report.py` renders a tok/s-vs-OSL section.
 - **Pre-req.** §8.1 (ISL/OSL-controlled workloads).
 - **Parity test.** Greedy outputs identical across engines at each
   (ISL, OSL) point.

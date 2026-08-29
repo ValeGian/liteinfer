@@ -4,15 +4,38 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
-## 19-05-2026 — §8.1 ISL/OSL benchmark harness refactor
+## 29-08-2026 — §8.1 ISL/OSL benchmark harness refactor
 
 - **PRs.** _pending merge_
-- **What.** Replaced the old benchmark system (single-append history file + per-engine
-  scripts) with a CLI-driven harness (`bench dataset generate` / `bench run` / `bench dashboard`).
-  Canonical JSONL datasets ensure identical inputs across engines. Per-request
-  `RequestMeasurement` objects enable p50/p95/p99 latency stats. Four engines
-  supported: liteinfer (in-process), vLLM 0.21.0 (subprocess), TRT-LLM 1.2.1 (subprocess, PyTorch backend). Dashboard published
-  to GitHub Pages at `docs/index.html`.
+- **What.** Replaced the old benchmark system (append-only history file, one runner
+  class per engine/config) with a data-driven matrix. `benchmarks/configs.py` holds
+  every configuration and names the config each one improves on, so the report emits
+  a 1:1 delta per change rather than an undifferentiated table. Datasets are canonical
+  and committed; every result carries the SHA-256 of its prompt set.
+- **Methodology.** `throughput` and `latency` report disjoint metric sets — rates
+  under saturation, percentiles at one request in flight — because a per-request
+  latency measured under saturation mostly records queue position. ITL is derived
+  from `(e2e - ttft) / (osl - 1)`, and TTFT from a separate single-token pass, so both
+  engines are timed identically with no per-token hooks. Forced output length
+  (`min_tokens = max_tokens = OSL`, `ignore_eos`) is verified per run and fails the
+  run when violated. Warmup exercises the measured path at the real ISL and batch
+  width; each (config, mode) runs in a fresh process.
+- **Engines.** liteinfer and vLLM 0.28.0, both in-process. TRT-LLM dropped.
+- **Fixed.** `AsyncLLMEngine` carried its own copy of the stop rule that ignored
+  `ignore_eos` and `min_tokens`, silently truncating every continuous-batching run.
+  Both engines now share `liteinfer/engine/stopping.py`.
+- **First findings.** The paged KV cache is a net regression at this shape (0.72x of
+  native-eager on both throughput and ITL; slower per decode step than running with
+  no cache at all), and continuous batching inherits it — 1.55x for an 8x wider batch
+  where vLLM gets 6.17x. Static batching is on par with vLLM (3.70x vs 3.84x for
+  B=1 -> B=4), and liteinfer leads on TTFT (15.7 ms vs 21.3 ms, though at this prompt
+  length TTFT is mostly per-call API overhead). The native-eager rewrite is
+  performance-neutral across every measurement.
+- **Certification.** Throughput matches `vllm bench throughput` to 1.0% at the same
+  shape. Continuous-batching occupancy was verified to reach full width 32 on every
+  step, so the scaling shortfall is per-step cost, not scheduling. An initial vLLM
+  TTFT reading was discarded: it is IPC-bound and was inflated 24% by the parallel
+  sweep, so latency now runs sequentially and the CLI warns otherwise.
 
 ---
 

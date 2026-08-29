@@ -1,410 +1,216 @@
-"""CLI entry point for the benchmark system.
+"""Benchmark CLI.
 
-Usage:
-    bench dataset generate  -- generate a canonical JSONL dataset
-    bench run               -- run a benchmark for one engine
-    bench run-suite         -- run all engines on the same dataset
-    bench results list      -- list saved result files
-    bench results show      -- print a result file as formatted text
-    bench dashboard compare -- build comparison HTML from cherry-picked results
-    bench dashboard promote -- pin result(s) to the main dashboard
-    bench dashboard demote  -- unpin result(s) from the main dashboard
-    bench dashboard build   -- rebuild the main dashboard HTML
+bench dataset --model M --isl 128 --osl 256 -n 200
+bench run --all --dataset D --mode both
+bench report --out docs/index.html
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import os
+import shutil
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
 
-# ---------------------------------------------------------------------------
-# Argument parsers
-# ---------------------------------------------------------------------------
+from benchmarks import configs, dataset, harness, report
+from benchmarks.harness import Mode
 
-
-def _add_dataset_generate_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model", required=True, help="HuggingFace model ID (for tokenizer)")
-    parser.add_argument("--isl", required=True, type=int, help="Target input sequence length")
-    parser.add_argument("--osl", required=True, type=int, help="Forced output sequence length")
-    parser.add_argument("--num-samples", type=int, default=200, help="Number of samples")
-    parser.add_argument(
-        "--output", default="benchmarks/datasets/", help="Output directory for JSONL file"
-    )
+DEFAULT_RESULTS_DIR = "benchmarks/results"
+DEFAULT_DATASET_DIR = "benchmarks/datasets"
 
 
-def _add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--engine", required=True, help="Engine: liteinfer, vllm, trtllm"
-    )
-    parser.add_argument(
-        "--type", required=True, dest="benchmark_type", choices=["throughput", "latency"]
-    )
-    parser.add_argument("--model", required=True, help="HuggingFace model ID")
-    parser.add_argument("--dataset", required=True, help="Path to canonical JSONL dataset")
-    parser.add_argument("--num-samples", type=int, default=None, help="Use first N samples")
-    parser.add_argument("--tag", default="", help="Short label for this run")
-    parser.add_argument(
-        "--results-dir", default="benchmarks/results/", help="Where to save result JSON"
-    )
-    parser.add_argument(
-        "--strict-osl",
-        action="store_true",
-        default=False,
-        help="Fail if >5%% of samples have wrong output length",
-    )
-    parser.add_argument(
-        "--max-num-tokens",
-        type=int,
-        default=None,
-        help="Max tokens per forward pass (engine-specific; maps to max_num_batched_tokens / max_num_tokens)",
-    )
-
-
-def _add_run_suite_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--engines", nargs="+", required=True, help="Engines to run (space-separated)"
-    )
-    parser.add_argument(
-        "--type", required=True, dest="benchmark_type", choices=["throughput", "latency"]
-    )
-    parser.add_argument("--model", required=True, help="HuggingFace model ID")
-    parser.add_argument("--dataset", required=True, help="Path to canonical JSONL dataset")
-    parser.add_argument("--num-samples", type=int, default=None)
-    parser.add_argument("--tag", default="")
-    parser.add_argument("--results-dir", default="benchmarks/results/")
-    parser.add_argument("--strict-osl", action="store_true", default=False)
-    parser.add_argument("--max-num-tokens", type=int, default=None)
-    parser.add_argument(
-        "--promote", action="store_true", default=False, help="Auto-promote all results"
-    )
-
-
-def _add_results_list_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--engine", default=None, help="Filter by engine")
-    parser.add_argument("--type", dest="benchmark_type", default=None, help="Filter by type")
-    parser.add_argument("--model", default=None, help="Filter by model")
-    parser.add_argument(
-        "--pinned", action="store_true", default=False, help="Show only pinned results"
-    )
-    parser.add_argument("--results-dir", default="benchmarks/results/")
-
-
-def _add_results_show_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("run_id", help="Run ID to display")
-    parser.add_argument("--results-dir", default="benchmarks/results/")
-
-
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
-
-
-def _cmd_dataset_generate(args: argparse.Namespace) -> None:
-    from benchmarks.dataset import generate_dataset
-
-    output_file = generate_dataset(
-        model_id=args.model,
+def _cmd_dataset(args: argparse.Namespace) -> int:
+    path = dataset.generate(
+        model=args.model,
         target_isl=args.isl,
         target_osl=args.osl,
         num_samples=args.num_samples,
-        output_path=args.output,
+        output_dir=args.out,
     )
-    print(f"Dataset written: {output_file}")
+    print(f"Wrote {path}")
+    return 0
 
 
-def _cmd_run(args: argparse.Namespace) -> None:
-    from benchmarks.harness import run_benchmark
-
-    result = run_benchmark(
-        engine_name=args.engine,
-        benchmark_type=args.benchmark_type,
-        model=args.model,
-        dataset_path=args.dataset,
-        num_samples=args.num_samples,
-        tag=args.tag,
-        results_dir=args.results_dir,
-        strict_osl=args.strict_osl,
-        max_num_tokens=args.max_num_tokens,
-    )
-    _print_result_summary(result)
-    print(f"\nResult saved: {args.results_dir}/{result['run_id']}.json")
+def _run_one(args: argparse.Namespace, name: str, mode: Mode) -> int:
+    data = dataset.load(args.dataset).head(args.num_samples)
+    result = harness.run(configs.get(name), data, args.dataset, mode, args.results_dir)
+    metrics = "  ".join(f"{k}={v:,.1f}" for k, v in result.summary.items())
+    print(f"{name} [{mode}] {metrics}")
+    return 0
 
 
-def _cmd_run_suite(args: argparse.Namespace) -> None:
-    from benchmarks.harness import run_benchmark
+@dataclass(frozen=True)
+class Slot:
+    """One GPU plus a private block of CPU cores."""
 
-    run_ids = []
-    for engine in args.engines:
-        print(f"\n--- Running {engine} ---")
-        result = run_benchmark(
-            engine_name=engine,
-            benchmark_type=args.benchmark_type,
-            model=args.model,
-            dataset_path=args.dataset,
-            num_samples=args.num_samples,
-            tag=args.tag,
-            results_dir=args.results_dir,
-            strict_osl=args.strict_osl,
-            max_num_tokens=args.max_num_tokens,
-        )
-        _print_result_summary(result)
-        run_ids.append(result["run_id"])
-
-    if args.promote:
-        for run_id in run_ids:
-            _promote_run_id(run_id, args.results_dir)
-        print(f"\nPromoted {len(run_ids)} results to main dashboard.")
+    gpu: int
+    cores: str
+    threads: int
 
 
-def _cmd_results_list(args: argparse.Namespace) -> None:
-    results_dir = Path(args.results_dir)
-    if not results_dir.exists():
-        print("No results directory found.")
-        return
+def _slots(gpus: list[int]) -> list[Slot]:
+    """Give each GPU a disjoint block of cores.
 
-    main_json = results_dir / "main.json"
-    pinned_ids: set[str] = set()
-    if main_json.exists():
-        index = json.loads(main_json.read_text())
-        pinned_ids = set(index.get("pinned", []))
-
-    rows = []
-    for result_file in sorted(results_dir.glob("*.json")):
-        if result_file.name == "main.json":
-            continue
-        try:
-            r = json.loads(result_file.read_text())
-        except Exception:
-            continue
-
-        if args.engine and r.get("engine") != args.engine:
-            continue
-        if args.benchmark_type and r.get("benchmark_type") != args.benchmark_type:
-            continue
-        if args.model and r.get("model") != args.model:
-            continue
-
-        run_id = r.get("run_id", result_file.stem)
-        is_pinned = "✓" if run_id in pinned_ids else ""
-        if args.pinned and not is_pinned:
-            continue
-
-        rows.append(
-            (
-                run_id,
-                r.get("engine", ""),
-                r.get("benchmark_type", ""),
-                r.get("model", "").split("/")[-1],
-                str(r["dataset"].get("target_isl", "")),
-                str(r["dataset"].get("target_osl", "")),
-                r.get("tag", ""),
-                is_pinned,
-            )
-        )
-
-    rows.sort(key=lambda x: x[0], reverse=True)
-
-    header = f"{'run_id':<50} {'engine':<12} {'type':<12} {'model':<30} {'ISL':>5} {'OSL':>5} {'tag':<20} pinned"
-    print(header)
-    print("-" * len(header))
-    for row in rows:
-        run_id, engine, btype, model, isl, osl, tag, pinned = row
-        print(f"{run_id:<50} {engine:<12} {btype:<12} {model:<30} {isl:>5} {osl:>5} {tag:<20} {pinned}")
+    Pinning is what makes parallel runs comparable to sequential ones: decode is
+    bound by how fast Python can launch kernels, so workers sharing cores would
+    measure each other's contention instead of the engine.
+    """
+    per = max(1, (os.cpu_count() or len(gpus)) // len(gpus))
+    return [
+        Slot(gpu=gpu, cores=f"{i * per}-{i * per + per - 1}", threads=per)
+        for i, gpu in enumerate(gpus)
+    ]
 
 
-def _cmd_results_show(args: argparse.Namespace) -> None:
-    result_file = Path(args.results_dir) / f"{args.run_id}.json"
-    if not result_file.exists():
-        print(f"Result not found: {result_file}", file=sys.stderr)
-        sys.exit(1)
-    result = json.loads(result_file.read_text())
-    _print_result_summary(result)
+def _run_isolated(args: argparse.Namespace, name: str, mode: Mode, slot: Slot | None) -> int:
+    """Each run gets a fresh process so GPU state never leaks between configs."""
+    command = [
+        sys.executable,
+        "-m",
+        "benchmarks.cli",
+        "run",
+        "--config",
+        name,
+        "--mode",
+        mode,
+        "--dataset",
+        str(args.dataset),
+        "--results-dir",
+        str(args.results_dir),
+        "--no-isolate",
+    ]
+    if args.num_samples is not None:
+        command += ["--num-samples", str(args.num_samples)]
 
+    env = dict(os.environ)
+    if slot is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(slot.gpu)
+        env["OMP_NUM_THREADS"] = str(slot.threads)
+        if shutil.which("taskset"):
+            command = ["taskset", "-c", slot.cores, *command]
 
-def _cmd_dashboard_compare(args: argparse.Namespace) -> None:
-    from benchmarks.dashboard.builder import build_comparison_dashboard
-
-    build_comparison_dashboard(
-        result_ids=args.run_ids,
-        results_dir=args.results_dir,
-        output_path=args.output,
-    )
-    print(f"Dashboard written: {args.output}")
-
-
-def _cmd_dashboard_promote(args: argparse.Namespace) -> None:
-    for run_id in args.run_ids:
-        _promote_run_id(run_id, args.results_dir)
-        print(f"Promoted: {run_id}")
-
-
-def _cmd_dashboard_demote(args: argparse.Namespace) -> None:
-    main_json = Path(args.results_dir) / "main.json"
-    if not main_json.exists():
-        print("main.json not found.", file=sys.stderr)
-        sys.exit(1)
-    index = json.loads(main_json.read_text())
-    for run_id in args.run_ids:
-        if run_id in index["pinned"]:
-            index["pinned"].remove(run_id)
-            print(f"Demoted: {run_id}")
-        else:
-            print(f"Not pinned: {run_id}")
-    main_json.write_text(json.dumps(index, indent=2))
-
-
-def _cmd_dashboard_build(args: argparse.Namespace) -> None:
-    from benchmarks.dashboard.builder import build_main_dashboard
-
-    build_main_dashboard(results_dir=args.results_dir, output_path=args.output)
-    print(f"Dashboard written: {args.output}")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _promote_run_id(run_id: str, results_dir: str) -> None:
-    main_json = Path(results_dir) / "main.json"
-    index = json.loads(main_json.read_text()) if main_json.exists() else {"pinned": []}
-    if run_id not in index["pinned"]:
-        index["pinned"].append(run_id)
-    main_json.write_text(json.dumps(index, indent=2))
-
-
-def _print_result_summary(result: dict) -> None:
-    engine = result.get("engine", "?")
-    btype = result.get("benchmark_type", "?")
-    dataset = result.get("dataset", {})
-    isl = dataset.get("target_isl", "?")
-    osl = dataset.get("target_osl", "?")
-    num_samples = dataset.get("num_samples", "?")
-    tag = result.get("tag", "")
-    timestamp = result.get("timestamp", "?")
-    summary = result.get("summary", {})
-
-    print(
-        f"\nEngine: {engine}  |  {btype}  |  ISL={isl}  OSL={osl}  |  {num_samples} samples"
-    )
-    if tag:
-        print(f"Tag: {tag}  |  {timestamp}")
+    done = subprocess.run(command, env=env, capture_output=True, text=True)
+    label = f"{name} [{mode}]" + (f" gpu{slot.gpu}" if slot else "")
+    if done.returncode == 0:
+        summary = [ln for ln in done.stdout.splitlines() if ln.startswith(name)]
+        print(summary[-1] if summary else f"{label} ok", flush=True)
     else:
-        print(f"Timestamp: {timestamp}")
+        print(f"{label} FAILED\n{done.stderr[-1500:]}", file=sys.stderr, flush=True)
+    return done.returncode
 
-    if btype == "throughput":
-        tps = summary.get("tokens_per_second")
-        rps = summary.get("requests_per_second")
-        if tps is not None:
-            print("\nThroughput")
-            print(f"  tok/s      {tps:>10.1f}")
-        if rps is not None:
-            print(f"  req/s      {rps:>10.1f}")
+
+def _longest_first(job: tuple[str, Mode]) -> tuple:
+    """Start the long jobs first so the tail of the schedule is short.
+
+    Throughput at a narrow batch width is the long pole; vLLM is fast everywhere.
+    """
+    config = configs.get(job[0])
+    return (job[1] == "latency", config.max_num_seqs, config.engine == "vllm")
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    names = list(configs.CONFIGS) if args.all else args.config
+    if not names:
+        print("Nothing to run: pass --config NAME ... or --all", file=sys.stderr)
+        return 2
+    modes: list[Mode] = ["throughput", "latency"] if args.mode == "both" else [args.mode]
+    jobs: list[tuple[str, Mode]] = [(n, m) for n in names for m in modes]
+
+    if args.no_isolate:
+        return max((_run_one(args, n, m) for n, m in jobs), default=0)
+
+    slots = _slots(args.gpus) if args.gpus else [None]
+    if len(slots) > 1 and "latency" in modes:
+        # Latency is dominated by per-call overhead, which is CPU-scheduling
+        # sensitive: running workers side by side inflated vLLM's TTFT by 24%
+        # while leaving its ITL untouched. Throughput is GPU-bound and safe.
         print(
-            "\nLatency (note: TTFT in throughput mode includes scheduling queue time and"
+            "WARNING: latency mode is sensitive to CPU contention; run it without "
+            "--gpus for publishable TTFT numbers.",
+            file=sys.stderr,
         )
-        print("         is not comparable to TTFT from a latency-mode run)")
+    jobs.sort(key=_longest_first)
+    print(f"{len(jobs)} runs over {len(slots)} worker(s)", flush=True)
 
-    else:
-        print("\nLatency (batch_size=1)")
+    free: Queue = Queue()
+    for slot in slots:
+        free.put(slot)
 
-    for label, key in [
-        ("TTFT  p50", "ttft_p50_ms"),
-        ("TTFT  p95", "ttft_p95_ms"),
-        ("TTFT  p99", "ttft_p99_ms"),
-        ("ITL   p50", "itl_p50_ms"),
-        ("ITL   p95", "itl_p95_ms"),
-        ("ITL   p99", "itl_p99_ms"),
-        ("E2E   p50", "e2e_p50_ms"),
-    ]:
-        v = summary.get(key)
-        if v is not None:
-            print(f"  {label}  {v:>10.0f} ms")
+    def run_job(job: tuple[str, Mode]) -> int:
+        slot = free.get()
+        try:
+            return _run_isolated(args, job[0], job[1], slot)
+        finally:
+            free.put(slot)
 
+    with ThreadPoolExecutor(max_workers=len(slots)) as pool:
+        codes = list(pool.map(run_job, jobs))
 
-# ---------------------------------------------------------------------------
-# Parser construction (also exported for test use)
-# ---------------------------------------------------------------------------
+    failed = [f"{n}/{m}" for (n, m), code in zip(jobs, codes, strict=True) if code != 0]
+    if failed:
+        print(f"\nFailed: {', '.join(failed)}", file=sys.stderr)
+    return 1 if failed else 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="bench",
-        description="liteinfer benchmark CLI",
+def _cmd_report(args: argparse.Namespace) -> int:
+    results = report.load_results(args.results_dir)
+    print(report.as_text(results))
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report.as_html(results), encoding="utf-8")
+        print(f"\nWrote {out}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="bench", description="liteinfer benchmarks")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    make = sub.add_parser("dataset", help="Generate a canonical dataset")
+    make.add_argument("--model", required=True)
+    make.add_argument("--isl", type=int, required=True)
+    make.add_argument("--osl", type=int, required=True)
+    make.add_argument("-n", "--num-samples", type=int, default=200)
+    make.add_argument("--out", default=DEFAULT_DATASET_DIR)
+    make.set_defaults(func=_cmd_dataset)
+
+    run = sub.add_parser("run", help="Run configs against a dataset")
+    run.add_argument("--config", nargs="+", default=[], choices=list(configs.CONFIGS))
+    run.add_argument("--all", action="store_true", help="Run every known config")
+    run.add_argument("--dataset", required=True)
+    run.add_argument("--mode", choices=["throughput", "latency", "both"], default="both")
+    run.add_argument("-n", "--num-samples", type=int, default=None)
+    run.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    run.add_argument(
+        "--gpus",
+        nargs="+",
+        type=int,
+        default=None,
+        help="GPU ids to spread runs over, one run per GPU at a time (default: one worker)",
     )
-    subparsers = parser.add_subparsers(dest="command")
+    run.add_argument(
+        "--no-isolate", action="store_true", help="Run in this process instead of a subprocess"
+    )
+    run.set_defaults(func=_cmd_run)
 
-    # dataset
-    dataset_parser = subparsers.add_parser("dataset", help="Dataset commands")
-    dataset_sub = dataset_parser.add_subparsers(dest="dataset_command")
-    gen_parser = dataset_sub.add_parser("generate", help="Generate a canonical dataset")
-    _add_dataset_generate_args(gen_parser)
-    gen_parser.set_defaults(func=_cmd_dataset_generate)
-
-    # run
-    run_parser = subparsers.add_parser("run", help="Run a benchmark for one engine")
-    _add_run_args(run_parser)
-    run_parser.set_defaults(func=_cmd_run)
-
-    # run-suite
-    suite_parser = subparsers.add_parser("run-suite", help="Run all engines sequentially")
-    _add_run_suite_args(suite_parser)
-    suite_parser.set_defaults(func=_cmd_run_suite)
-
-    # results
-    results_parser = subparsers.add_parser("results", help="Result management commands")
-    results_sub = results_parser.add_subparsers(dest="results_command")
-
-    list_parser = results_sub.add_parser("list", help="List saved result files")
-    _add_results_list_args(list_parser)
-    list_parser.set_defaults(func=_cmd_results_list)
-
-    show_parser = results_sub.add_parser("show", help="Print a result file")
-    _add_results_show_args(show_parser)
-    show_parser.set_defaults(func=_cmd_results_show)
-
-    # dashboard
-    dash_parser = subparsers.add_parser("dashboard", help="Dashboard commands")
-    dash_sub = dash_parser.add_subparsers(dest="dashboard_command")
-
-    compare_parser = dash_sub.add_parser("compare", help="Build comparison dashboard")
-    compare_parser.add_argument("run_ids", nargs="+", help="Run IDs to compare")
-    compare_parser.add_argument("--output", required=True, help="Output HTML path")
-    compare_parser.add_argument("--results-dir", default="benchmarks/results/")
-    compare_parser.set_defaults(func=_cmd_dashboard_compare)
-
-    promote_parser = dash_sub.add_parser("promote", help="Pin result(s) to main dashboard")
-    promote_parser.add_argument("run_ids", nargs="+", help="Run IDs to promote")
-    promote_parser.add_argument("--results-dir", default="benchmarks/results/")
-    promote_parser.set_defaults(func=_cmd_dashboard_promote)
-
-    demote_parser = dash_sub.add_parser("demote", help="Unpin result(s) from main dashboard")
-    demote_parser.add_argument("run_ids", nargs="+", help="Run IDs to demote")
-    demote_parser.add_argument("--results-dir", default="benchmarks/results/")
-    demote_parser.set_defaults(func=_cmd_dashboard_demote)
-
-    build_parser = dash_sub.add_parser("build", help="Rebuild main dashboard HTML")
-    build_parser.add_argument("--output", default="docs/index.html")
-    build_parser.add_argument("--results-dir", default="benchmarks/results/")
-    build_parser.set_defaults(func=_cmd_dashboard_build)
+    rep = sub.add_parser("report", help="Print and optionally write the comparison report")
+    rep.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    rep.add_argument("--out", default=None, help="Write a standalone HTML page here")
+    rep.set_defaults(func=_cmd_report)
 
     return parser
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = _build_parser()
-    return parser.parse_args(argv)
-
-
-def main() -> None:
-    args = parse_args()
-    if not hasattr(args, "func"):
-        _build_parser().print_help()
-        sys.exit(0)
-    args.func(args)
+def main() -> int:
+    args = build_parser().parse_args()
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -78,7 +78,7 @@ liteinfer/
 │   ├── cache/             # KV cache (paged, prefix-cached, …)
 │   └── sampling/          # SamplingParams + Sampler
 ├── tests/                 # Unit / integration / e2e tests
-├── benchmarks/            # CLI-driven benchmark harness (dataset, run, dashboard)
+├── benchmarks/            # Benchmark matrix, harness, and report
 └── pyproject.toml
 ```
 
@@ -126,36 +126,48 @@ See `tests/README.md` for conventions.
 
 ## Performance
 
-See the **[live benchmark dashboard](https://valegian.github.io/liteinfer/)** for current results.
+A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched batch width.
 
-Hardware used for published results: NVIDIA A40 · Llama-3.2-1B-Instruct.
+| | liteinfer | vLLM | |
+|---|---:|---:|---|
+| Decode step (ITL p50) | 13.8 ms | 5.2 ms | 2.6× behind |
+| Throughput, B=4 | 271 tok/s | 724 tok/s | 2.7× behind |
+| Batching gain, B=1 → B=4 | 3.70× | 3.84× | on par |
+| Time to first token (p50) | 15.7 ms | 21.3 ms | 1.4× ahead\* |
+
+\* At this prompt length TTFT is mostly fixed per-call API overhead rather than
+prefill compute, so read it as offline round-trip latency, not prefill speed.
+
+Static batching is already competitive; the gap is the per-step decode constant
+(no CUDA graphs, no fused attention) and a paged-cache path that currently costs
+more than it saves. Throughput figures are certified against `vllm bench throughput`
+to within 1%. Full tables, methodology, and per-milestone deltas:
+[`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).
 
 ## Benchmarking
 
-Generate a canonical dataset, run any engine, and publish results to the dashboard
-in three steps:
+Every liteinfer configuration is measured against the one it improves on, and
+against vLLM, on byte-identical prompts.
 
 ```bash
-# 1. Generate dataset (once per model/ISL/OSL combination)
-bench dataset generate \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --isl 128 --osl 256 --num-samples 200
+pip install -e ".[dev,bench]"
 
-# 2. Run benchmark
-bench run \
-  --engine liteinfer --type throughput \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --dataset benchmarks/datasets/isl128_osl256_n200_meta_llama_llama_3_2_1b_instruct.jsonl \
-  --tag my-feature
+# 1. Build a dataset (once per model + ISL/OSL)
+bench dataset --model meta-llama/Llama-3.2-1B-Instruct --isl 128 --osl 256 -n 200
 
-# 3. Promote to dashboard and publish
-bench dashboard promote <run_id>
-bench dashboard build --output docs/index.html
-git add docs/index.html benchmarks/results/main.json && git commit -m "bench: publish"
+DS=benchmarks/datasets/isl128_osl256_n200_meta_llama_llama_3_2_1b_instruct.json
+
+# 2. Run every config, in both modes
+bench run --all --dataset "$DS" --mode throughput -n 200
+bench run --all --dataset "$DS" --mode latency    -n 50
+
+# 3. Report
+bench report --out docs/index.html
 ```
 
-Engines: `liteinfer`, `vllm`, `trtllm`. See `benchmarks/envs/README.md` for
-per-engine setup. See `docs/benchmarks.md` for methodology and metric definitions.
+Engines: `liteinfer`, `vllm`. See [`benchmarks/README.md`](benchmarks/README.md)
+for the config matrix and controls, and [`docs/benchmarks.md`](docs/benchmarks.md)
+for methodology and results.
 
 ## Roadmap
 

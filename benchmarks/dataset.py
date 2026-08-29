@@ -1,19 +1,12 @@
-"""
-Canonical benchmark dataset generation and loading.
+"""Canonical benchmark dataset: one fixed file per (model, ISL, OSL).
 
-Corpus source: ShareGPT_V3 (anon8231489123/ShareGPT_Vicuna_unfiltered on HuggingFace).
-All human turns from ~100K real conversations are concatenated into a single text corpus;
-a sliding token window then extracts ISL-controlled samples. This matches the dataset
-used by vLLM's own benchmarks, making results directly comparable.
+Corpus is ShareGPT_V3 (the source vLLM's own benchmarks use). All human turns
+are concatenated, then a sliding token window extracts ISL-controlled prompts.
+Every engine is then fed byte-identical prompts, which `sha256` proves.
 
-dataset_revision in generate_dataset should be pinned to a git commit hash for
-strict cross-machine reproducibility. Using "main" (the default) is convenient but
-means the corpus may change if the dataset is updated upstream.
-
-ISL variance: tokenizer encode->decode round-trip introduces +-0-5 token variance
-from the target ISL. The actual input_token_count is recorded per sample, so
-result JSONs correctly reflect what each engine received. ±5 token variance is
-acceptable for throughput/latency benchmarking.
+Tokenizer encode->decode round-trips shift the realised prompt length by a few
+tokens, so each sample records the length it actually has; `target_isl` in the
+metadata is the length that was asked for.
 """
 
 from __future__ import annotations
@@ -22,171 +15,129 @@ import hashlib
 import json
 import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
-from transformers import AutoTokenizer
-
-from benchmarks.adapters.base import BenchmarkSample
-
-# ---------------------------------------------------------------------------
-# Corpus — ShareGPT (~100K real user conversations, same source as vLLM benchmarks)
-# ---------------------------------------------------------------------------
-
-_SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
-_SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
-
-# Pin to a specific git commit hash for strict cross-machine reproducibility.
-# To update: find the latest commit at
+_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
+# Pinned for cross-machine reproducibility. To update, pick a newer commit from
 # https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/commits/main
-# then update this constant and regenerate all datasets.
-_SHAREGPT_DEFAULT_REVISION = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
+_REVISION = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
 
-# Per-revision in-process cache: avoids re-downloading within one process.
-_corpus_by_revision: dict[str, str] = {}
+_corpus_cache: dict[str, list[str]] = {}
 
 
-def _build_sharegpt_corpus(revision: str) -> str:
-    """Download ShareGPT and concatenate all human turns into a single text corpus."""
-    json_path = hf_hub_download(
-        repo_id=_SHAREGPT_REPO_ID,
-        filename=_SHAREGPT_FILENAME,
-        repo_type="dataset",
-        revision=revision,
-    )
-
-    with open(json_path, encoding="utf-8") as f:
-        conversations: list[dict] = json.load(f)
-
-    texts: list[str] = []
-    for conv in conversations:
-        for turn in conv.get("conversations", []):
-            if turn.get("from") == "human":
-                text = turn.get("value", "").strip()
-                if text:
-                    texts.append(text)
-
-    return "\n\n".join(texts)
+@dataclass(frozen=True)
+class Sample:
+    prompt: str
+    input_tokens: int
 
 
-def _get_corpus(revision: str) -> str:
-    if revision not in _corpus_by_revision:
-        _corpus_by_revision[revision] = _build_sharegpt_corpus(revision)
-    return _corpus_by_revision[revision]
+@dataclass(frozen=True)
+class Dataset:
+    model: str
+    target_isl: int
+    target_osl: int
+    samples: list[Sample]
+
+    @property
+    def sha256(self) -> str:
+        """Order-independent digest of the prompt set."""
+        payload = json.dumps(sorted(s.prompt for s in self.samples), ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def head(self, n: int | None) -> Dataset:
+        if n is None or n >= len(self.samples):
+            return self
+        return Dataset(self.model, self.target_isl, self.target_osl, self.samples[:n])
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _human_turns(revision: str) -> list[str]:
+    """Every human turn in the corpus, cached per revision."""
+    if revision not in _corpus_cache:
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(
+            repo_id=_REPO_ID, filename=_FILENAME, repo_type="dataset", revision=revision
+        )
+        conversations = json.loads(Path(path).read_text(encoding="utf-8"))
+        _corpus_cache[revision] = [
+            turn["value"].strip()
+            for conv in conversations
+            for turn in conv.get("conversations", [])
+            if turn.get("from") == "human" and turn.get("value", "").strip()
+        ]
+    return _corpus_cache[revision]
 
 
-def build_dataset_filename(model_id: str, isl: int, osl: int, num_samples: int) -> str:
-    """Derive canonical output filename from benchmark parameters.
-
-    Slugifies model_id: lowercase, replace '/' and '-' with '_', compress
-    repeated '_'.
-
-    Example:
-        "meta-llama/Llama-3.2-1B-Instruct" → "meta_llama_llama_3_2_1b_instruct"
-        → "isl128_osl256_n100_meta_llama_llama_3_2_1b_instruct.jsonl"
-    """
-    slug = model_id.lower()
-    slug = re.sub(r"[/\-\.]", "_", slug)
-    slug = re.sub(r"_+", "_", slug)
-    slug = slug.strip("_")
-    return f"isl{isl}_osl{osl}_n{num_samples}_{slug}.jsonl"
+def filename_for(model: str, isl: int, osl: int, num_samples: int) -> str:
+    slug = re.sub(r"_+", "_", re.sub(r"[/\-.]", "_", model.lower())).strip("_")
+    return f"isl{isl}_osl{osl}_n{num_samples}_{slug}.json"
 
 
-def generate_dataset(
-        model_id: str,
-        target_isl: int,
-        target_osl: int,
-        num_samples: int,
-        output_path: str | Path,
-        seed: int = 42,
-        dataset_revision: str = _SHAREGPT_DEFAULT_REVISION,
+def generate(
+    model: str,
+    target_isl: int,
+    target_osl: int,
+    num_samples: int,
+    output_dir: str | Path,
+    seed: int = 42,
+    revision: str = _REVISION,
 ) -> Path:
-    """Generate a canonical benchmark dataset JSONL file.
+    """Build a dataset file and return its path.
 
-    Downloads ShareGPT at the given revision, tokenizes the concatenated corpus of
-    human turns, and slides a window of target_isl tokens to extract samples. Each
-    window is decoded back to text to form the prompt.
-
-    Pin dataset_revision to a git commit hash for cross-machine reproducibility.
-    Actual input_token_count may differ from target_isl by ±5 tokens due to
-    tokenizer round-trip; this variance is acceptable and documented (§9.4).
+    Only as much of the corpus as the run needs is tokenised: turns are shuffled
+    with ``seed``, concatenated until they cover ``num_samples * target_isl``
+    tokens, then cut into consecutive non-overlapping windows. Tokenising the
+    whole corpus to keep a thousandth of it would cost minutes and gigabytes.
     """
-    output_path = Path(output_path)
-    if output_path.is_dir():
-        filename = build_dataset_filename(model_id, target_isl, target_osl, num_samples)
-        output_path = output_path / filename
+    from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    corpus = _get_corpus(dataset_revision)
-    token_ids = tokenizer.encode(corpus, add_special_tokens=False)
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    turns = list(_human_turns(revision))
+    random.Random(seed).shuffle(turns)
 
-    max_start = len(token_ids) - target_isl
-    if max_start < num_samples:
+    needed = num_samples * target_isl
+    token_ids: list[int] = []
+    for turn in turns:
+        token_ids += tokenizer.encode(turn, add_special_tokens=False)
+        if len(token_ids) >= needed:
+            break
+    if len(token_ids) < needed:
         raise ValueError(
-            f"Corpus too small: need {num_samples} windows of {target_isl} tokens "
-            f"but corpus has only {len(token_ids)} tokens ({max_start} valid starts)"
+            f"Corpus holds {len(token_ids)} tokens, need {needed} "
+            f"({num_samples} samples of {target_isl})"
         )
 
-    rng = random.Random(seed)
-    selected_starts = rng.sample(range(max_start), num_samples)
-
-    samples: list[dict] = []
-    for start in selected_starts:
-        window = token_ids[start: start + target_isl]
+    samples = []
+    for index in range(num_samples):
+        window = token_ids[index * target_isl : (index + 1) * target_isl]
         prompt = tokenizer.decode(window, skip_special_tokens=True)
-        actual_count = len(tokenizer.encode(prompt, add_special_tokens=False))
-        samples.append(
+        samples.append(Sample(prompt, len(tokenizer.encode(prompt, add_special_tokens=False))))
+
+    path = Path(output_dir) / filename_for(model, target_isl, target_osl, num_samples)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
             {
-                "prompt": prompt,
-                "input_token_count": actual_count,
-                "forced_output_token_count": target_osl,
-            }
-        )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        for sample in samples:
-            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
-
-    return output_path
-
-
-def load_dataset(
-        path: str | Path,
-        num_samples: int | None = None,
-) -> list[BenchmarkSample]:
-    """Load a canonical benchmark dataset from a JSONL file."""
-    path = Path(path)
-    samples: list[BenchmarkSample] = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            samples.append(
-                BenchmarkSample(
-                    prompt=record["prompt"],
-                    input_token_count=record["input_token_count"],
-                    forced_output_token_count=record["forced_output_token_count"],
-                )
-            )
-            if num_samples is not None and len(samples) >= num_samples:
-                break
-    return samples
+                "model": model,
+                "target_isl": target_isl,
+                "target_osl": target_osl,
+                "samples": [{"prompt": s.prompt, "input_tokens": s.input_tokens} for s in samples],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
-def dataset_sha256(samples: list[BenchmarkSample]) -> str:
-    """SHA-256 of the sorted prompt list (order-independent).
-
-    Used for cross-engine identity checks: if two result files carry the same
-    sha256, they were run against the same set of prompts.
-    """
-    sorted_prompts = sorted(s.prompt for s in samples)
-    payload = json.dumps(sorted_prompts, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def load(path: str | Path) -> Dataset:
+    record = json.loads(Path(path).read_text(encoding="utf-8"))
+    return Dataset(
+        model=record["model"],
+        target_isl=record["target_isl"],
+        target_osl=record["target_osl"],
+        samples=[Sample(s["prompt"], s["input_tokens"]) for s in record["samples"]],
+    )
