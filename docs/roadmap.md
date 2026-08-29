@@ -73,49 +73,26 @@ listed.
 ### 2.3 Paged KV cache performance (fused kernel)
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous
-  KV blocks into a contiguous buffer before attention. Measured 29-08-2026 at
-  ISL 128 / OSL 256 the regression is far larger than the ~13% first recorded
-  at OSL 64: paged reaches **0.72x of native-eager** on both throughput
-  (73.3 -> 52.7 tok/s) and ITL (13.8 -> 19.0 ms), and is now **slower per decode
-  step than running with no KV cache at all** (19.0 vs 16.5 ms). The penalty
-  grows with sequence length and batch width, so it worsens as workloads become
-  realistic. `PagedKVCache._gather_all` (`liteinfer/cache/paged_kv_cache.py:193`)
-  runs once per layer per step: a Python loop over every sequence that slices
-  each block and `torch.cat`s the whole K/V history into a fresh padded
-  `[B, H, max_total, D]` tensor. At B=32 with 16 layers that is roughly 8k
-  Python-level tensor ops and ~200 MB copied per decode step — a batch-32 step
-  costs 130 ms against 19 ms at batch 1, where a bandwidth-bound decode should
-  cost about the same at both widths. Continuous batching (§1.2) is built on
-  paged and inherits all of it: it reaches full batch occupancy (measured: every
-  step at width 32) yet converts an 8x wider batch into only 1.55x throughput,
-  where vLLM gets 6.17x. A fused paged-attention
-  kernel reads the block table directly inside the CUDA kernel,
-  eliminating the gather entirely (same approach as vLLM's
-  PagedAttention kernel). Closes the performance gap and makes paged
-  faster than eager at high occupancy.
+- **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous KV blocks
+  into a contiguous buffer before attention. Measured 29-08-2026 at ISL 128 /
+  OSL 256 that costs far more than the ~13% first recorded at OSL 64: paged runs
+  at **0.72x of native-eager** on both throughput (73.3 -> 52.7 tok/s) and ITL
+  (13.8 -> 19.0 ms), and is **slower per decode step than running with no KV cache
+  at all** (19.0 vs 16.5 ms). `PagedKVCache._gather_all` rebuilds the whole K/V
+  history into a fresh padded tensor once per layer per step — roughly 8k Python
+  tensor ops and ~200 MB copied per step at B=32, so a batch-32 step costs 130 ms
+  against 19 ms at batch 1, where a bandwidth-bound decode should cost about the
+  same at both widths. Continuous batching (§1.2) is built on paged and inherits
+  it: batch occupancy is full (measured: every step at width 32) yet an 8x wider
+  batch yields only 1.55x throughput, where vLLM gets 6.17x. A fused
+  paged-attention kernel reads the block table inside the CUDA kernel and removes
+  the gather entirely, the same approach as vLLM's PagedAttention.
 - **Scope.** Custom CUDA/Triton kernel for block-table attention;
   `ModelRunner` switches to it when `cache_mode="paged"`.
 - **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the
   entry point to swap in a custom attention backend.
 - **Parity test.** Paged greedy output identical to eager; benchmark
   shows paged ≥ eager tok/s at B=1.
-
-### 2.4 Async engine step metrics
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** `AsyncLLMEngine` never calls `stats.record()`, so the continuous
-  path emits no `StepMetrics` at all — no phase, batch width, token count or
-  per-step wall time. `LLMEngine` records all of it. Diagnosing the continuous
-  batching shortfall in §1.3/§2.3 required monkey-patching
-  `ContinuousScheduler.schedule` from a throwaway script to recover batch
-  occupancy, which is not a workflow anyone should need to repeat.
-- **Scope.** Record a `StepMetrics` per step in `AsyncLLMEngine._step`, with a
-  phase for the mixed prefill+decode case the two-pass step creates. Reuse
-  `EngineStats`; no new types.
-- **Parity test.** A continuous run reports the same total token count through
-  `EngineStats` as the returned outputs contain, and batch width never exceeds
-  `max_num_seqs`.
 
 ### 2.5 Quantized cache (KV-cache fp8 / int8)
 - **Status.** `planned`
@@ -129,6 +106,22 @@ listed.
 ---
 
 ## 3. Performance optimizations
+
+### 2.7 Async engine step metrics
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** `AsyncLLMEngine` never calls `stats.record()`, so the continuous
+  path emits no `StepMetrics` at all — no phase, batch width, token count or
+  per-step wall time. `LLMEngine` records all of it. Diagnosing the continuous
+  batching shortfall behind §2.3 required monkey-patching
+  `ContinuousScheduler.schedule` from a throwaway script to recover batch
+  occupancy, which is not a workflow anyone should need to repeat.
+- **Scope.** Record a `StepMetrics` per step in `AsyncLLMEngine._step`, with a
+  phase for the mixed prefill+decode case the two-pass step creates. Reuse
+  `EngineStats`; no new types.
+- **Parity test.** A continuous run reports the same total token count through
+  `EngineStats` as the returned outputs contain, and batch width never exceeds
+  `max_num_seqs`.
 
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
@@ -243,18 +236,6 @@ listed.
 ---
 
 ## 8. Benchmark harness
-
-### 8.1 ISL / OSL-controlled workloads
-- **Status.** `landed`
-- **PRs.** _pending merge_
-- **Why.** Current workloads let the model decide output length (EOS
-  or `max_tokens`), so two engines may generate different numbers of
-  tokens for the same prompt. This makes tok/s and E2E comparisons
-  unreliable across engines. Fixed ISL (Input Sequence Length) and
-  OSL (Output Sequence Length) give reproducible, apples-to-apples
-  numbers.
-- **Scope.** Implemented via canonical JSONL dataset in `benchmarks/dataset.py`. See
-  `plans/benchmark_refactoring_execution_plan.md` for full design.
 
 ### 8.2 Plain HuggingFace `transformers` benchmark runner
 - **Status.** `planned`
