@@ -58,20 +58,6 @@ listed.
 
 ## 2. KV cache implementations
 
-### 2.1 Per-request failure isolation
-- **Status.** `landed`
-- **PRs.** _none yet_
-- **Why.** Any exception raised while admitting or running a request killed the
-  background loop: the caller waited on a queue nobody would ever post to, every
-  later request hung the same way, and the error only surfaced from `stop()` at
-  an unrelated call site. An over-long prompt was enough to take the engine down.
-- **Scope.** Request queues carry `StreamEvent | Exception | None`;
-  `generate_stream` re-raises. Admission failures fail one request, a failed
-  forward pass aborts that pass's sequences, and a loop that dies anyway fails
-  every waiter before exiting.
-- **Parity test.** An over-long prompt raises to its own caller, a later valid
-  request still completes, and a forward pass that raises surfaces to the caller.
-
 ### 2.2 Prefix sharing
 - **Status.** `planned`
 - **PRs.** _none yet_
@@ -250,8 +236,7 @@ listed.
   `torch.cat` KV growth adds per-step copy overhead. The crossover point
   — where KV cache starts winning — is model- and hardware-dependent and
   currently invisible in the benchmark suite. A sequence-length sweep
-  makes this crossover explicit, validates that §2.6 (pre-allocated
-  buffer) actually closes the gap, and guards against regressions.
+  makes this crossover explicit and guards against regressions.
 - **Scope.** New `bench run-sweep` subcommand iterating over `(ISL, OSL)` pairs,
   calling `harness.run()` for each. `report.py` renders a tok/s-vs-OSL section.
 - **Pre-req.** §8.1 (ISL/OSL-controlled workloads).
