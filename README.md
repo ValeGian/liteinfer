@@ -130,18 +130,18 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 
 | | liteinfer | vLLM | |
 |---|---:|---:|---|
-| Decode step (ITL p50) | 13.8 ms | 5.2 ms | 2.6× behind |
-| Throughput, B=4 | 271 tok/s | 724 tok/s | 2.7× behind |
-| Batching gain, B=1 → B=4 | 3.70× | 3.84× | on par |
-| Time to first token (p50) | 15.7 ms | 21.3 ms | 1.4× ahead\* |
+| Decode step (ITL p50) | 13.7 ms | 5.2 ms | 2.6× behind |
+| Throughput, B=4 | 282 tok/s | 724 tok/s | 2.6× behind |
+| Throughput, B=32 | 1,268 tok/s | 4,467 tok/s | 3.5× behind |
+| Batching gain, B=1 → B=4 | 3.84× | 3.84× | on par |
+| Time to first token (p50) | 15.7 ms | 22.7 ms | 1.4× ahead\* |
 
 \* At this prompt length TTFT is mostly fixed per-call API overhead rather than
 prefill compute, so read it as offline round-trip latency, not prefill speed.
 
-Static batching is already competitive; the gap is the per-step decode constant
-(no CUDA graphs, no fused attention) and a paged-cache path that currently costs
-more than it saves. Throughput figures are certified against `vllm bench throughput`
-to within 1%. Full tables, methodology, and per-milestone deltas:
+Batching is competitive at both tiers; what remains is a roughly flat ~3× per-step
+decode constant at every batch width — no CUDA graphs, no fused attention.
+Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:
 [`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).
 
 ## Benchmarking

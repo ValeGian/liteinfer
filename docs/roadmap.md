@@ -73,26 +73,19 @@ listed.
 ### 2.3 Paged KV cache performance (fused kernel)
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** The initial paged impl (§2.1, landed) gathers non-contiguous KV blocks
-  into a contiguous buffer before attention. Measured 29-08-2026 at ISL 128 /
-  OSL 256 that costs far more than the ~13% first recorded at OSL 64: paged runs
-  at **0.72x of native-eager** on both throughput (73.3 -> 52.7 tok/s) and ITL
-  (13.8 -> 19.0 ms), and is **slower per decode step than running with no KV cache
-  at all** (19.0 vs 16.5 ms). `PagedKVCache._gather_all` rebuilds the whole K/V
-  history into a fresh padded tensor once per layer per step — roughly 8k Python
-  tensor ops and ~200 MB copied per step at B=32, so a batch-32 step costs 130 ms
-  against 19 ms at batch 1, where a bandwidth-bound decode should cost about the
-  same at both widths. Continuous batching (§1.2) is built on paged and inherits
-  it: batch occupancy is full (measured: every step at width 32) yet an 8x wider
-  batch yields only 1.55x throughput, where vLLM gets 6.17x. A fused
-  paged-attention kernel reads the block table inside the CUDA kernel and removes
-  the gather entirely, the same approach as vLLM's PagedAttention.
-- **Scope.** Custom CUDA/Triton kernel for block-table attention;
-  `ModelRunner` switches to it when `cache_mode="paged"`.
-- **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the
-  entry point to swap in a custom attention backend.
-- **Parity test.** Paged greedy output identical to eager; benchmark
-  shows paged ≥ eager tok/s at B=1.
+- **Why.** Paged gathers non-contiguous KV blocks into a contiguous buffer before
+  attention. Since the gather was vectorised that costs ~8-10% against
+  native-eager (0.92x throughput at B=1, 0.90x at B=4 and on ITL), and what is
+  left is memory traffic rather than overhead: the gather still copies the whole
+  K/V history every decode step. A fused paged-attention kernel reads the block
+  table inside the CUDA kernel and removes the copy entirely, the same approach
+  as vLLM's PagedAttention.
+- **Scope.** Custom CUDA/Triton kernel for block-table attention; `ModelRunner`
+  switches to it when `cache_mode="paged"`.
+- **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the entry point to
+  swap in a custom attention backend.
+- **Parity test.** Paged greedy output identical to eager; benchmark shows
+  paged >= eager tok/s at B=1.
 
 ### 2.5 Quantized cache (KV-cache fp8 / int8)
 - **Status.** `planned`
