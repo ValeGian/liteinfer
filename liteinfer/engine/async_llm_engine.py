@@ -32,13 +32,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 
-from liteinfer.async_llm_types import StreamEvent
-from liteinfer.config import AsyncEngineConfig
+from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
 from liteinfer.engine.continuous_scheduler import ContinuousScheduler
-from liteinfer.engine.metrics import EngineStats
+from liteinfer.engine.metrics import (
+    EngineStats,
+    Phase,
+    StepMetrics,
+    StepTimer,
+    peak_gpu_memory_bytes,
+)
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.engine.stopping import resolve_stop_status
+from liteinfer.outputs import StreamEvent
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
 from liteinfer.tokenizer import Tokenizer
@@ -53,11 +59,12 @@ _FINISH_REASONS: dict[SequenceStatus, str] = {
 class AsyncLLMEngine:
     """Continuous-batching inference engine backed by an asyncio event loop."""
 
-    def __init__(self, config: AsyncEngineConfig) -> None:
+    def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.scheduler = ContinuousScheduler(config)
         self.model_runner = ContinuousModelRunner(config)
         self.sampler = Sampler()
+        self._step_idx = 0
         self.stats = EngineStats()
 
         self._request_queues: dict[str, asyncio.Queue] = {}
@@ -122,7 +129,9 @@ class AsyncLLMEngine:
     def _enqueue(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
         token_ids = self.tokenizer.encode(prompt)
         if len(token_ids) >= self.config.max_model_len:
-            raise ValueError(f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}")
+            raise ValueError(
+                f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}"
+            )
         seq = Sequence(
             request_id=request_id,
             prompt=prompt,
@@ -144,14 +153,9 @@ class AsyncLLMEngine:
             return
 
         if sched.prefill_seqs:
-            logits = self.model_runner.prefill(sched.prefill_seqs)
-            sampled = self.sampler(logits, [s.sampling_params for s in sched.prefill_seqs])
-            self._apply_sampled(sched.prefill_seqs, sampled)
-
+            self._forward(Phase.PREFILL, sched.prefill_seqs)
         if sched.decode_seqs:
-            logits = self.model_runner.decode(sched.decode_seqs)
-            sampled = self.sampler(logits, [s.sampling_params for s in sched.decode_seqs])
-            self._apply_sampled(sched.decode_seqs, sampled)
+            self._forward(Phase.DECODE, sched.decode_seqs)
 
         newly_finished = 0
         for seq in sched.all_seqs:
@@ -162,6 +166,37 @@ class AsyncLLMEngine:
                 newly_finished += 1
 
         self.stats.num_requests_finished += newly_finished
+
+    def _forward(self, phase: Phase, seqs: list[Sequence]) -> None:
+        """Run one forward pass and record it.
+
+        Prefill and decode are separate passes, so a step that admits new
+        sequences records two — which is what makes the two-pass cost (§1.3)
+        visible in `stats`.
+        """
+        run = self.model_runner.prefill if phase is Phase.PREFILL else self.model_runner.decode
+        input_tokens = (
+            sum(len(seq.prompt_token_ids) for seq in seqs) if phase is Phase.PREFILL else len(seqs)
+        )
+        with StepTimer(self.model_runner.device) as timer:
+            logits = run(seqs)
+            sampled = self.sampler(logits, [seq.sampling_params for seq in seqs])
+            self._apply_sampled(seqs, sampled)
+
+        if not self.config.collect_stats:
+            return
+        self.stats.record(
+            StepMetrics(
+                step_idx=self._step_idx,
+                phase=phase,
+                num_seqs=len(seqs),
+                input_tokens=input_tokens,
+                new_tokens=len(seqs),
+                wall_time_s=timer.elapsed,
+                peak_gpu_mem_bytes=peak_gpu_memory_bytes(self.model_runner.device),
+            )
+        )
+        self._step_idx += 1
 
     def _apply_sampled(self, seqs: list[Sequence], sampled) -> None:
         for i, seq in enumerate(seqs):

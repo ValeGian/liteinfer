@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from liteinfer.engine.async_llm_engine import AsyncLLMEngine
-from liteinfer.engine.llm_engine import LLMEngine
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.engine.stopping import resolve_stop_status
 from liteinfer.sampling.params import SamplingParams
@@ -91,15 +88,14 @@ def test_max_model_len_stops_the_sequence() -> None:
     )
 
 
-@pytest.mark.parametrize("engine_cls", [LLMEngine, AsyncLLMEngine])
-def test_both_engines_honour_ignore_eos(engine_cls) -> None:
-    # Regression guard: the two engines once carried separate copies of this
-    # rule and the async one silently ignored ignore_eos/min_tokens.
+def test_engine_honours_ignore_eos() -> None:
+    # Regression guard: the engine once carried its own copy of this rule and
+    # silently ignored ignore_eos/min_tokens.
     engine = MagicMock()
     engine.tokenizer = _tokenizer()
     engine.config.max_model_len = MAX_MODEL_LEN
     seq = _seq(2, SamplingParams(max_tokens=64, ignore_eos=True))
 
-    engine_cls._maybe_finish(engine, seq, EOS_ID)
+    AsyncLLMEngine._maybe_finish(engine, seq, EOS_ID)
 
     assert seq.status is SequenceStatus.WAITING

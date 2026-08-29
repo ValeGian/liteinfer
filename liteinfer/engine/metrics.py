@@ -14,7 +14,6 @@ import torch
 class Phase(str, Enum):
     PREFILL = "prefill"
     DECODE = "decode"
-    RECOMPUTE = "recompute"
 
 
 @dataclass(frozen=True)
@@ -26,14 +25,18 @@ class StepMetrics:
 
     num_seqs: int
     input_tokens: int  # Total tokens in the forward-pass input across the batch.
-    new_tokens: int    # Total tokens sampled (and appended to outputs) this step.
+    new_tokens: int  # Total tokens sampled (and appended to outputs) this step.
 
     wall_time_s: float
     peak_gpu_mem_bytes: int | None = None
 
     @property
     def throughput_tokens_per_s(self) -> float:
-        return (self.input_tokens + self.new_tokens) / self.wall_time_s if self.wall_time_s > 0 else 0.0
+        return (
+            (self.input_tokens + self.new_tokens) / self.wall_time_s
+            if self.wall_time_s > 0
+            else 0.0
+        )
 
     @property
     def decode_throughput_tokens_per_s(self) -> float:
@@ -80,7 +83,11 @@ class EngineStats:
 
     @property
     def avg_throughput_tokens_per_s(self) -> float:
-        return (self.total_input_tokens + self.total_new_tokens) / self.total_wall_s if self.total_wall_s > 0 else 0.0
+        return (
+            (self.total_input_tokens + self.total_new_tokens) / self.total_wall_s
+            if self.total_wall_s > 0
+            else 0.0
+        )
 
     @property
     def avg_decode_throughput_tokens_per_s(self) -> float:

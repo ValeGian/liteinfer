@@ -70,12 +70,13 @@ asyncio.run(main())
 ```
 liteinfer/
 ├── liteinfer/             # Library source
-│   ├── llm.py             # User-facing LLM class
+│   ├── llm.py             # Synchronous LLM facade
+│   ├── async_llm.py       # AsyncLLM: the engine's native interface
 │   ├── config.py          # EngineConfig
-│   ├── engine/            # Orchestration: scheduler, sequence, model runner
+│   ├── engine/            # Orchestration: scheduler, sequence, model runner, metrics
 │   ├── models/            # Model loaders + per-architecture implementations
 │   ├── layers/            # Reusable building blocks (attention, RMSNorm, …)
-│   ├── cache/             # KV cache (paged, prefix-cached, …)
+│   ├── cache/             # Paged KV cache: block pool + slot addressing
 │   └── sampling/          # SamplingParams + Sampler
 ├── tests/                 # Unit / integration / e2e tests
 ├── benchmarks/            # Benchmark matrix, harness, and report
@@ -86,18 +87,25 @@ Each module's `__init__.py` documents the contract it owns.
 
 ## Architecture (brief)
 
-User code calls **`LLM`**, a thin facade over **`LLMEngine`**, which owns:
+One engine: continuous batching over a paged KV cache.
 
-- **`Scheduler`** — picks which sequences run on the next forward pass
-  (static batching (see `Scheduler`) or continuous batching (see `ContinuousScheduler`)).
-- **`ModelRunner`** — runs the actual forward pass for the selected batch
-  on the GPU. Tensor parallelism, `torch.compile`, and CUDA graph capture
-  plug in here.
-- **`KVCache`** — paged blocks shared across sequences. Prefix caching
-  is a `KVCache` variant.
+- **`AsyncLLM`** — asyncio API: `await llm.generate(...)`, or `async for` to
+  stream tokens. **`LLM`** is a synchronous facade over it for offline batch use.
+- **`ContinuousScheduler`** — fills empty batch slots from the waiting queue on
+  every step and evicts finished sequences individually.
+- **`ContinuousModelRunner`** — runs one prefill or decode forward pass.
+  `torch.compile`, CUDA graph capture and tensor parallelism plug in here.
+- **`ContinuousKVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
+  `slot_table` maps logical token positions to physical slots, so a whole batch
+  is read or written with a single indexing op.
 
-Sampling is a separate stage so strategies (greedy, top-p, …) can be
-swapped without touching the engine.
+Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
+without touching the engine. `stats` records a `StepMetrics` per forward pass.
+
+Earlier designs — no cache, `DynamicCache`, plain-tensor cache, static
+batching — were measured against each other and then removed; the numbers live
+in [`docs/benchmarks.md`](docs/benchmarks.md) and the reasoning in
+[`docs/milestones.md`](docs/milestones.md).
 
 ## Testing
 

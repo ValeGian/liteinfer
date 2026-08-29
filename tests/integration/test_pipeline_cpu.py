@@ -1,387 +1,221 @@
-# pyright: reportPrivateImportUsage=false, reportCallIssue=false
-"""Integration tests for the full LLM pipeline on CPU with a tiny fake Llama model.
+# pyright: reportPrivateImportUsage=false
+"""Integration tests for the async continuous-batching pipeline on CPU.
 
-Uses randomly-initialised weights — tests structure and correctness of the
-inference pipeline, not output quality.
+Uses randomly-initialised tiny Llama weights — validates pipeline structure
+and correctness, not output quality.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
-import pytest
 import torch
-from safetensors.torch import save_file
-from tokenizers import Tokenizer as HFTokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
-from transformers import PreTrainedTokenizerFast
-from transformers.models.llama.configuration_llama import LlamaConfig
 
-from liteinfer import LLM
+from liteinfer import AsyncLLM
 from liteinfer.sampling.params import SamplingParams
+from tests.integration import tiny_llama
 
 # ---------------------------------------------------------------------------
-# Fixture
-# ---------------------------------------------------------------------------
-
-_VOCAB_SIZE = 256
-_EOS_ID = 1
-
-
-def _build_tiny_llama_dir(model_dir: Path) -> None:
-    """Populate *model_dir* with a tiny Llama model and a minimal tokenizer."""
-    cfg = LlamaConfig(
-        vocab_size=_VOCAB_SIZE,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        # "default" rope_type is not in ROPE_INIT_FUNCTIONS for this
-        # transformers version; use "linear" with factor=1 (identity).
-        rope_scaling={"rope_type": "linear", "factor": 1.0},
-        architectures=["LlamaForCausalLM"],
-        tie_word_embeddings=True,
-    )
-    cfg.save_pretrained(str(model_dir))
-
-    # Build model on CPU with a fixed seed for reproducibility.
-    from liteinfer.models.llama import LlamaForCausalLM
-
-    torch.manual_seed(0)
-    with torch.device("cpu"):
-        model = LlamaForCausalLM(cfg)
-    model = model.to(dtype=torch.float32)
-
-    # lm_head.weight is tied to embed_tokens.weight — omit it from the
-    # checkpoint so the loader can exercise the tied-weight resolution path.
-    state = {k: v for k, v in model.state_dict().items() if k != "lm_head.weight"}
-    save_file(state, str(model_dir / "model.safetensors"))
-
-    # Minimal word-level tokenizer: vocab entries are "tok<i>" for i in
-    # [2, 256), plus <unk>=0 and <eos>=1.  Unknown words map to 0, which
-    # is a valid embedding index.
-    vocab: dict[str, int] = {"<unk>": 0, "<eos>": _EOS_ID}
-    for i in range(2, _VOCAB_SIZE):
-        vocab[f"tok{i}"] = i
-    hf_tok = HFTokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
-    hf_tok.pre_tokenizer = Whitespace()
-    fast_tok = PreTrainedTokenizerFast(
-        tokenizer_object=hf_tok,
-        eos_token="<eos>",
-        unk_token="<unk>",
-    )
-    fast_tok.save_pretrained(str(model_dir))
-
-
-@pytest.fixture(scope="module")
-def tiny_llama_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    model_dir = tmp_path_factory.mktemp("tiny_llama")
-    _build_tiny_llama_dir(model_dir)
-    return model_dir
-
-
-def _make_llm(model_dir: Path, cache_mode: str = "none") -> LLM:
-    return LLM(str(model_dir), device="cpu", dtype=torch.float32, cache_mode=cache_mode)  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# Tests
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_no_cache_returns_request_output(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="none")
-    outputs = llm.generate("hello world", SamplingParams(max_tokens=4, temperature=0.0))
-    assert len(outputs) == 1
-    out = outputs[0]
-    assert out.request_id == "req-0"
-    assert out.prompt == "hello world"
-    assert isinstance(out.text, str)
-    assert isinstance(out.token_ids, list)
+def _run(coro):
+    """Run an async coroutine synchronously — avoids pytest-asyncio dependency."""
+    return asyncio.run(coro)
 
 
-def test_pipeline_no_cache_respects_max_tokens(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="none")
-    for max_tokens in (1, 3, 7):
-        out = llm.generate("hello", SamplingParams(max_tokens=max_tokens, temperature=0.0))[0]
-        assert len(out.token_ids) <= max_tokens
-
-
-def test_pipeline_no_cache_finish_reason_length(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="none")
-    out = llm.generate("hello", SamplingParams(max_tokens=3, temperature=0.0))[0]
-    # Random weights almost certainly won't hit EOS in 3 steps.
-    assert out.finish_reason == "length"
-
-
-def test_pipeline_no_cache_token_ids_in_vocab_range(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="none")
-    out = llm.generate("hello world", SamplingParams(max_tokens=8, temperature=0.0))[0]
-    for token_id in out.token_ids:
-        assert 0 <= token_id < _VOCAB_SIZE
-
-
-def test_pipeline_eager_cache_returns_request_output(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="eager")
-    outputs = llm.generate("hello world", SamplingParams(max_tokens=4, temperature=0.0))
-    assert len(outputs) == 1
-    out = outputs[0]
-    assert isinstance(out.token_ids, list)
-    assert len(out.token_ids) <= 4
-
-
-def test_pipeline_eager_cache_token_ids_in_vocab_range(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="eager")
-    out = llm.generate("hello world", SamplingParams(max_tokens=8, temperature=0.0))[0]
-    for token_id in out.token_ids:
-        assert 0 <= token_id < _VOCAB_SIZE
-
-
-def test_pipeline_greedy_parity_no_cache_vs_eager_cache(tiny_llama_dir: Path) -> None:
-    """Greedy decoding must produce identical token sequences regardless of cache mode."""
-    llm_no_cache = _make_llm(tiny_llama_dir, cache_mode="none")
-    llm_eager = _make_llm(tiny_llama_dir, cache_mode="eager")
-    params = SamplingParams(max_tokens=10, temperature=0.0)
-    prompt = "tok2 tok3 tok4"
-    out_nc = llm_no_cache.generate(prompt, params)[0]
-    out_ec = llm_eager.generate(prompt, params)[0]
-    assert out_nc.token_ids == out_ec.token_ids, (
-        f"cache-mode mismatch: no_cache={out_nc.token_ids} eager={out_ec.token_ids}"
-    )
-
-
-def test_pipeline_multiple_prompts(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="none")
-    prompts = ["hello", "world", "foo bar"]
-    outputs = llm.generate(prompts, SamplingParams(max_tokens=3, temperature=0.0))
-    assert len(outputs) == len(prompts)
-    for out in outputs:
-        assert len(out.token_ids) <= 3
-
-
-def test_pipeline_stops_on_eos(tiny_llama_dir: Path) -> None:
-    """When the model emits EOS, generation stops before max_tokens."""
-    llm = _make_llm(tiny_llama_dir, cache_mode="none")
-    original_execute = llm.engine.model_runner.execute
-
-    def _execute_forcing_eos(scheduled, is_new_batch):
-        logits, n_tokens = original_execute(scheduled, is_new_batch)
-        if not is_new_batch:
-            # Override logits so EOS has the highest score on every decode step.
-            forced = torch.full((1, _VOCAB_SIZE), float("-inf"))
-            forced[0, _EOS_ID] = 0.0
-            logits = forced
-        return logits, n_tokens
-
-    llm.engine.model_runner.execute = _execute_forcing_eos  # type: ignore[method-assign]
-    out = llm.generate("hello", SamplingParams(max_tokens=20, temperature=0.0))[0]
-
-    assert out.finish_reason == "stop"
-    assert len(out.token_ids) < 20
-
-
-# ---------------------------------------------------------------------------
-# Static batching with B > 1
-# ---------------------------------------------------------------------------
-
-
-def _make_llm_batched(
-    model_dir: Path, cache_mode: str = "none", max_num_seqs: int = 4
-) -> LLM:
-    return LLM(
+def _async_llm(model_dir: Path, max_num_seqs: int = 4) -> AsyncLLM:
+    return AsyncLLM(
         str(model_dir),
         device="cpu",
-        dtype=torch.float32,
-        cache_mode=cache_mode,  # type: ignore[arg-type]
+        dtype=torch.float32,  # type: ignore[arg-type]
         max_num_seqs=max_num_seqs,
     )
 
 
-def _by_request_id(outputs):
-    return {out.request_id: out for out in outputs}
+# ---------------------------------------------------------------------------
+# Basic output shape and correctness
+# ---------------------------------------------------------------------------
 
 
-def test_pipeline_batched_no_cache_returns_all_outputs(tiny_llama_dir: Path) -> None:
-    """B>1 with mixed-length prompts returns one output per prompt, in input order."""
-    llm = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
-    prompts = ["tok2", "tok3 tok4 tok5", "tok6 tok7", "tok8 tok9 tok10 tok11 tok12"]
-    outputs = llm.generate(prompts, SamplingParams(max_tokens=4, temperature=0.0))
+def test_continuous_pipeline_returns_one_output_per_prompt(tiny_llama_dir: Path) -> None:
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return await llm.generate(
+                ["tok2", "tok3 tok4", "tok5 tok6 tok7"],
+                SamplingParams(max_tokens=4, temperature=0.0),
+            )
 
-    assert len(outputs) == len(prompts)
+    outputs = _run(_run_test())
+    assert len(outputs) == 3
+
+
+def test_continuous_pipeline_output_order_matches_input(tiny_llama_dir: Path) -> None:
+    prompts = ["tok2", "tok3 tok4 tok5", "tok6"]
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return await llm.generate(prompts, SamplingParams(max_tokens=3, temperature=0.0))
+
+    outputs = _run(_run_test())
     for prompt, out in zip(prompts, outputs, strict=True):
         assert out.prompt == prompt
-        assert 0 < len(out.token_ids) <= 4
-        for token_id in out.token_ids:
-            assert 0 <= token_id < _VOCAB_SIZE
 
 
-def test_pipeline_batched_eager_cache_returns_all_outputs(tiny_llama_dir: Path) -> None:
-    llm = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=4)
-    prompts = ["tok2 tok3", "tok4 tok5 tok6", "tok7"]
-    outputs = llm.generate(prompts, SamplingParams(max_tokens=5, temperature=0.0))
-    assert len(outputs) == len(prompts)
-    for out in outputs:
-        assert 0 < len(out.token_ids) <= 5
+def test_continuous_pipeline_respects_max_tokens(tiny_llama_dir: Path) -> None:
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return await llm.generate(
+                ["tok2 tok3", "tok4"],
+                SamplingParams(max_tokens=3, temperature=0.0),
+            )
+
+    for out in _run(_run_test()):
+        assert 0 < len(out.token_ids) <= 3
 
 
-def test_pipeline_batched_greedy_parity_b1_vs_bN_no_cache(tiny_llama_dir: Path) -> None:
-    """Greedy outputs must be identical regardless of max_num_seqs (no-cache path)."""
-    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
-    params = SamplingParams(max_tokens=6, temperature=0.0)
+def test_continuous_pipeline_tokens_in_vocab_range(tiny_llama_dir: Path) -> None:
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return await llm.generate("tok2 tok3", SamplingParams(max_tokens=8, temperature=0.0))
 
-    llm_b1 = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=1)
-    llm_bN = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
-    out_b1 = _by_request_id(llm_b1.generate(prompts, params))
-    out_bN = _by_request_id(llm_bN.generate(prompts, params))
-
-    assert set(out_b1) == set(out_bN)
-    for req_id, o1 in out_b1.items():
-        oN = out_bN[req_id]
-        assert o1.token_ids == oN.token_ids, (
-            f"req_id={req_id} prompt={o1.prompt!r}\n"
-            f"  B=1: {o1.token_ids}\n"
-            f"  B=N: {oN.token_ids}"
-        )
+    for out in _run(_run_test()):
+        for tid in out.token_ids:
+            assert 0 <= tid < tiny_llama.VOCAB_SIZE
 
 
-def test_pipeline_batched_greedy_parity_b1_vs_bN_eager_cache(tiny_llama_dir: Path) -> None:
-    """Greedy outputs must be identical regardless of max_num_seqs (eager-cache path)."""
-    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
-    params = SamplingParams(max_tokens=6, temperature=0.0)
+def test_continuous_pipeline_finish_reason_length(tiny_llama_dir: Path) -> None:
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return await llm.generate("tok2", SamplingParams(max_tokens=3, temperature=0.0))
 
-    llm_b1 = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=1)
-    llm_bN = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=4)
-    out_b1 = _by_request_id(llm_b1.generate(prompts, params))
-    out_bN = _by_request_id(llm_bN.generate(prompts, params))
-
-    for req_id, o1 in out_b1.items():
-        oN = out_bN[req_id]
-        assert o1.token_ids == oN.token_ids
+    out = _run(_run_test())[0]
+    # Random weights almost never hit EOS in 3 steps.
+    assert out.finish_reason == "length"
 
 
 # ---------------------------------------------------------------------------
-# Native eager KV cache
+# Parity: continuous batching must produce same greedy tokens as static B=1
 # ---------------------------------------------------------------------------
+def test_continuous_pipeline_processes_more_seqs_than_max_num_seqs(tiny_llama_dir: Path) -> None:
+    """With max_num_seqs=1 and 5 prompts, all 5 complete (slot freed continuously)."""
+    prompts = [f"tok{i + 2}" for i in range(5)]
 
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir, max_num_seqs=1) as llm:
+            return await llm.generate(prompts, SamplingParams(max_tokens=4, temperature=0.0))
 
-def test_pipeline_native_eager_cache_returns_request_output(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="native_eager")
-    outputs = llm.generate("hello world", SamplingParams(max_tokens=4, temperature=0.0))
-    assert len(outputs) == 1
-    out = outputs[0]
-    assert isinstance(out.token_ids, list)
-    assert 0 < len(out.token_ids) <= 4
-
-
-def test_pipeline_native_eager_cache_token_ids_in_vocab_range(tiny_llama_dir: Path) -> None:
-    llm = _make_llm(tiny_llama_dir, cache_mode="native_eager")
-    out = llm.generate("hello world", SamplingParams(max_tokens=8, temperature=0.0))[0]
-    for token_id in out.token_ids:
-        assert 0 <= token_id < _VOCAB_SIZE
-
-
-def test_pipeline_greedy_parity_eager_cache_vs_native_eager_cache(tiny_llama_dir: Path) -> None:
-    """native_eager must produce the same token sequence as eager (DynamicCache)."""
-    llm_eager = _make_llm(tiny_llama_dir, cache_mode="eager")
-    llm_native = _make_llm(tiny_llama_dir, cache_mode="native_eager")
-    params = SamplingParams(max_tokens=10, temperature=0.0)
-    prompt = "tok2 tok3 tok4"
-    out_eager = llm_eager.generate(prompt, params)[0]
-    out_native = llm_native.generate(prompt, params)[0]
-    assert out_eager.token_ids == out_native.token_ids, (f"cache-mode mismatch: eager={out_eager.token_ids} native_eager={out_native.token_ids}")
-
-
-def test_pipeline_batched_native_eager_cache_returns_all_outputs(tiny_llama_dir: Path) -> None:
-    llm = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=4)
-    prompts = ["tok2 tok3", "tok4 tok5 tok6", "tok7"]
-    outputs = llm.generate(prompts, SamplingParams(max_tokens=5, temperature=0.0))
-    assert len(outputs) == len(prompts)
-    for out in outputs:
-        assert 0 < len(out.token_ids) <= 5
-
-
-def test_pipeline_batched_greedy_parity_b1_vs_bN_native_eager_cache(tiny_llama_dir: Path) -> None:
-    """Greedy outputs must be identical regardless of max_num_seqs (native-eager path)."""
-    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
-    params = SamplingParams(max_tokens=6, temperature=0.0)
-
-    llm_b1 = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=1)
-    llm_bN = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=4)
-    out_b1 = _by_request_id(llm_b1.generate(prompts, params))
-    out_bN = _by_request_id(llm_bN.generate(prompts, params))
-
-    for req_id, o1 in out_b1.items():
-        oN = out_bN[req_id]
-        assert o1.token_ids == oN.token_ids
-
-
-def test_pipeline_batched_greedy_parity_eager_vs_native_eager_batched(tiny_llama_dir: Path) -> None:
-    """Batched native_eager must match batched eager (DynamicCache) token-for-token."""
-    prompts = ["tok2 tok3 tok4", "tok5", "tok6 tok7 tok8 tok9"]
-    params = SamplingParams(max_tokens=6, temperature=0.0)
-
-    llm_eager = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=4)
-    llm_native = _make_llm_batched(tiny_llama_dir, cache_mode="native_eager", max_num_seqs=4)
-    out_eager = _by_request_id(llm_eager.generate(prompts, params))
-    out_native = _by_request_id(llm_native.generate(prompts, params))
-
-    for req_id, oe in out_eager.items():
-        on = out_native[req_id]
-        assert oe.token_ids == on.token_ids, f"req_id={req_id}\n  eager={oe.token_ids}\n  native_eager={on.token_ids}"
-
-
-def test_pipeline_batched_mid_batch_eos_isolated(tiny_llama_dir: Path) -> None:
-    """When one seq in a batch hits EOS mid-decode, others continue uninterrupted."""
-    llm = _make_llm_batched(tiny_llama_dir, cache_mode="none", max_num_seqs=4)
-    original_execute = llm.engine.model_runner.execute
-
-    target_request_id = "req-1"  # second prompt only
-
-    def _execute_forcing_eos_for_target(scheduled, is_new_batch):
-        logits, n_tokens = original_execute(scheduled, is_new_batch)
-        if not is_new_batch:
-            logits = logits.clone()
-            for i, seq in enumerate(scheduled):
-                if seq.request_id == target_request_id and seq.num_output_tokens >= 2:
-                    logits[i] = float("-inf")
-                    logits[i, _EOS_ID] = 0.0
-        return logits, n_tokens
-
-    llm.engine.model_runner.execute = _execute_forcing_eos_for_target  # type: ignore[method-assign]
-
-    prompts = ["tok2", "tok3", "tok4", "tok5"]
-    outputs = llm.generate(prompts, SamplingParams(max_tokens=10, temperature=0.0))
-    by_req = _by_request_id(outputs)
-
-    finished_early = by_req[target_request_id]
-    assert finished_early.finish_reason == "stop"
-    assert len(finished_early.token_ids) < 10
-
-    for req_id, out in by_req.items():
-        if req_id == target_request_id:
-            continue
-        assert out.finish_reason == "length"
-        assert len(out.token_ids) == 10
-
-
-def test_pipeline_batched_multiple_static_batches_via_stats(tiny_llama_dir: Path) -> None:
-    """5 prompts with max_num_seqs=2 must form exactly 3 static batches.
-
-    Observable via engine.stats: count of PREFILL phases (or RECOMPUTE on no-cache)
-    equals the number of distinct batches scheduled.
-    """
-    from liteinfer.engine.metrics import Phase
-
-    llm = _make_llm_batched(tiny_llama_dir, cache_mode="eager", max_num_seqs=2)
-    prompts = ["tok2", "tok3", "tok4", "tok5", "tok6"]
-    outputs = llm.generate(prompts, SamplingParams(max_tokens=3, temperature=0.0))
-
+    outputs = _run(_run_test())
     assert len(outputs) == 5
-    prefill_steps = [s for s in llm.engine.stats.steps if s.phase == Phase.PREFILL]
-    # 5 prompts, max_num_seqs=2 → batches of size 2, 2, 1 → 3 prefill steps.
-    assert len(prefill_steps) == 3, (
-        f"expected 3 PREFILL phases, got {len(prefill_steps)}: "
-        f"{[s.phase for s in llm.engine.stats.steps]}"
-    )
+    for out in outputs:
+        assert 0 < len(out.token_ids) <= 4
+
+
+# ---------------------------------------------------------------------------
+# Streaming API
+# ---------------------------------------------------------------------------
+
+
+def test_stream_yields_events_before_completion(tiny_llama_dir: Path) -> None:
+    """stream() must yield at least one intermediate event before is_finished."""
+    intermediate_seen = False
+
+    async def _run_test():
+        nonlocal intermediate_seen
+        async with _async_llm(tiny_llama_dir) as llm:
+            async for event in llm.stream(
+                "tok2 tok3 tok4 tok5", SamplingParams(max_tokens=6, temperature=0.0)
+            ):
+                if not event.is_finished:
+                    intermediate_seen = True
+
+    _run(_run_test())
+    assert intermediate_seen, "stream() never yielded an intermediate (non-finished) event"
+
+
+def test_stream_final_event_is_finished(tiny_llama_dir: Path) -> None:
+    last_event = None
+
+    async def _run_test():
+        nonlocal last_event
+        async with _async_llm(tiny_llama_dir) as llm:
+            async for event in llm.stream("tok2", SamplingParams(max_tokens=3, temperature=0.0)):
+                last_event = event
+
+    _run(_run_test())
+    assert last_event is not None
+    assert last_event.is_finished
+    assert last_event.finish_reason in ("stop", "length")
+
+
+def test_stream_cumulative_tokens_grow_monotonically(tiny_llama_dir: Path) -> None:
+    token_counts = []
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            async for event in llm.stream(
+                "tok2 tok3", SamplingParams(max_tokens=5, temperature=0.0)
+            ):
+                token_counts.append(len(event.output_token_ids))
+
+    _run(_run_test())
+    assert token_counts == sorted(token_counts), "token counts must be non-decreasing"
+    assert token_counts[-1] >= 1
+
+
+def test_stream_concurrent_requests_both_complete(tiny_llama_dir: Path) -> None:
+    """Two concurrent stream() calls must both complete."""
+
+    async def _collect(llm, prompt):
+        events = []
+        async for event in llm.stream(prompt, SamplingParams(max_tokens=4, temperature=0.0)):
+            events.append(event)
+        return events
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir, max_num_seqs=4) as llm:
+            return await asyncio.gather(
+                _collect(llm, "tok2 tok3"),
+                _collect(llm, "tok4 tok5 tok6"),
+            )
+
+    results_a, results_b = _run(_run_test())
+    assert results_a[-1].is_finished
+    assert results_b[-1].is_finished
+
+
+# ---------------------------------------------------------------------------
+# EOS stops generation
+# ---------------------------------------------------------------------------
+
+
+def test_continuous_pipeline_stops_on_eos(tiny_llama_dir: Path) -> None:
+    """When the model emits EOS, generation stops before max_tokens."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            original_prefill = llm.engine.model_runner.prefill
+            original_decode = llm.engine.model_runner.decode
+
+            def _prefill_forcing_eos(seqs):
+                logits = original_prefill(seqs)
+                forced = torch.full((logits.shape[0], tiny_llama.VOCAB_SIZE), float("-inf"))
+                forced[:, tiny_llama.EOS_ID] = 0.0
+                return forced
+
+            def _decode_forcing_eos(seqs):
+                logits = original_decode(seqs)
+                forced = torch.full((logits.shape[0], tiny_llama.VOCAB_SIZE), float("-inf"))
+                forced[:, tiny_llama.EOS_ID] = 0.0
+                return forced
+
+            llm.engine.model_runner.prefill = _prefill_forcing_eos  # type: ignore[method-assign]
+            llm.engine.model_runner.decode = _decode_forcing_eos  # type: ignore[method-assign]
+
+            return await llm.generate("tok2 tok3", SamplingParams(max_tokens=20, temperature=0.0))
+
+    outputs = _run(_run_test())
+    assert outputs[0].finish_reason == "stop"
+    assert len(outputs[0].token_ids) < 20

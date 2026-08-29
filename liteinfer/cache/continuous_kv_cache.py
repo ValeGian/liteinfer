@@ -92,7 +92,9 @@ class ContinuousKVCache:
             self._pool.device,
         )
 
-    def scatter(self, layer_idx: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+    def scatter(
+        self, layer_idx: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> None:
         """Store one K/V column per slot: ``[B, H, T, D]`` -> ``[B, T, H, D]``."""
         keys, values = self._pool.slots(layer_idx)
         keys[slots] = k.permute(0, 2, 1, 3)

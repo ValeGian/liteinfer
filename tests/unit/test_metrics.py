@@ -41,9 +41,3 @@ def test_engine_stats_listeners_fire_synchronously() -> None:
     stats.record(StepMetrics(1, Phase.DECODE, 1, 1, 1, 0.05))
     assert seen == [0, 1]
 
-
-def test_recompute_phase_does_not_inflate_prefill_avg() -> None:
-    stats = EngineStats()
-    stats.record(StepMetrics(0, Phase.RECOMPUTE, 1, input_tokens=50, new_tokens=1, wall_time_s=0.5))
-    assert stats.total_prefill_input_tokens == 0
-    assert stats.avg_prefill_throughput_tokens_per_s == 0.0

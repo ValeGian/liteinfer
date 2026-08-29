@@ -66,38 +66,11 @@ def hf_model(model_dir):
 
 
 @pytest.fixture(scope="module")
-def llm_no_cache(model_dir):
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="none")
-    yield llm
-    # Move to CPU before del: pytest's fixture cache still holds a reference to
-    # the yielded value during teardown, so del alone won't free CUDA memory.
-    if llm.engine.model_runner.model is not None:
-        llm.engine.model_runner.model.cpu()
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-@pytest.fixture(scope="module")
-def llm_eager_cache(model_dir):
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="eager")
-    yield llm
-    # Move to CPU before del: pytest's fixture cache still holds a reference to
-    # the yielded value during teardown, so del alone won't free CUDA memory.
-    if llm.engine.model_runner.model is not None:
-        llm.engine.model_runner.model.cpu()
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-@pytest.fixture(scope="module")
-def llm_native_eager_cache(model_dir):
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="native_eager")
-    yield llm
-    if llm.engine.model_runner.model is not None:
-        llm.engine.model_runner.model.cpu()
-    del llm
+def llm(model_dir):
+    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE)
+    yield engine
+    engine.close()
+    del engine
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -127,7 +100,7 @@ def _liteinfer_greedy(llm: LLM, prompt: str, max_tokens: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Parity: no-cache vs transformers
+# Parity vs transformers
 # ---------------------------------------------------------------------------
 
 
@@ -135,11 +108,11 @@ def _liteinfer_greedy(llm: LLM, prompt: str, max_tokens: int) -> list[int]:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_no_cache_matches_transformers(llm_no_cache: LLM, hf_model, prompt: str) -> None:
-    """liteinfer (cache_mode=none) greedy output must match transformers token-for-token."""
-    prompt_ids = llm_no_cache.tokenizer.encode(prompt)
+def test_greedy_matches_transformers(llm: LLM, hf_model, prompt: str) -> None:
+    """liteinfer greedy output must match transformers token-for-token."""
+    prompt_ids = llm.tokenizer.encode(prompt)
     expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm_no_cache, prompt, _PARITY_MAX_TOKENS)
+    actual = _liteinfer_greedy(llm, prompt, _PARITY_MAX_TOKENS)
     assert actual == expected, (
         f"prompt={prompt!r}\n"
         f"  liteinfer : {actual}\n"
@@ -151,91 +124,11 @@ def test_greedy_no_cache_matches_transformers(llm_no_cache: LLM, hf_model, promp
 # Parity: eager cache vs transformers
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_eager_cache_matches_transformers(llm_eager_cache: LLM, hf_model, prompt: str) -> None:
-    """liteinfer (cache_mode=eager) greedy output must match transformers token-for-token."""
-    prompt_ids = llm_eager_cache.tokenizer.encode(prompt)
-    expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    assert actual == expected, (
-        f"prompt={prompt!r}\n"
-        f"  liteinfer : {actual}\n"
-        f"  transformers: {expected}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Parity: no-cache vs eager-cache (internal consistency)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_no_cache_matches_eager_cache(
-    llm_no_cache: LLM, llm_eager_cache: LLM, prompt: str
-) -> None:
-    """Both cache modes must produce the same token sequence under greedy decoding."""
-    tokens_no_cache = _liteinfer_greedy(llm_no_cache, prompt, _PARITY_MAX_TOKENS)
-    tokens_eager = _liteinfer_greedy(llm_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    assert tokens_no_cache == tokens_eager, (
-        f"prompt={prompt!r}\n"
-        f"  no_cache   : {tokens_no_cache}\n"
-        f"  eager_cache: {tokens_eager}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Parity: native_eager cache vs transformers
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_native_eager_cache_matches_transformers(llm_native_eager_cache: LLM, hf_model, prompt: str) -> None:
-    """liteinfer (cache_mode=native_eager) greedy output must match transformers token-for-token."""
-    prompt_ids = llm_native_eager_cache.tokenizer.encode(prompt)
-    expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm_native_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    assert actual == expected, (
-        f"prompt={prompt!r}\n"
-        f"  liteinfer   : {actual}\n"
-        f"  transformers: {expected}"
-    )
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_eager_cache_matches_native_eager_cache(llm_eager_cache: LLM, llm_native_eager_cache: LLM, prompt: str) -> None:
-    """eager (DynamicCache) and native_eager must produce identical token sequences."""
-    tokens_eager = _liteinfer_greedy(llm_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    tokens_native = _liteinfer_greedy(llm_native_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    assert tokens_eager == tokens_native, (
-        f"prompt={prompt!r}\n"
-        f"  eager       : {tokens_eager}\n"
-        f"  native_eager: {tokens_native}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# E2E generation: structural correctness
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-def test_generation_output_fields_populated(llm_no_cache: LLM) -> None:
-    outputs = llm_no_cache.generate(
+def test_generation_output_fields_populated(llm: LLM) -> None:
+    outputs = llm.generate(
         "Tell me a fun fact about penguins.",
         SamplingParams(max_tokens=15, temperature=0.0),
     )
@@ -250,9 +143,9 @@ def test_generation_output_fields_populated(llm_no_cache: LLM) -> None:
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-def test_generation_respects_max_tokens(llm_no_cache: LLM) -> None:
+def test_generation_respects_max_tokens(llm: LLM) -> None:
     for max_tokens in (1, 5, 15):
-        out = llm_no_cache.generate(
+        out = llm.generate(
             "Hello, my name is",
             SamplingParams(max_tokens=max_tokens, temperature=0.0),
         )[0]
@@ -264,13 +157,13 @@ def test_generation_respects_max_tokens(llm_no_cache: LLM) -> None:
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-def test_generation_multiple_prompts(llm_no_cache: LLM) -> None:
+def test_generation_multiple_prompts(llm: LLM) -> None:
     prompts = [
         "The sky is",
         "Water boils at",
         "The fastest animal on earth is",
     ]
-    outputs = llm_no_cache.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
+    outputs = llm.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
     assert len(outputs) == len(prompts)
     for i, (out, prompt) in enumerate(zip(outputs, prompts, strict=True)):
         assert out.prompt == prompt, f"prompt mismatch at index {i}"
@@ -281,26 +174,14 @@ def test_generation_multiple_prompts(llm_no_cache: LLM) -> None:
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-def test_generation_token_ids_in_vocab_range(llm_no_cache: LLM) -> None:
-    out = llm_no_cache.generate(
+def test_generation_token_ids_in_vocab_range(llm: LLM) -> None:
+    out = llm.generate(
         "Once upon a time",
         SamplingParams(max_tokens=20, temperature=0.0),
     )[0]
-    vocab_size = llm_no_cache.tokenizer.vocab_size
+    vocab_size = llm.tokenizer.vocab_size
     for token_id in out.token_ids:
         assert 0 <= token_id < vocab_size, (
             f"token_id {token_id} out of range [0, {vocab_size})"
         )
 
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-def test_generation_eager_cache_output_fields_populated(llm_eager_cache: LLM) -> None:
-    out = llm_eager_cache.generate(
-        "The meaning of life is",
-        SamplingParams(max_tokens=10, temperature=0.0),
-    )[0]
-    assert isinstance(out.text, str) and len(out.text) > 0
-    assert 0 < len(out.token_ids) <= 10
-    assert out.finish_reason in ("stop", "length")

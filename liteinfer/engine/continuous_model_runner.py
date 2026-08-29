@@ -20,8 +20,11 @@ import torch
 
 from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
-from liteinfer.config import AsyncEngineConfig
-from liteinfer.engine.attention_mask import build_continuous_decode_for_model, build_for_model
+from liteinfer.config import EngineConfig
+from liteinfer.engine.attention_mask import (
+    build_continuous_decode_for_model,
+    build_prefill_for_model,
+)
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.loader import load_hf_model
@@ -29,7 +32,7 @@ from liteinfer.tokenizer import Tokenizer
 
 
 class ContinuousModelRunner:
-    def __init__(self, config: AsyncEngineConfig) -> None:
+    def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.device = config.resolved_device()
         self.model: torch.nn.Module | None = None
@@ -66,11 +69,9 @@ class ContinuousModelRunner:
             self._cache.register(seq.request_id, pl)
 
         input_ids, position_ids = self._build_prefill_inputs(seqs, prompt_lens, max_prompt_len)
-        attention_mask = build_for_model(
+        attention_mask = build_prefill_for_model(
             type(self.model).__name__,
             prompt_lens=prompt_lens,
-            query_len=max_prompt_len,
-            past_len=0,
             dtype=self.config.dtype,
             device=self.device,
         )

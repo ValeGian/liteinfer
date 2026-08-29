@@ -22,7 +22,9 @@ class SamplingParams:
 
     # Stable unique ID so Sampler can key per-request RNG state without
     # relying on id(), which reuses addresses after GC.
-    _id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False, repr=False, compare=False)
+    _id: str = field(
+        default_factory=lambda: uuid.uuid4().hex, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.temperature < 0:

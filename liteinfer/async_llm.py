@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from itertools import count
 
-from liteinfer.async_llm_types import StreamEvent
-from liteinfer.config import AsyncEngineConfig
+from liteinfer.config import EngineConfig
 from liteinfer.engine.async_llm_engine import AsyncLLMEngine
-from liteinfer.llm import RequestOutput
+from liteinfer.outputs import RequestOutput, StreamEvent
 from liteinfer.sampling.params import SamplingParams
 
 
@@ -29,14 +29,10 @@ class AsyncLLM:
     ``stop()`` (called automatically by the context manager). New requests are
     admitted into empty batch slots on every engine step; finished sequences
     are evicted immediately without waiting for the whole batch to complete.
-
-    Cache mode is always ``"paged"``: continuous batching requires per-sequence
-    block management that the paged KV cache provides.
     """
 
     def __init__(self, model: str, **engine_kwargs) -> None:
-        engine_kwargs.pop("cache_mode", None)  # always paged; silently ignore overrides
-        self.config = AsyncEngineConfig(model=model, **engine_kwargs)
+        self.config = EngineConfig(model=model, **engine_kwargs)
         self.engine = AsyncLLMEngine(self.config)
         self._req_id_gen = count(0)
 
@@ -89,8 +85,6 @@ class AsyncLLM:
                 token_ids=final.output_token_ids,
                 finish_reason=final.finish_reason or "stop",
             )
-
-        import asyncio
 
         req_ids = [f"req-{next(self._req_id_gen)}" for _ in prompts]
         results = await asyncio.gather(

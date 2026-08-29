@@ -12,7 +12,7 @@ import asyncio
 import pytest
 import torch
 
-from liteinfer import LLM, AsyncLLM
+from liteinfer import AsyncLLM
 from liteinfer.hub import resolve_model_path
 from liteinfer.sampling.params import SamplingParams
 
@@ -34,47 +34,9 @@ def model_dir():
 
 
 # ---------------------------------------------------------------------------
-# Parity: continuous batching == static B=1 (greedy)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.gpu
-@pytest.mark.e2e
-def test_continuous_gpu_greedy_parity_vs_static(model_dir) -> None:
-    """Continuous batching (AsyncLLM) must produce identical greedy tokens to
-    static B=1 (LLM with paged cache) on the same prompts."""
-    params = SamplingParams(max_tokens=_MAX_TOKENS, temperature=0.0)
-
-    # Static reference
-    llm_static = LLM(
-        str(model_dir),
-        device=_DEVICE,
-        dtype=_DTYPE,  # type: ignore[arg-type]
-        cache_mode="paged",
-        max_num_seqs=1,
-    )
-    static_outputs = {out.prompt: out.token_ids for out in llm_static.generate(_PARITY_PROMPTS, params)}
-    del llm_static
-    torch.cuda.empty_cache()
-
-    async def _run_async():
-        async with AsyncLLM(
-            str(model_dir),
-            device=_DEVICE,
-            dtype=_DTYPE,  # type: ignore[arg-type]
-            max_num_seqs=1,
-        ) as llm:
-            return await llm.generate(_PARITY_PROMPTS, params)
-
-    for out in asyncio.run(_run_async()):
-        expected = static_outputs[out.prompt]
-        assert out.token_ids == expected, (
-            f"prompt={out.prompt!r}\n"
-            f"  continuous: {out.token_ids}\n"
-            f"  static:     {expected}"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Functional: multi-prompt throughput run (correctness only, not perf)
 # ---------------------------------------------------------------------------

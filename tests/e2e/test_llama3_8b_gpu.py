@@ -63,34 +63,11 @@ def hf_model(model_dir):
 
 
 @pytest.fixture()
-def llm_no_cache(model_dir):
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="none")
-    yield llm
-    if llm.engine.model_runner.model is not None:
-        llm.engine.model_runner.model.cpu()
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-@pytest.fixture()
-def llm_eager_cache(model_dir):
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="eager")
-    yield llm
-    if llm.engine.model_runner.model is not None:
-        llm.engine.model_runner.model.cpu()
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-@pytest.fixture()
-def llm_native_eager_cache(model_dir):
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode="native_eager")
-    yield llm
-    if llm.engine.model_runner.model is not None:
-        llm.engine.model_runner.model.cpu()
-    del llm
+def llm(model_dir):
+    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE)
+    yield engine
+    engine.close()
+    del engine
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -127,11 +104,11 @@ def _liteinfer_greedy(llm: LLM, prompt: str, max_tokens: int) -> list[int]:
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_no_cache_matches_transformers(llm_no_cache: LLM, hf_model, prompt: str) -> None:
-    """liteinfer (cache_mode=none) greedy output must match transformers token-for-token."""
-    prompt_ids = llm_no_cache.tokenizer.encode(prompt)
+def test_greedy_matches_transformers(llm: LLM, hf_model, prompt: str) -> None:
+    """liteinfer greedy output must match transformers token-for-token."""
+    prompt_ids = llm.tokenizer.encode(prompt)
     expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm_no_cache, prompt, _PARITY_MAX_TOKENS)
+    actual = _liteinfer_greedy(llm, prompt, _PARITY_MAX_TOKENS)
     assert actual == expected, (
         f"prompt={prompt!r}\n"
         f"  liteinfer   : {actual}\n"
@@ -144,89 +121,3 @@ def test_greedy_no_cache_matches_transformers(llm_no_cache: LLM, hf_model, promp
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_eager_cache_matches_transformers(llm_eager_cache: LLM, hf_model, prompt: str) -> None:
-    """liteinfer (cache_mode=eager) greedy output must match transformers token-for-token."""
-    prompt_ids = llm_eager_cache.tokenizer.encode(prompt)
-    expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    assert actual == expected, (
-        f"prompt={prompt!r}\n"
-        f"  liteinfer   : {actual}\n"
-        f"  transformers: {expected}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Parity: native_eager cache vs transformers
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_native_eager_cache_matches_transformers(llm_native_eager_cache: LLM, hf_model, prompt: str) -> None:
-    """liteinfer (cache_mode=native_eager) greedy output must match transformers token-for-token."""
-    prompt_ids = llm_native_eager_cache.tokenizer.encode(prompt)
-    expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm_native_eager_cache, prompt, _PARITY_MAX_TOKENS)
-    assert actual == expected, (
-        f"prompt={prompt!r}\n"
-        f"  liteinfer   : {actual}\n"
-        f"  transformers: {expected}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Internal consistency
-# ---------------------------------------------------------------------------
-# These tests compare two liteinfer cache modes without HF. Loading both
-# simultaneously exceeds single-GPU VRAM, so each mode is loaded, sampled,
-# and unloaded before the next one is loaded.
-
-
-def _liteinfer_greedy_ephemeral(model_dir, cache_mode: str, prompt: str, max_tokens: int) -> list[int]:
-    """Load a single liteinfer instance, generate, then fully release VRAM."""
-    llm = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, cache_mode=cache_mode)
-    try:
-        return _liteinfer_greedy(llm, prompt, max_tokens)
-    finally:
-        if llm.engine.model_runner.model is not None:
-            llm.engine.model_runner.model.cpu()
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_no_cache_matches_eager_cache(model_dir, prompt: str) -> None:
-    """Both cache modes must produce the same token sequence under greedy decoding."""
-    tokens_no_cache = _liteinfer_greedy_ephemeral(model_dir, "none", prompt, _PARITY_MAX_TOKENS)
-    tokens_eager = _liteinfer_greedy_ephemeral(model_dir, "eager", prompt, _PARITY_MAX_TOKENS)
-    assert tokens_no_cache == tokens_eager, (
-        f"prompt={prompt!r}\n"
-        f"  no_cache   : {tokens_no_cache}\n"
-        f"  eager_cache: {tokens_eager}"
-    )
-
-
-@pytest.mark.gpu
-@pytest.mark.e2e
-@pytest.mark.slow
-@pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_eager_cache_matches_native_eager_cache(model_dir, prompt: str) -> None:
-    """eager (DynamicCache) and native_eager must produce identical token sequences."""
-    tokens_eager = _liteinfer_greedy_ephemeral(model_dir, "eager", prompt, _PARITY_MAX_TOKENS)
-    tokens_native = _liteinfer_greedy_ephemeral(model_dir, "native_eager", prompt, _PARITY_MAX_TOKENS)
-    assert tokens_eager == tokens_native, (
-        f"prompt={prompt!r}\n"
-        f"  eager       : {tokens_eager}\n"
-        f"  native_eager: {tokens_native}"
-    )

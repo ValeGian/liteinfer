@@ -114,7 +114,19 @@ def _longest_first(job: tuple[str, Mode]) -> tuple:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    names = list(configs.CONFIGS) if args.all else args.config
+    names = (
+        [name for name, config in configs.CONFIGS.items() if not config.historical]
+        if args.all
+        else args.config
+    )
+    historical = [n for n in names if configs.get(n).historical]
+    if historical:
+        print(
+            f"Cannot run {', '.join(historical)}: measured before the code was removed. "
+            "Their results are kept for the report.",
+            file=sys.stderr,
+        )
+        return 2
     if not names:
         print("Nothing to run: pass --config NAME ... or --all", file=sys.stderr)
         return 2

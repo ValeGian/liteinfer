@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Literal
 
 Engine = Literal["liteinfer", "vllm"]
-CacheMode = Literal["none", "eager", "native_eager", "paged"]
 
 
 @dataclass(frozen=True)
@@ -20,61 +19,62 @@ class BenchmarkConfig:
     engine: Engine
     description: str
     max_num_seqs: int = 1
-    cache_mode: CacheMode = "paged"  # liteinfer only
-    continuous: bool = False  # liteinfer only: AsyncLLM instead of LLM
     baseline: str | None = None
+    historical: bool = False
+    """Measured before the code was removed. Kept so the report still shows the
+    progression; `bench run --all` skips it because it can no longer run."""
 
 
 _ENTRIES: tuple[BenchmarkConfig, ...] = (
     # --- liteinfer: KV cache lineage, one sequence at a time (§1.2, §2.1) ---
     BenchmarkConfig(
         name="liteinfer-nocache",
+        historical=True,
         engine="liteinfer",
-        cache_mode="none",
         description="No KV cache: every step re-feeds the whole sequence",
     ),
     BenchmarkConfig(
         name="liteinfer-eager",
+        historical=True,
         engine="liteinfer",
-        cache_mode="eager",
         baseline="liteinfer-nocache",
         description="KV cache via transformers DynamicCache",
     ),
     BenchmarkConfig(
         name="liteinfer-native-eager",
+        historical=True,
         engine="liteinfer",
-        cache_mode="native_eager",
         baseline="liteinfer-eager",
         description="KV cache as plain tensors, no DynamicCache",
     ),
     BenchmarkConfig(
         name="liteinfer-paged",
+        historical=True,
         engine="liteinfer",
-        cache_mode="paged",
         baseline="liteinfer-native-eager",
         description="Paged KV cache: fixed-size blocks from a pool",
     ),
     # --- liteinfer: static batching at B=4 (§1.1) ---
     BenchmarkConfig(
         name="liteinfer-eager-b4",
+        historical=True,
         engine="liteinfer",
-        cache_mode="eager",
         max_num_seqs=4,
         baseline="liteinfer-eager",
         description="Static batching, B=4, eager cache",
     ),
     BenchmarkConfig(
         name="liteinfer-native-eager-b4",
+        historical=True,
         engine="liteinfer",
-        cache_mode="native_eager",
         max_num_seqs=4,
         baseline="liteinfer-native-eager",
         description="Static batching, B=4, native eager cache",
     ),
     BenchmarkConfig(
         name="liteinfer-paged-b4",
+        historical=True,
         engine="liteinfer",
-        cache_mode="paged",
         max_num_seqs=4,
         baseline="liteinfer-paged",
         description="Static batching, B=4, paged cache",
@@ -83,9 +83,7 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
     BenchmarkConfig(
         name="liteinfer-continuous",
         engine="liteinfer",
-        cache_mode="paged",
         max_num_seqs=32,
-        continuous=True,
         baseline="liteinfer-paged-b4",
         description="Continuous batching, up to 32 concurrent sequences",
     ),

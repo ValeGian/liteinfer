@@ -4,11 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
-
-CacheMode = Literal["eager", "native_eager", "paged", "none"]
 
 
 @dataclass
@@ -18,7 +15,6 @@ class EngineConfig:
     dtype: torch.dtype = torch.bfloat16
     device: str = "auto"
 
-    cache_mode: CacheMode = "none"
     max_num_seqs: int = 32
     max_model_len: int = 4096
 
@@ -26,7 +22,7 @@ class EngineConfig:
 
     collect_stats: bool = True
 
-    # Paged KV cache settings (cache_mode="paged" only).
+    # KV block pool.
     block_size: int = 16
     num_gpu_blocks: int | None = None  # None → auto-computed after model load
 
@@ -35,8 +31,6 @@ class EngineConfig:
             raise ValueError("max_num_seqs must be >= 1")
         if self.max_model_len < 1:
             raise ValueError("max_model_len must be >= 1")
-        if self.cache_mode not in ("eager", "native_eager", "paged", "none"):
-            raise ValueError(f"cache_mode must be 'eager', 'native_eager', 'paged', or 'none', got {self.cache_mode!r}")
         if self.block_size < 1:
             raise ValueError("block_size must be >= 1")
 
@@ -45,20 +39,3 @@ class EngineConfig:
         if self.device == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(self.device)
-
-
-@dataclass
-class AsyncEngineConfig(EngineConfig):
-    """Configuration for the async continuous-batching engine.
-
-    Identical to ``EngineConfig`` but forces ``cache_mode="paged"``:
-    continuous batching requires per-sequence block management that only
-    the paged KV cache provides.
-    """
-
-    cache_mode: CacheMode = "paged"  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.cache_mode != "paged":
-            raise ValueError(f"AsyncEngineConfig requires cache_mode='paged', got {self.cache_mode!r}")
-        super().__post_init__()

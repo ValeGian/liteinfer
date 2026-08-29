@@ -80,8 +80,8 @@ listed.
   K/V history every decode step. A fused paged-attention kernel reads the block
   table inside the CUDA kernel and removes the copy entirely, the same approach
   as vLLM's PagedAttention.
-- **Scope.** Custom CUDA/Triton kernel for block-table attention; `ModelRunner`
-  switches to it when `cache_mode="paged"`.
+- **Scope.** Custom CUDA/Triton kernel for block-table attention;
+  `ContinuousModelRunner` switches to it for the decode pass.
 - **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the entry point to
   swap in a custom attention backend.
 - **Parity test.** Paged greedy output identical to eager; benchmark shows
@@ -100,26 +100,10 @@ listed.
 
 ## 3. Performance optimizations
 
-### 2.7 Async engine step metrics
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** `AsyncLLMEngine` never calls `stats.record()`, so the continuous
-  path emits no `StepMetrics` at all — no phase, batch width, token count or
-  per-step wall time. `LLMEngine` records all of it. Diagnosing the continuous
-  batching shortfall behind §2.3 required monkey-patching
-  `ContinuousScheduler.schedule` from a throwaway script to recover batch
-  occupancy, which is not a workflow anyone should need to repeat.
-- **Scope.** Record a `StepMetrics` per step in `AsyncLLMEngine._step`, with a
-  phase for the mixed prefill+decode case the two-pass step creates. Reuse
-  `EngineStats`; no new types.
-- **Parity test.** A continuous run reports the same total token count through
-  `EngineStats` as the returned outputs contain, and batch width never exceeds
-  `max_num_seqs`.
-
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Wrap `ModelRunner._execute_eager` in `torch.compile`,
+- **Scope.** Wrap the `ContinuousModelRunner` forward passes in `torch.compile`,
   gated by `EngineConfig.enable_torch_compile`. First call pays
   compile cost; subsequent calls run the compiled graph.
 - **Risk.** Dynamic shapes (variable sequence length) defeat compile

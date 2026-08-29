@@ -4,6 +4,15 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 29-08-2026 — One engine: continuous batching only (+ §2.7 async step metrics)
+
+- **PRs.** _none yet_
+- **What.** Removed every superseded execution path now that the benchmark has measured each one against its predecessor. Gone: the synchronous `LLMEngine`, `Scheduler` and `ModelRunner` (static batching), the `KVCache` ABC with its no-cache, `DynamicCache` and plain-tensor implementations, the batch-level `PagedKVCache`, `cache_mode`, and `AsyncEngineConfig` — which had become identical to `EngineConfig`. What remains is one engine: `AsyncLLM` over continuous batching on a paged block cache, with `LLM` kept as a synchronous facade that owns a private event loop, so offline batch use is unchanged. The attention-mask builder loses its decode branch and `past_len` parameter, since continuous prefill always passes zero and continuous decode has its own builder. `StepMetrics` is now recorded per forward pass rather than per step, which is what makes the two-pass prefill+decode cost (§1.3) visible and closes §2.7; `collect_stats` finally means something, having never been read before. The benchmark collapses to one liteinfer adapter — the event-loop handling it used to carry now lives in `LLM` — and the removed configurations stay in `benchmarks/configs.py` flagged `historical` so the report keeps rendering the full progression, marked as no longer runnable. Package source drops from ~2,900 to ~2,000 lines.
+- **Why these and not others.** `nocache` was strictly dominated (60.5 vs 73.4 tok/s, 16.5 vs 13.7 ms ITL). `eager` and `native-eager` measured identical, so one was redundant. Static batching was surpassed 4.5x by continuous batching (281.6 → 1,268.3 tok/s). The one cost is ~9% single-request ITL, since eager's 13.7 ms beat continuous's 14.9 ms at B=1 — judged not worth a second engine and ~900 lines in a codebase meant to be read.
+- **Verified.** Surviving flow re-measured at 1,368 tok/s, unchanged within run-to-run variance, so per-pass metrics cost nothing measurable. 177 non-e2e tests and 11 GPU e2e tests pass; the sync-pipeline suite was ported to the facade rather than deleted.
+
+---
+
 ## 29-08-2026 — Vectorised block-table gather (precursor to §2.3)
 
 - **PRs.** [#16](https://github.com/ValeGian/liteinfer/pull/16)

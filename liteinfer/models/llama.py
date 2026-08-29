@@ -64,7 +64,10 @@ class LlamaRotaryEmbedding(nn.Module):
             # Standard RoPE: no frequency scaling, custom base theta.
             theta = rope_params.get("rope_theta", config.default_theta)
             head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-            inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+            inv_freq = 1.0 / (
+                theta
+                ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+            )
             self.attention_scaling = 1.0
         else:
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -72,8 +75,12 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        )
         position_ids_expanded = position_ids[:, None, :].float()
         # RoPE math is sensitive to fp16/bf16 rounding; force fp32.
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
@@ -114,9 +121,13 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class LlamaMLP(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -134,17 +145,27 @@ class LlamaAttention(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
 
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
 
     def forward(
         self,
@@ -229,9 +250,7 @@ def _build_causal_mask(
     total_len = past_len + seq_len
     mask = torch.zeros((seq_len, total_len), dtype=dtype, device=device)
     if seq_len > 1:
-        causal = torch.full(
-            (seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=device
-        )
+        causal = torch.full((seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=device)
         causal = torch.triu(causal, diagonal=1)
         mask[:, past_len:] = causal
     return mask[None, None, :, :]
@@ -265,7 +284,9 @@ class LlamaModel(nn.Module):
             ).unsqueeze(0)
 
         if attention_mask is None:
-            attention_mask = _build_causal_mask(seq_len, past_len, inputs_embeds.dtype, inputs_embeds.device)
+            attention_mask = _build_causal_mask(
+                seq_len, past_len, inputs_embeds.dtype, inputs_embeds.device
+            )
 
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
@@ -287,9 +308,7 @@ class LlamaForCausalLM(nn.Module):
 
     # Read by `liteinfer.models.loader` to resolve checkpoints that store
     # only the embedding copy of a tied weight.
-    _tied_weights_keys: ClassVar[dict[str, str]] = {
-        "lm_head.weight": "model.embed_tokens.weight"
-    }
+    _tied_weights_keys: ClassVar[dict[str, str]] = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()

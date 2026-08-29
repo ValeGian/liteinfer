@@ -28,8 +28,15 @@ def test_a_config_never_baselines_against_another_engine() -> None:
     assert crossed == []
 
 
-def test_continuous_configs_use_the_paged_cache() -> None:
-    assert all(c.cache_mode == "paged" for c in CONFIGS.values() if c.continuous)
+def test_historical_configs_still_name_a_baseline_chain() -> None:
+    # They are no longer runnable, but the report renders their lineage.
+    historical = [c for c in CONFIGS.values() if c.historical]
+    assert all(c.baseline in CONFIGS or c.baseline is None for c in historical)
+
+
+def test_at_least_one_liteinfer_config_is_runnable() -> None:
+    runnable = [c for c in CONFIGS.values() if c.engine == "liteinfer" and not c.historical]
+    assert len(runnable) == 1
 
 
 def test_get_rejects_an_unknown_name() -> None:
