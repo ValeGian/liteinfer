@@ -8,8 +8,10 @@ and correctness, not output quality.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
+import pytest
 import torch
 
 from liteinfer import AsyncLLM
@@ -219,3 +221,63 @@ def test_continuous_pipeline_stops_on_eos(tiny_llama_dir: Path) -> None:
     outputs = _run(_run_test())
     assert outputs[0].finish_reason == "stop"
     assert len(outputs[0].token_ids) < 20
+
+
+# ---------------------------------------------------------------------------
+# Failure handling: a bad request must not take the engine down with it
+# ---------------------------------------------------------------------------
+
+
+def test_over_long_prompt_raises_to_its_own_caller(tiny_llama_dir: Path) -> None:
+    async def run() -> None:
+        async with AsyncLLM(
+            str(tiny_llama_dir), device="cpu", dtype=torch.float32, max_model_len=8
+        ) as llm:
+            long_prompt = " ".join(f"tok{i}" for i in range(10, 40))
+            with pytest.raises(ValueError, match="max_model_len"):
+                await asyncio.wait_for(
+                    llm.generate([long_prompt], SamplingParams(max_tokens=2)), timeout=20
+                )
+
+    _run(run())
+
+
+def test_engine_still_serves_requests_after_a_bad_one(tiny_llama_dir: Path) -> None:
+    async def run() -> list:
+        async with AsyncLLM(
+            str(tiny_llama_dir), device="cpu", dtype=torch.float32, max_model_len=8
+        ) as llm:
+            long_prompt = " ".join(f"tok{i}" for i in range(10, 40))
+            with contextlib.suppress(ValueError):
+                await llm.generate([long_prompt], SamplingParams(max_tokens=2))
+            return await asyncio.wait_for(
+                llm.generate(["tok5"], SamplingParams(max_tokens=2)), timeout=20
+            )
+
+    assert len(_run(run())) == 1
+
+
+def test_a_failing_forward_pass_raises_to_the_caller(tiny_llama_dir: Path) -> None:
+    async def run() -> None:
+        async with AsyncLLM(str(tiny_llama_dir), device="cpu", dtype=torch.float32) as llm:
+            llm.engine.model_runner.prefill = _raise_boom
+            with pytest.raises(RuntimeError, match="boom"):
+                await asyncio.wait_for(
+                    llm.generate(["tok5"], SamplingParams(max_tokens=2)), timeout=20
+                )
+
+    _run(run())
+
+
+def test_streaming_before_start_is_refused(tiny_llama_dir: Path) -> None:
+    async def run() -> None:
+        llm = AsyncLLM(str(tiny_llama_dir), device="cpu", dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="not running"):
+            async for _ in llm.stream("tok5", SamplingParams(max_tokens=1)):
+                pass
+
+    _run(run())
+
+
+def _raise_boom(*_args, **_kwargs):
+    raise RuntimeError("boom")

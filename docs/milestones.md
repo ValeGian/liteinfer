@@ -4,6 +4,13 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 29-08-2026 — §2.1 Per-request failure isolation
+
+- **PRs.** _none yet_
+- **What.** Errors are now scoped to the request that caused them. Per-request queues carry `StreamEvent | Exception | None` and `generate_stream` re-raises, so a rejected prompt reaches its own caller; a forward pass that raises aborts only that pass's sequences; and a loop that dies for any other reason fails every outstanding waiter before exiting rather than leaving them parked. `generate_stream` also refuses to run before `start()` instead of hanging. Previously any exception in admission or execution killed the background loop silently: the caller waited forever on a queue nobody would post to, every subsequent request hung the same way, and the original error only surfaced later from `stop()`. An over-long prompt was enough to trigger it.
+
+---
+
 ## 29-08-2026 — One engine: continuous batching only (+ §2.7 async step metrics)
 
 - **PRs.** _none yet_
