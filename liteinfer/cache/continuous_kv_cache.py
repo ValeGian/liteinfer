@@ -1,9 +1,7 @@
 """Per-sequence paged KV cache for continuous batching.
 
-Unlike ``PagedKVCache`` (which is batch-level and fixed for the lifetime of
-a static batch), ``ContinuousKVCache`` manages individual sequences identified
-by ``request_id``. Sequences can register and deregister at any time, which is
-required by the continuous scheduler's slot-filling policy.
+Sequences are keyed by ``request_id`` and can register or deregister at any
+time, which is what the scheduler's slot-filling policy requires.
 
 Payload protocol
 ----------------

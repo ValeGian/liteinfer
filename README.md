@@ -16,8 +16,9 @@ test, and benchmark.
 
 ## Status
 
-v0 — minimal end-to-end greedy/sampled inference on local safetensors.
-Static batching (B > 1), paged KV cache. Continuous batching via `AsyncLLM` (async context manager + streaming API). Paged KV cache. See
+v0 — greedy/sampled inference on local safetensors via continuous batching over
+a paged KV cache. `AsyncLLM` is the native interface (async context manager plus
+streaming); `LLM` is a synchronous facade for offline batch use. See
 [`docs/milestones.md`](docs/milestones.md) for what is in, and
 [`docs/roadmap.md`](docs/roadmap.md) for what is queued.
 
@@ -74,8 +75,7 @@ liteinfer/
 │   ├── async_llm.py       # AsyncLLM: the engine's native interface
 │   ├── config.py          # EngineConfig
 │   ├── engine/            # Orchestration: scheduler, sequence, model runner, metrics
-│   ├── models/            # Model loaders + per-architecture implementations
-│   ├── layers/            # Reusable building blocks (attention, RMSNorm, …)
+│   ├── models/            # Loader + per-architecture implementations (layers included)
 │   ├── cache/             # Paged KV cache: block pool + slot addressing
 │   └── sampling/          # SamplingParams + Sampler
 ├── tests/                 # Unit / integration / e2e tests
@@ -181,10 +181,9 @@ for methodology and results.
 
 High-level direction:
 
-- [x] Single-prompt greedy/sampled generation from local safetensors
-- [x] Static batching (B > 1)
+- [x] Greedy/sampled generation from local safetensors
 - [x] Paged KV cache
-- [x] Continuous batching (async, streaming, paged KV)
+- [x] Continuous batching (async, streaming) — superseded static batching, now removed
 - [ ] prefix caching
 - [ ] `torch.compile` and CUDA graphs for decode
 - [ ] Tensor parallelism (single node)

@@ -1,17 +1,10 @@
 """ContinuousModelRunner — forward-pass execution for continuous batching.
 
-Exposes two explicit methods instead of the single ``execute()`` of
-``ModelRunner``:
-
 * ``prefill(seqs)`` — full prompt pass for newly admitted sequences.
 * ``decode(seqs)`` — single-token pass for sequences already past prefill.
 
-Two separate forward passes are issued when both new and running sequences
-coexist in the same engine step. This keeps the implementation simple and
-avoids the mixed-prefill/decode attention complexity that would otherwise
-require a flash-attention-style kernel.
-
-See roadmap §1.3 for the single-pass chunked-prefill upgrade path.
+A step where new and running sequences coexist issues both, rather than one
+mixed pass, which would need a flash-attention-style kernel. See roadmap §1.3.
 """
 
 from __future__ import annotations
@@ -21,10 +14,7 @@ import torch
 from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
 from liteinfer.config import EngineConfig
-from liteinfer.engine.attention_mask import (
-    build_continuous_decode_for_model,
-    build_prefill_for_model,
-)
+from liteinfer.engine.attention_mask import builders_for
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.loader import load_hf_model
@@ -65,16 +55,12 @@ class ContinuousModelRunner:
         prompt_lens = [len(s.prompt_token_ids) for s in seqs]
         max_prompt_len = max(prompt_lens)
 
-        for seq, pl in zip(seqs, prompt_lens, strict=False):
-            self._cache.register(seq.request_id, pl)
+        for seq, prompt_len in zip(seqs, prompt_lens, strict=True):
+            self._cache.register(seq.request_id, prompt_len)
 
         input_ids, position_ids = self._build_prefill_inputs(seqs, prompt_lens, max_prompt_len)
-        attention_mask = build_prefill_for_model(
-            type(self.model).__name__,
-            prompt_lens=prompt_lens,
-            dtype=self.config.dtype,
-            device=self.device,
-        )
+        build_prefill, _ = builders_for(type(self.model).__name__)
+        attention_mask = build_prefill(prompt_lens, self.config.dtype, self.device)
         payload = self._cache.make_prefill_payload(request_ids, prompt_lens)
         out = self.model(
             input_ids=input_ids,
@@ -82,7 +68,7 @@ class ContinuousModelRunner:
             past_key_values=payload,
             attention_mask=attention_mask,
         )
-        return self._select_prefill_logits(out.logits, prompt_lens, max_prompt_len)
+        return out.logits[:, -1, :]  # left-padded, so the last column is the last real token
 
     @torch.inference_mode()
     def decode(self, seqs: list[Sequence]) -> torch.Tensor:
@@ -98,12 +84,8 @@ class ContinuousModelRunner:
 
         # seq_total_len includes the current decode token (prompt + all output tokens).
         seq_total_lens = [len(s.prompt_token_ids) + len(s.output_token_ids) for s in seqs]
-        attention_mask = build_continuous_decode_for_model(
-            type(self.model).__name__,
-            seq_total_lens=seq_total_lens,
-            dtype=self.config.dtype,
-            device=self.device,
-        )
+        _, build_decode = builders_for(type(self.model).__name__)
+        attention_mask = build_decode(seq_total_lens, self.config.dtype, self.device)
         payload = self._cache.make_decode_payload(request_ids)
         out = self.model(
             input_ids=input_ids,
@@ -123,15 +105,15 @@ class ContinuousModelRunner:
         prompt_lens: list[int],
         max_prompt_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        B = len(seqs)
-        input_ids = torch.full((B, max_prompt_len), 0, dtype=torch.long, device=self.device)
-        position_ids = torch.zeros((B, max_prompt_len), dtype=torch.long, device=self.device)
-        for i, (seq, pl) in enumerate(zip(seqs, prompt_lens, strict=False)):
-            offset = max_prompt_len - pl
+        shape = (len(seqs), max_prompt_len)
+        input_ids = torch.zeros(shape, dtype=torch.long, device=self.device)
+        position_ids = torch.zeros(shape, dtype=torch.long, device=self.device)
+        for i, (seq, prompt_len) in enumerate(zip(seqs, prompt_lens, strict=True)):
+            offset = max_prompt_len - prompt_len
             input_ids[i, offset:] = torch.tensor(
                 seq.prompt_token_ids, dtype=torch.long, device=self.device
             )
-            position_ids[i, offset:] = torch.arange(pl, device=self.device)
+            position_ids[i, offset:] = torch.arange(prompt_len, device=self.device)
         return input_ids, position_ids
 
     def _build_decode_inputs(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -140,22 +122,6 @@ class ContinuousModelRunner:
         input_ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
         position_ids = torch.tensor(positions, dtype=torch.long, device=self.device).unsqueeze(1)
         return input_ids, position_ids
-
-    def _select_prefill_logits(
-        self,
-        logits: torch.Tensor,
-        prompt_lens: list[int],
-        max_prompt_len: int,
-    ) -> torch.Tensor:
-        """Pick logits at each sequence's last real (non-padded) token."""
-        if logits.shape[1] == 1:
-            return logits[:, -1, :]
-        last_indices = torch.tensor(
-            [max_prompt_len - 1] * len(prompt_lens),
-            dtype=torch.long,
-            device=logits.device,
-        )
-        return logits[torch.arange(len(prompt_lens), device=logits.device), last_indices]
 
     # ------------------------------------------------------------------
     # Block pool

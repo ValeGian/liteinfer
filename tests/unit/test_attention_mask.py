@@ -1,5 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Unit tests for the additive attention mask builder used by static batching."""
+"""Unit tests for the prefill attention-mask builder."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ def _min(dtype: torch.dtype) -> float:
 
 
 def test_single_seq_no_padding_matches_pure_causal() -> None:
-    """B=1 with prompt_len == query_len: mask is the standard causal triangle."""
+    """B=1 with no padding: the mask is the standard causal triangle."""
     mask = build_prefill_mask(
         prompt_lens=[3],
         dtype=torch.float32,

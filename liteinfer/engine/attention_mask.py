@@ -1,21 +1,10 @@
 # pyright: reportPrivateImportUsage=false
-"""Additive attention mask builder for static batching with left-padded prefill.
+"""Additive attention masks: 0 to attend, ``finfo(dtype).min`` to not.
 
-Returns a mask of shape ``[B, 1, query_len, past_len + query_len]`` whose
-entries are 0 for "attend" and ``finfo(dtype).min`` for "do not attend".
-Combines two sources of masking:
-
-* **Causal**: query token *q* may not attend to key token *k > q*.
-* **Left padding**: when prompts in a batch have different lengths, the
-  shorter ones are padded on the left during prefill. Padded positions
-  are stored in the KV cache (their values are arbitrary). Real query
-  rows must not attend to padded key columns; padded query rows are
-  fully masked since they do not produce any sampled token.
-
-The builder takes raw prompt lengths and reconstructs both effects in a
-single tensor that the model can add to attention scores directly.
+Prompts of different lengths are left-padded, so every mask has to hide the
+padded columns as well as enforce causality. Prefill and decode need different
+shapes, so they have separate builders.
 """
-
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -55,25 +44,6 @@ def build_prefill_mask(
             mask[i, 0, pad:, :pad] = neg_inf
     return mask
 
-
-def build_prefill_for_model(
-    model_class_name: str,
-    *,
-    prompt_lens: Sequence[int],
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """Per-model dispatch for the prefill mask.
-
-    New architectures register themselves by extending this dispatch.
-    """
-    if model_class_name == "LlamaForCausalLM":
-        return build_prefill_mask(prompt_lens=prompt_lens, dtype=dtype, device=device)
-    raise NotImplementedError(
-        f"no attention-mask builder registered for model class {model_class_name!r}"
-    )
-
-
 def build_continuous_decode_mask(
     seq_total_lens: list[int],
     dtype: torch.dtype,
@@ -81,21 +51,10 @@ def build_continuous_decode_mask(
 ) -> torch.Tensor:
     """Additive attention mask for a continuous-batching decode step.
 
-    Unlike ``build_additive_mask``, sequences in a continuous batch may have
-    different total cached lengths (prompt + output tokens so far). The paged
-    KV cache returns tensors LEFT-PADDED to ``max(seq_total_lens)``. This mask
-    unmasks each sequence's real token positions (right side) and masks the
-    left-pad zeros.
-
-    Args:
-        seq_total_lens: total token count per sequence (prompt + output so far
-            PLUS the one new token being decoded). The length of this list
-            equals the batch size.
-        dtype: must match the attention score tensor.
-        device: target device.
-
-    Returns:
-        Tensor shaped ``[B, 1, 1, max_total]``.
+    Sequences in a continuous batch hold different numbers of cached tokens, and
+    the cache returns them left-padded to ``max(seq_total_lens)``, so each row
+    masks its own pad prefix. ``seq_total_lens`` counts prompt + output so far,
+    including the token being decoded. Returns ``[B, 1, 1, max_total]``.
     """
     if not seq_total_lens:
         raise ValueError("seq_total_lens must be non-empty")
@@ -109,20 +68,11 @@ def build_continuous_decode_mask(
     return mask
 
 
-def build_continuous_decode_for_model(
-    model_class_name: str,
-    *,
-    seq_total_lens: list[int],
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """Per-model dispatch for continuous-batching decode masks."""
-    if model_class_name == "LlamaForCausalLM":
-        return build_continuous_decode_mask(
-            seq_total_lens=seq_total_lens,
-            dtype=dtype,
-            device=device,
-        )
-    raise NotImplementedError(
-        f"no continuous-decode mask builder for model class {model_class_name!r}"
-    )
+_BUILDERS = {"LlamaForCausalLM": (build_prefill_mask, build_continuous_decode_mask)}
+
+
+def builders_for(model_class_name: str):
+    """Return this architecture's ``(prefill, decode)`` mask builders."""
+    if model_class_name not in _BUILDERS:
+        raise NotImplementedError(f"no attention-mask builders for {model_class_name!r}")
+    return _BUILDERS[model_class_name]
