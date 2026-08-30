@@ -29,7 +29,7 @@ import math
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool
+from liteinfer.cache.block_pool import BlockPool, slot_table
 
 
 class ContinuousKVCache:
@@ -83,54 +83,25 @@ class ContinuousKVCache:
     # Internal helpers shared by payloads
     # ------------------------------------------------------------------
 
-    def _write_tokens(
-        self,
-        layer_idx: int,
-        request_id: str,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        start_pos: int,
-    ) -> None:
-        """Write k/v ``[num_kv_heads, n_tokens, head_dim]`` starting at ``start_pos``."""
-        n_tokens = k.shape[1]
-        written = 0
-        pos = start_pos
-        while written < n_tokens:
-            block_in_table = pos // self._pool.block_size
-            slot_in_block = pos % self._pool.block_size
-            n_in_block = min(n_tokens - written, self._pool.block_size - slot_in_block)
-            block_idx = self._block_tables[request_id][block_in_table]
-            self._pool.write_tokens(
-                layer_idx,
-                block_idx,
-                slot_in_block,
-                k[:, written : written + n_in_block, :],
-                v[:, written : written + n_in_block, :],
-            )
-            written += n_in_block
-            pos += n_in_block
+    def slot_table_for(self, request_ids: list[str]) -> torch.Tensor:
+        """Physical slot of every cached token for these sequences."""
+        return slot_table(
+            [self._block_tables[rid] for rid in request_ids],
+            [self._token_counts[rid] for rid in request_ids],
+            self._pool.block_size,
+            self._pool.device,
+        )
 
-    def _read_seq_kv(
-        self,
-        layer_idx: int,
-        request_id: str,
-        total_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather all cached K/V for one sequence from its block table.
+    def scatter(self, layer_idx: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Store one K/V column per slot: ``[B, H, T, D]`` -> ``[B, T, H, D]``."""
+        keys, values = self._pool.slots(layer_idx)
+        keys[slots] = k.permute(0, 2, 1, 3)
+        values[slots] = v.permute(0, 2, 1, 3)
 
-        Returns ``([num_kv_heads, total_tokens, head_dim], same)`` pair.
-        """
-        k_parts: list[torch.Tensor] = []
-        v_parts: list[torch.Tensor] = []
-        remaining = total_tokens
-        for block_idx in self._block_tables[request_id]:
-            n = min(remaining, self._pool.block_size)
-            k_parts.append(self._pool.get_key_block(layer_idx, block_idx)[:, :n, :])
-            v_parts.append(self._pool.get_value_block(layer_idx, block_idx)[:, :n, :])
-            remaining -= n
-            if remaining == 0:
-                break
-        return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
+    def gather(self, layer_idx: int, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the cached K/V at ``slots`` as ``[B, H, T, D]``."""
+        keys, values = self._pool.slots(layer_idx)
+        return keys[slots].permute(0, 2, 1, 3), values[slots].permute(0, 2, 1, 3)
 
 
 class _PrefillPayload:
@@ -145,7 +116,7 @@ class _PrefillPayload:
         self._cache = cache
         self._request_ids = request_ids
         self._prompt_lens = prompt_lens
-        self._max_prompt_len = max(prompt_lens) if prompt_lens else 0
+        self._slots = torch.empty(0, dtype=torch.long)
 
     def update(
         self,
@@ -155,15 +126,13 @@ class _PrefillPayload:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Store real prompt tokens in blocks; return original tensors unchanged."""
         if layer_idx == 0:
-            for req_id, pl in zip(self._request_ids, self._prompt_lens, strict=False):
-                self._cache._token_counts[req_id] = pl
+            for req_id, prompt_len in zip(self._request_ids, self._prompt_lens, strict=True):
+                self._cache._token_counts[req_id] = prompt_len
+            self._slots = self._cache.slot_table_for(self._request_ids)
 
-        for i, (req_id, pl) in enumerate(zip(self._request_ids, self._prompt_lens, strict=False)):
-            real_start = self._max_prompt_len - pl
-            k_real = key_states[i, :, real_start:, :]
-            v_real = value_states[i, :, real_start:, :]
-            self._cache._write_tokens(layer_idx, req_id, k_real, v_real, start_pos=0)
-
+        # Prompts arrive left-padded and the slot table is right-aligned, so the
+        # two line up column for column; padding lands in the null block.
+        self._cache.scatter(layer_idx, self._slots, key_states, value_states)
         return key_states, value_states
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
@@ -176,6 +145,7 @@ class _DecodePayload:
     def __init__(self, cache: ContinuousKVCache, request_ids: list[str]) -> None:
         self._cache = cache
         self._request_ids = request_ids
+        self._slots = torch.empty(0, dtype=torch.long)
 
     def update(
         self,
@@ -183,21 +153,13 @@ class _DecodePayload:
         value_states: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Append decode token for each sequence; return gathered left-padded K/V."""
+        """Append each sequence's decode token; return gathered left-padded K/V."""
         if layer_idx == 0:
             self._advance_slots()
+            self._slots = self._cache.slot_table_for(self._request_ids)
 
-        for i, req_id in enumerate(self._request_ids):
-            write_pos = self._cache._token_counts[req_id] - 1
-            self._cache._write_tokens(
-                layer_idx,
-                req_id,
-                key_states[i, :, :, :],
-                value_states[i, :, :, :],
-                start_pos=write_pos,
-            )
-
-        return self._gather_all(layer_idx)
+        self._cache.scatter(layer_idx, self._slots[:, -1:], key_states, value_states)
+        return self._cache.gather(layer_idx, self._slots)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         if not self._request_ids:
@@ -210,20 +172,3 @@ class _DecodePayload:
             if current % self._cache._pool.block_size == 0:
                 self._cache._block_tables[req_id].append(self._cache._pool.allocate())
             self._cache._token_counts[req_id] += 1
-
-    def _gather_all(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        token_counts = [self._cache._token_counts[rid] for rid in self._request_ids]
-        max_total = max(token_counts)
-        pool = self._cache._pool
-        k_batch: list[torch.Tensor] = []
-        v_batch: list[torch.Tensor] = []
-        for req_id, total in zip(self._request_ids, token_counts, strict=False):
-            k_seq, v_seq = self._cache._read_seq_kv(layer_idx, req_id, total)
-            pad_len = max_total - total
-            if pad_len > 0:
-                zeros = k_seq.new_zeros(pool.num_kv_heads, pad_len, pool.head_dim)
-                k_seq = torch.cat([zeros, k_seq], dim=1)
-                v_seq = torch.cat([zeros, v_seq], dim=1)
-            k_batch.append(k_seq)
-            v_batch.append(v_seq)
-        return torch.stack(k_batch), torch.stack(v_batch)

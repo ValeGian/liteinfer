@@ -86,42 +86,6 @@ def test_block_pool_exhaustion_raises() -> None:
     with pytest.raises(BlockPoolExhaustedError):
         pool.allocate()
 
-
-def test_block_pool_write_tokens_readable_via_get_key_block() -> None:
-    """Tokens written to a block must be readable back via get_key_block / get_value_block."""
-    pool = _make_pool()
-    block_idx = pool.allocate()
-
-    k = torch.randn(_NUM_KV_HEADS, 3, _HEAD_DIM)
-    v = torch.randn_like(k)
-    pool.write_tokens(layer_idx=0, block_idx=block_idx, slot_offset=0, k=k, v=v)
-
-    k_block = pool.get_key_block(layer_idx=0, block_idx=block_idx)
-    v_block = pool.get_value_block(layer_idx=0, block_idx=block_idx)
-
-    torch.testing.assert_close(k_block[:, :3, :], k)
-    torch.testing.assert_close(v_block[:, :3, :], v)
-
-
-def test_block_pool_layers_are_independent() -> None:
-    """Writing to layer 0 must not affect layer 1 at the same block and slots."""
-    pool = _make_pool()
-    block_idx = pool.allocate()
-
-    k_layer0 = torch.ones(_NUM_KV_HEADS, 2, _HEAD_DIM)
-    k_layer1 = torch.zeros(_NUM_KV_HEADS, 2, _HEAD_DIM)
-    pool.write_tokens(0, block_idx, 0, k_layer0, torch.zeros_like(k_layer0))
-    pool.write_tokens(1, block_idx, 0, k_layer1, torch.zeros_like(k_layer1))
-
-    torch.testing.assert_close(pool.get_key_block(0, block_idx)[:, :2, :], k_layer0)
-    torch.testing.assert_close(pool.get_key_block(1, block_idx)[:, :2, :], k_layer1)
-
-
-# ---------------------------------------------------------------------------
-# PagedKVCache — interface and lifecycle
-# ---------------------------------------------------------------------------
-
-
 def test_paged_kv_cache_is_kv_cache_subclass() -> None:
     assert issubclass(PagedKVCache, KVCache)
 

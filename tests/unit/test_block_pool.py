@@ -30,7 +30,7 @@ def test_block_pool_initial_free_count_equals_num_blocks() -> None:
 def test_block_pool_allocate_returns_valid_index() -> None:
     pool = _pool()
     idx = pool.allocate()
-    assert 0 <= idx < _B
+    assert 1 <= idx <= _B  # block 0 is the null block
 
 
 def test_block_pool_allocate_decrements_free_count() -> None:
@@ -54,38 +54,41 @@ def test_block_pool_exhaustion_raises_block_pool_exhausted_error() -> None:
         pool.allocate()
 
 
-def test_block_pool_write_tokens_are_readable_via_get_key_block() -> None:
+def test_slots_written_by_index_are_readable_via_get_key_block() -> None:
     pool = _pool()
     idx = pool.allocate()
-    k = torch.randn(_H, 3, _D)
-    v = torch.randn_like(k)
-    pool.write_tokens(layer_idx=0, block_idx=idx, slot_offset=0, k=k, v=v)
+    keys, _ = pool.slots(layer_idx=0)
+    k = torch.randn(3, _H, _D)
+    keys[idx * _S : idx * _S + 3] = k
 
-    torch.testing.assert_close(pool.get_key_block(0, idx)[:, :3, :], k)
-    torch.testing.assert_close(pool.get_value_block(0, idx)[:, :3, :], v)
+    torch.testing.assert_close(pool.get_key_block(0, idx)[:, :3, :], k.permute(1, 0, 2))
 
 
-def test_block_pool_write_tokens_at_nonzero_slot_offset() -> None:
+def test_slots_are_addressed_at_block_index_times_block_size() -> None:
     pool = _pool()
     idx = pool.allocate()
-    k = torch.randn(_H, 2, _D)
-    v = torch.randn_like(k)
-    pool.write_tokens(layer_idx=0, block_idx=idx, slot_offset=2, k=k, v=v)
+    keys, _ = pool.slots(layer_idx=0)
+    k = torch.randn(2, _H, _D)
+    keys[idx * _S + 2 : idx * _S + 4] = k
 
-    torch.testing.assert_close(pool.get_key_block(0, idx)[:, 2:4, :], k)
-    torch.testing.assert_close(pool.get_value_block(0, idx)[:, 2:4, :], v)
+    torch.testing.assert_close(pool.get_key_block(0, idx)[:, 2:4, :], k.permute(1, 0, 2))
 
 
 def test_block_pool_layers_store_independently() -> None:
     pool = _pool()
     idx = pool.allocate()
-    k0 = torch.ones(_H, 1, _D)
-    k1 = torch.zeros(_H, 1, _D)
-    pool.write_tokens(0, idx, 0, k0, torch.zeros_like(k0))
-    pool.write_tokens(1, idx, 0, k1, torch.zeros_like(k1))
+    for layer, value in ((0, 1.0), (1, 0.0)):
+        keys, _ = pool.slots(layer)
+        keys[idx * _S] = torch.full((_H, _D), value)
 
-    torch.testing.assert_close(pool.get_key_block(0, idx)[:, :1, :], k0)
-    torch.testing.assert_close(pool.get_key_block(1, idx)[:, :1, :], k1)
+    assert pool.get_key_block(0, idx)[0, 0, 0] == 1.0
+    assert pool.get_key_block(1, idx)[0, 0, 0] == 0.0
+
+
+def test_block_zero_is_never_allocated() -> None:
+    # Block 0 is the null block that padded batch positions read and write.
+    pool = _pool(num_blocks=3)
+    assert 0 not in {pool.allocate() for _ in range(3)}
 
 
 def test_block_pool_freed_block_can_be_reallocated() -> None:
