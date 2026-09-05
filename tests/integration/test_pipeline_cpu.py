@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 from pathlib import Path
 
 import pytest
@@ -317,3 +318,39 @@ def test_delivering_events_is_charged_separately_from_the_forward_pass(tiny_llam
             return llm.engine.stats.time.deliver
 
     assert _run(_run_test()) > 0
+
+
+# ---------------------------------------------------------------------------
+# Incremental detokenization (§5.2)
+# ---------------------------------------------------------------------------
+
+
+def test_streamed_text_matches_a_full_decode(tiny_llama_dir: Path) -> None:
+    """The incremental text must be exactly what re-decoding every token would give."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            outputs = await llm.generate(
+                ["tok2 tok3", "tok4"], SamplingParams(max_tokens=8, temperature=0.0)
+            )
+            tokenizer = llm.engine.tokenizer
+            return [(o.text, tokenizer.decode(list(o.token_ids))) for o in outputs]
+
+    for streamed, full in _run(_run_test()):
+        assert streamed == full
+
+
+def test_text_grows_monotonically_while_streaming(tiny_llama_dir: Path) -> None:
+    """Each event's text must extend the previous one, never rewrite it."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return [
+                event.text
+                async for event in llm.stream(
+                    "tok2 tok3", SamplingParams(max_tokens=8, temperature=0.0)
+                )
+            ]
+
+    texts = _run(_run_test())
+    assert all(later.startswith(earlier) for earlier, later in itertools.pairwise(texts))

@@ -366,29 +366,6 @@ listed.
 
 ## 5. Engine ergonomics
 
-### 5.2 Incremental detokenization
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** `_build_event` decodes a sequence's **entire** output text on every
-  step, for every running sequence, so the work per token grows with the tokens
-  already generated. Measured with §6.4's attribution (32 sequences, A40):
-
-  | OSL | share of loop time | seconds |
-  |---:|---:|---:|
-  | 256 | 6.9% | 0.45 |
-  | 1024 | **16.9%** | 5.41 |
-
-  Four times the output length costs **twelve times** the detokenisation, which
-  is the quadratic showing through. At OSL 256 it is a minor cost; by OSL 1024
-  it is the second-largest item in the engine after the forward pass itself, and
-  it keeps climbing. `resolve_stop_status` re-decodes the same way when stop
-  strings are set.
-- **Scope.** Cache the last decoded suffix per sequence and decode only the new
-  token's contribution, in `_build_event` and in `resolve_stop_status`.
-- **Parity test.** Streamed text identical to the current full re-decode,
-  including across a multi-byte character split over two tokens — which is the
-  reason this is not simply string concatenation.
-
 ### 5.5 Backpressure on admission
 - **Status.** `planned`
 - **PRs.** _none yet_

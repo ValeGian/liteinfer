@@ -8,32 +8,34 @@ from liteinfer.engine.async_llm_engine import AsyncLLMEngine
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.engine.stopping import resolve_stop_status
 from liteinfer.sampling.params import SamplingParams
+from liteinfer.tokenizer import IncrementalDetokenizer
 
 EOS_ID = 2
 STOP_ID = 99
 MAX_MODEL_LEN = 2048
 
 
-def _tokenizer(decoded: str = "") -> MagicMock:
+def _tokenizer() -> MagicMock:
     tokenizer = MagicMock()
     tokenizer.eos_token_ids = {EOS_ID}
-    tokenizer.decode.return_value = decoded
     return tokenizer
 
 
-def _seq(num_output: int, params: SamplingParams) -> Sequence:
+def _seq(num_output: int, params: SamplingParams, output_text: str = "") -> Sequence:
+    """A sequence whose text is already decoded — which is how the engine calls the rule."""
     return Sequence(
         request_id="r0",
         prompt="hi",
         prompt_token_ids=[1],
         output_token_ids=list(range(10, 10 + num_output)),
         sampling_params=params,
+        detokenizer=IncrementalDetokenizer(text=output_text),
     )
 
 
-def _resolve(num_output: int, token_id: int, params: SamplingParams, decoded: str = "") -> object:
+def _resolve(num_output: int, token_id: int, params: SamplingParams, output_text: str = "") -> object:
     return resolve_stop_status(
-        _seq(num_output, params), token_id, _tokenizer(decoded), MAX_MODEL_LEN
+        _seq(num_output, params, output_text), token_id, _tokenizer(), MAX_MODEL_LEN
     )
 
 
@@ -66,7 +68,7 @@ def test_stop_token_fires_once_min_tokens_is_reached() -> None:
 
 def test_stop_string_stops_when_present_in_output() -> None:
     params = SamplingParams(max_tokens=64, stop=["DONE"])
-    assert _resolve(2, 42, params, decoded="all DONE") is SequenceStatus.FINISHED_STOPPED
+    assert _resolve(2, 42, params, output_text="all DONE") is SequenceStatus.FINISHED_STOPPED
 
 
 def test_max_tokens_stops_even_with_ignore_eos() -> None:
