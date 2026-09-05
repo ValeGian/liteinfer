@@ -297,6 +297,16 @@ listed.
   kernel", and the broadcast path cannot fall back to memory-efficient — it has
   to fall back to expanding the heads. That fallback is the reason this is not a
   one-line change.
+- **Predicted effect, written before the run.** Amdahl caps this well below the
+  kernel number. Attention is 1.57 ms of a 14.68 ms decode step (14.2% of the
+  11.08 ms the GPU is busy; the other 3.60 ms it is idle). A 10x attention
+  kernel therefore buys **1.11x** on the step, or about **1.13-1.16x** once the
+  `_repeat_kv` expansion goes with it — against a 1.1x threshold and ±4%
+  run-to-run variance. The end-to-end benchmark figure will move less again,
+  since prefill is neutral and some of the wall is outside the forward pass
+  (§6.4). **Do not report the 6.7-10x as a liteinfer speedup**; it is a kernel
+  measurement, and quoting it as an engine result is the mistake this item has
+  already made three times in other forms.
 - **Parity test.** The kernels differ by ~1e-3 in bf16 here, more than the
   current path, so pin equivalence in fp32 as §3.3 did — and assert peak memory
   no worse than the expanded-head path, since numerical agreement is exactly the
