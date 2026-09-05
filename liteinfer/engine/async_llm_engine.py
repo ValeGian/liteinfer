@@ -158,9 +158,7 @@ class AsyncLLMEngine:
     def _enqueue(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
         token_ids = self.tokenizer.encode(prompt)
         if len(token_ids) >= self.config.max_model_len:
-            raise ValueError(
-                f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}"
-            )
+            raise ValueError(f"prompt has {len(token_ids)} tokens, >= max_model_len={self.config.max_model_len}")
         seq = Sequence(
             request_id=request_id,
             prompt=prompt,
