@@ -104,15 +104,34 @@ def _liteinfer_greedy(llm: LLM, prompt: str, max_tokens: int) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(scope="module")
+def eager_llm(model_dir):
+    """liteinfer with the same attention kernel `hf_model` uses.
+
+    This test isolates liteinfer's *model* — RoPE, norms, projections, the
+    cache — against the reference implementation, so the kernel has to be held
+    constant on both sides. Left on the default `sdpa` against an eager
+    reference, it would instead measure bf16 rounding: the two kernels agree to
+    about two ULP, and greedy decoding turns that into a different token around
+    position 11. That the kernels agree is pinned separately, in fp32, below.
+    """
+    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, attn_implementation="eager")
+    yield engine
+    engine.close()
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_matches_transformers(llm: LLM, hf_model, prompt: str) -> None:
+def test_greedy_matches_transformers(eager_llm: LLM, hf_model, prompt: str) -> None:
     """liteinfer greedy output must match transformers token-for-token."""
-    prompt_ids = llm.tokenizer.encode(prompt)
+    prompt_ids = eager_llm.tokenizer.encode(prompt)
     expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm, prompt, _PARITY_MAX_TOKENS)
+    actual = _liteinfer_greedy(eager_llm, prompt, _PARITY_MAX_TOKENS)
     assert actual == expected, (
         f"prompt={prompt!r}\n"
         f"  liteinfer : {actual}\n"
