@@ -4,6 +4,18 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — §3.3 Fused SDPA attention
+
+- **PRs.** [#22](https://github.com/ValeGian/liteinfer/pull/22)
+- **What.** Attention is now a named kernel picked by `EngineConfig.attn_implementation`, and the default `sdpa` hands the operation to PyTorch, which tiles the softmax and never assembles the `[batch, heads, queries, keys]` score matrix. That matrix was the largest allocation in the forward pass and grew with the square of sequence length. On one attention call at 4 seqs × 32 heads × 2048 tokens, peak allocation drops 5,192 MiB → 96 MiB.
+- **What it is not.** A speedup. Re-measured against the eager kernel on the same tree: 1.08× at 128/256, 1.02× at 128/1024, 1.10× at 1024/256, 1.03× at 1024/1024 — four rows inside run-to-run variance. The feature is the fifth row. At ISL 2048 eager asks for 16.02 GiB in one allocation and dies; `sdpa` completes at 385.3 tok/s. That is the score matrix exactly (32 × 32 × 2048², fp32 after the softmax upcast), so what the kernel moves is the ceiling, not the clock. Credit where it belongs: the ISL 1024 shapes were unlocked by #20's pool sizing, not by this — ISL 2048 is the first shape only the fused kernel reaches.
+- **Eager stays, and stays runnable.** Writing the arithmetic out is what makes it readable, and it is the reference the fused kernel is checked against. This is a kernel choice rather than a superseded design, so `liteinfer-continuous` keeps its benchmark row instead of being flagged `historical` — the roadmap's replacement rule applies to designs one path fully covers, and neither kernel covers the other.
+- **Which backend.** Not FlashAttention. Left-padded batches need an explicit additive mask and flash accepts only `is_causal` — PyTorch reports "Flash Attention does not support non-null attn_mask" — so SDPA takes the memory-efficient backend, which tiles the same way. Getting flash means dropping the padding, filed as §3.6.
+- **Parity.** Pinned in fp32, where the kernels are token-identical on a single prompt and on a left-padded batch. In bf16 they agree to ~2 ULP on the rows the engine reads, which greedy decoding turns into a different token around position 17 — precision, not a difference in what is computed. They do differ on fully masked rows, where `sdpa` returns zeros and eager the uniform average of every value vector; a row attending to nothing has no defined answer, and the engine takes logits from the last column, which is never padding.
+- **Also.** The loader's `_attn_implementation = "eager"` pin had been dead since the modeling code stopped going through transformers, and is gone. Two follow-ups the work exposed are filed: §3.5 (`enable_gqa` removes the 4× K/V copy the profile put at ~10% of decode time) and §3.6 (varlen packing, which unblocks flash and §1.3).
+
+---
+
 ## 05-09-2026 — KV pool sized to demand
 
 - **PRs.** [#20](https://github.com/ValeGian/liteinfer/pull/20)

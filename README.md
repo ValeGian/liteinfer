@@ -161,7 +161,10 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 prefill compute, so read it as offline round-trip latency, not prefill speed.
 
 Batching is competitive at both tiers; what remains is a roughly flat ~3× per-step
-decode constant at every batch width — no CUDA graphs, no fused attention.
+decode constant at every batch width — no CUDA graphs, no varlen packing.
+Attention is fused (SDPA), which bought prompt length rather than speed: at
+ISL 2048 the eager kernel asks for 16 GiB in one allocation and dies, while the
+fused one runs.
 Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:
 [`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).
 
