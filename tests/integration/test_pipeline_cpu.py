@@ -281,3 +281,39 @@ def test_streaming_before_start_is_refused(tiny_llama_dir: Path) -> None:
 
 def _raise_boom(*_args, **_kwargs):
     raise RuntimeError("boom")
+
+
+# ---------------------------------------------------------------------------
+# Time attribution (§6.4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_loop_accounts_for_all_of_its_own_time(tiny_llama_dir: Path) -> None:
+    """Every stage is charged somewhere, so the shares sum to the whole loop."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            await llm.generate(["tok2 tok3"], SamplingParams(max_tokens=4, temperature=0.0))
+            return llm.engine.stats.time.shares()
+
+    assert sum(_run(_run_test()).values()) == pytest.approx(1.0)
+
+
+def test_the_forward_pass_is_charged_to_forward(tiny_llama_dir: Path) -> None:
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            await llm.generate(["tok2 tok3"], SamplingParams(max_tokens=4, temperature=0.0))
+            return llm.engine.stats.time.forward
+
+    assert _run(_run_test()) > 0
+
+
+def test_delivering_events_is_charged_separately_from_the_forward_pass(tiny_llama_dir: Path) -> None:
+    """Detokenising an event per sequence is not forward-pass work, and grows with output length."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            await llm.generate(["tok2 tok3"], SamplingParams(max_tokens=4, temperature=0.0))
+            return llm.engine.stats.time.deliver
+
+    assert _run(_run_test()) > 0
