@@ -47,10 +47,11 @@ the same clock, with no per-token hooks that each would implement differently.
 ## Shipping an improvement
 
 This harness exists so that a faster path can *replace* a slower one instead of
-sitting next to it. The loop — measure the baseline, add a config naming what it
-improves on, read the mode that matches the change, then delete what it beat and
-simplify — is written up in [`docs/roadmap.md`](../docs/roadmap.md) under
-"Shipping an improvement".
+sitting next to it — when it genuinely covers the same ground. The loop (measure
+the baseline, add a config naming what it improves on, read the mode that matches
+the change, then either delete what it beat and simplify, or keep both because
+the win is scoped to a precondition) is written up in
+[`docs/roadmap.md`](../docs/roadmap.md) under "Shipping an improvement".
 
 ## Configs
 

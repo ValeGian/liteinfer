@@ -19,10 +19,11 @@ by the substantive bullets:
 
 ## Shipping an improvement
 
-Every change that claims to make liteinfer faster follows the same loop. The
-point is that the claim is always backed by a number measured the same way
-before and after, and that a feature which wins outright replaces the one it
-beats rather than sitting beside it.
+Every change that claims to make liteinfer faster follows the same loop: the
+claim is backed by a number measured the same way before and after, and a
+general improvement that wins outright replaces the path it beats rather than
+sitting beside it. A specialised improvement — one that only applies under some
+precondition — joins instead. Step 6 is where that is decided.
 
 **1. Measure the baseline.** The config being improved must already have stored
 results in `benchmarks/results/`. If it does not, run it first — a claim needs a
@@ -53,9 +54,21 @@ single-request ITL; both belong in the write-up.
 `docs/benchmarks.md`, headline numbers in `README.md`, a milestone entry with
 its PR link, and the roadmap item flipped to `landed`.
 
-**6. If it is a clear win, delete what it beat.** A clear win is: better on the
-mode the feature targets, by more than variance, with any regression elsewhere
-small enough to state and accept. Then, in order:
+**6. Does it replace, or does it join?** Two questions, in this order.
+
+*Does it cover the whole domain of the thing it beats?* Continuous batching
+serves every workload static batching served — any model, any batch size — so
+static batching had no remaining reason to exist. An MoE kernel, a quantized
+path, a long-context attention variant: each may win by a wide margin inside its
+domain and still replace nothing, because outside that domain it does not apply.
+If there is any workload the old path serves and the new one cannot, they both
+stay. Two paths chosen by a precondition are not debt; they are the feature.
+
+*If it does cover the domain, is it a clear win there?* Better on the mode the
+feature targets, by more than run-to-run variance, with any regression elsewhere
+small enough to state and accept.
+
+**Both yes → delete what it beat**, in order:
 
    - confirm the superseded config's results are stored — that measurement is
      the only record once the code is gone;
@@ -67,8 +80,15 @@ small enough to state and accept. Then, in order:
      entry, a base class with one subclass. Collapse them in the same PR, or
      the codebase keeps the shape of a choice it no longer offers.
 
-Keeping a slower path "just in case" is how the codebase stops being readable.
-The benchmark exists so that deleting it is safe.
+**Conditional win → keep both**, and say so explicitly: the config stays
+runnable and its `description` names the precondition, so the report shows what
+the row applies to. Measure it *inside its domain*. Comparing an MoE kernel against a dense baseline measures
+the model, not the kernel — so a specialised path usually needs its own dataset
+or model in the matrix, not just its own config.
+
+Keeping a slower *general* path "just in case" is how the codebase stops being
+readable, and the benchmark exists so that deleting it is safe. Keeping a
+*specialised* path is not the same thing: it is the only thing serving its case.
 
 ## Marking an item done
 
