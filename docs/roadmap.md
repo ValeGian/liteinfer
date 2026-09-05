@@ -231,18 +231,20 @@ listed.
 
   | | |
   |---|---:|
-  | step wall time | 14.68 ms |
+  | step wall time | 13.96 ms |
   | weight-read floor | 3.56 ms |
-  | GPU busy | 11.08 ms (75%) |
-  | **GPU idle, waiting on Python** | **3.60 ms (25%)** |
-  | CUDA kernels launched per step | **883** |
+  | GPU busy | 11.02 ms (79%) |
+  | **GPU idle, waiting on Python** | **2.93 ms (21%)** |
+  | CUDA kernels launched per step | **822** |
 
   Graph replay collapses those 883 launches into one, so the idle quarter is
   what it directly recovers — about 1.3x before any kernel gets faster.
-  Re-measured after §7 vectorised the sampler, in case those per-row `.item()`
-  syncs were part of the idle: **unchanged at 14.75 ms, 25% idle, 883
-  launches**. Sampling sits outside the forward pass, so it never was — this
-  item is worth its full size. It is
+  These numbers have been re-measured twice, because two other changes might
+  have eaten into them. §7's sampler vectorisation did not: sampling sits
+  outside the forward pass, and the step was unchanged at 14.75 ms, 25% idle,
+  883 launches. Building the per-step tensors in one transfer did: 35 pageable
+  host-to-device copies per step became 5, which is where the drop to 13.96 ms,
+  21% and 822 launches came from. What is left is launch overhead proper. It is
   also the only item that attacks the deficit the benchmark has shown all along:
   liteinfer sits at 0.28-0.35x of vLLM at *every* batch width, and a gap that
   stays flat as concurrency grows is a fixed per-step cost, not an algorithmic

@@ -59,13 +59,15 @@ def build_continuous_decode_mask(
     if not seq_total_lens:
         raise ValueError("seq_total_lens must be non-empty")
     max_total = max(seq_total_lens)
-    neg_inf = torch.finfo(dtype).min
+
+    # One transfer for the lengths, then the pad region is a comparison rather
+    # than a slice assignment per sequence — which was a kernel launch each.
+    counts = torch.tensor(seq_total_lens, device=device)
+    positions = torch.arange(max_total, device=device)
+    is_pad = positions < (max_total - counts).unsqueeze(1)
+
     mask = torch.zeros((len(seq_total_lens), 1, 1, max_total), dtype=dtype, device=device)
-    for i, total in enumerate(seq_total_lens):
-        pad_len = max_total - total
-        if pad_len > 0:
-            mask[i, 0, 0, :pad_len] = neg_inf
-    return mask
+    return mask.masked_fill_(is_pad.view(len(seq_total_lens), 1, 1, max_total), torch.finfo(dtype).min)
 
 
 _BUILDERS = {"LlamaForCausalLM": (build_prefill_mask, build_continuous_decode_mask)}

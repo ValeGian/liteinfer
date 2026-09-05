@@ -1,11 +1,14 @@
 # pyright: reportPrivateImportUsage=false
-"""Unit tests for the prefill attention-mask builder."""
+"""Unit tests for the attention-mask builders."""
 
 from __future__ import annotations
 
 import torch
 
-from liteinfer.engine.attention_mask import build_prefill_mask
+from liteinfer.engine.attention_mask import (
+    build_continuous_decode_mask,
+    build_prefill_mask,
+)
 
 
 def _min(dtype: torch.dtype) -> float:
@@ -79,3 +82,12 @@ def test_dtype_min_used_for_masked_positions() -> None:
     # Upper-triangle entry in the causal mask must equal bf16_min.
     assert mask[0, 0, 0, 1].item() == bf16_min
 
+
+
+def test_decode_mask_hides_exactly_the_pad_prefix_of_every_row() -> None:
+    """Vectorised or not, each row must mask its own prefix and nothing else."""
+    lens = [5, 3, 1]
+    mask = build_continuous_decode_mask(lens, torch.float32, torch.device("cpu"))
+
+    masked_per_row = (mask[:, 0, 0, :] == torch.finfo(torch.float32).min).sum(dim=1)
+    assert masked_per_row.tolist() == [max(lens) - n for n in lens]

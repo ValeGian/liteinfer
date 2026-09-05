@@ -47,3 +47,17 @@ def test_every_sequence_gets_max_total_columns() -> None:
 def test_unequal_block_table_lengths_are_handled() -> None:
     rows = _table([[0, 1], [2]], [5, 2])
     assert rows[1].tolist()[-2:] == [8, 9]
+
+
+def test_ragged_block_tables_pad_to_the_null_block() -> None:
+    """Rows are padded on the host before the transfer; the padding must be block 0."""
+    table = slot_table([[3, 7], [5]], counts=[20, 4], block_size=16, device=torch.device("cpu"))
+
+    assert table[1, -4:].tolist() == [5 * 16 + i for i in range(4)]
+
+
+def test_max_total_comes_from_the_counts_not_the_device() -> None:
+    """Width is a property of the Python counts, so it must not need a sync to learn."""
+    table = slot_table([[1], [1]], counts=[3, 9], block_size=16, device=torch.device("cpu"))
+
+    assert table.shape[1] == 9

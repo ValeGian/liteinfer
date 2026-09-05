@@ -123,15 +123,19 @@ def slot_table(
 
     Both caches use this for every read and write, so block addressing lives in
     exactly one place.
-    """
-    count = torch.tensor(counts, device=device)
-    max_total = int(count.max())
 
-    blocks = torch.zeros(
-        (len(block_tables), max(len(t) for t in block_tables)), dtype=torch.long, device=device
-    )
-    for row, table in enumerate(block_tables):
-        blocks[row, : len(table)] = torch.tensor(table, device=device)
+    The block tables are padded on the host and moved in a single transfer. A
+    row-by-row copy costs one host-to-device transfer per sequence — and those
+    are pageable, so each one blocks — where this costs one for the batch.
+    ``max_total`` comes from the Python counts for the same reason: reading it
+    off the device would sync the whole queue to learn something already known.
+    """
+    max_total = max(counts)
+    width = max(len(table) for table in block_tables)
+    padded = [list(table) + [0] * (width - len(table)) for table in block_tables]
+
+    blocks = torch.tensor(padded, dtype=torch.long, device=device)
+    count = torch.tensor(counts, device=device)
 
     logical = torch.arange(max_total, device=device) - (max_total - count).unsqueeze(1)
     is_real = logical >= 0
