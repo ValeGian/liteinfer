@@ -7,6 +7,12 @@ to make state-of-the-art inference techniques (paged KV cache, prefix
 caching, tensor parallelism, `torch.compile`, CUDA graphs, …) easy to read,
 test, and benchmark.
 
+**New to inference serving?** [**Inside liteinfer**](https://claude.ai/code/artifact/52a9e43f-c529-4a70-af07-d55dbffb1cbf)
+is an illustrated walkthrough of how the engine works and why each design was
+chosen — prefill and decode, KV caching, paged memory, and continuous batching —
+following the measured progression that produced this codebase, including the
+steps that lost. It assumes PyTorch, not serving experience.
+
 ## Goals
 
 1. **Fast offline inference** — throughput in the same league as vLLM on a single node.
@@ -101,6 +107,9 @@ One engine: continuous batching over a paged KV cache.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
 without touching the engine. `stats` records a `StepMetrics` per forward pass.
+
+Each of these components is explained, with diagrams and interactive figures, in
+[Inside liteinfer](https://claude.ai/code/artifact/52a9e43f-c529-4a70-af07-d55dbffb1cbf).
 
 Earlier designs — no cache, `DynamicCache`, plain-tensor cache, static
 batching — were measured against each other and then removed; the numbers live
