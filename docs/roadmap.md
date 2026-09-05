@@ -304,20 +304,3 @@ listed.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
-
-### 8.3 Sequence-length sweep workload
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** At short sequence lengths (small prompts, low `max_tokens`)
-  the RECOMPUTE engine outperforms KV-cache engines because single-token
-  decode steps are memory-bandwidth-bound and GPU-underutilised, while
-  `torch.cat` KV growth adds per-step copy overhead. The crossover point
-  — where KV cache starts winning — is model- and hardware-dependent and
-  currently invisible in the benchmark suite. A sequence-length sweep
-  makes this crossover explicit and guards against regressions.
-- **Scope.** New `bench run-sweep` subcommand iterating over `(ISL, OSL)` pairs,
-  calling `harness.run()` for each. `report.py` renders a tok/s-vs-OSL section.
-- **Pre-req.** §8.1 (ISL/OSL-controlled workloads).
-- **Parity test.** Greedy outputs identical across engines at each
-  (ISL, OSL) point.
-

@@ -169,6 +169,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _cmd_sweep(args: argparse.Namespace) -> int:
+    """Run the same configs across a grid of (ISL, OSL) shapes.
+
+    A speedup measured at one shape is a claim about that shape. The sweep is
+    how you find out whether it generalises.
+    """
+    shapes = [(isl, osl) for isl in args.isl for osl in args.osl]
+    print(f"{len(shapes)} shape(s): {', '.join(f'{i}/{o}' for i, o in shapes)}", flush=True)
+
+    failures = 0
+    for isl, osl in shapes:
+        path = Path(args.dataset_dir) / dataset.filename_for(args.model, isl, osl, args.num_samples)
+        if not path.exists():
+            print(f"\ngenerating {path.name}", flush=True)
+            dataset.generate(args.model, isl, osl, args.num_samples, args.dataset_dir)
+        print(f"\n########## ISL {isl} / OSL {osl} ##########", flush=True)
+        failures += _cmd_run(argparse.Namespace(**{**vars(args), "dataset": str(path)}))
+    return 1 if failures else 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     results = report.load_results(args.results_dir)
     print(report.as_text(results))
@@ -210,6 +230,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-isolate", action="store_true", help="Run in this process instead of a subprocess"
     )
     run.set_defaults(func=_cmd_run)
+
+    sweep = sub.add_parser("sweep", help="Run configs across a grid of ISL/OSL shapes")
+    sweep.add_argument("--config", nargs="+", default=[], choices=list(configs.CONFIGS))
+    sweep.add_argument("--all", action="store_true", help="Run every runnable config")
+    sweep.add_argument("--model", required=True)
+    sweep.add_argument("--isl", nargs="+", type=int, required=True)
+    sweep.add_argument("--osl", nargs="+", type=int, required=True)
+    sweep.add_argument("--mode", choices=["throughput", "latency", "both"], default="throughput")
+    sweep.add_argument("-n", "--num-samples", type=int, default=200)
+    sweep.add_argument("--dataset-dir", default=DEFAULT_DATASET_DIR)
+    sweep.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    sweep.add_argument("--gpus", nargs="+", type=int, default=None)
+    sweep.add_argument("--no-isolate", action="store_true")
+    sweep.set_defaults(func=_cmd_sweep)
 
     rep = sub.add_parser("report", help="Print and optionally write the comparison report")
     rep.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)

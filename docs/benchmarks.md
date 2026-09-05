@@ -192,6 +192,53 @@ B=1 and 13.9 ms at B=4; vLLM 5.2 ms at B=1, 4 and 32), confirming latency mode r
 keep one request in flight. The derived ITL reconstructs E2E to 0.3%
 (28.1 + 255 × 5.2 = 1,354 ms vs 1,350 ms measured).
 
+## Shape sensitivity
+
+Everything above is one shape: ISL 128 / OSL 256. `bench sweep` measures across a
+grid, and the first sweep showed that treating a single shape as general would
+have been a mistake twice over.
+
+### The KV cache's advantage grows with generated length
+
+Measured on the pre-#17 tree, the last commit where `liteinfer-nocache` still
+exists (n=32, ISL 128, one A40):
+
+| OSL | no cache | KV cache | cache is worth |
+|---:|---:|---:|---:|
+| 256 | 60.7 | 69.5 | 1.15× |
+| 512 | 44.6 | 71.9 | 1.61× |
+| 1024 | 24.1 | 69.6 | **2.88×** |
+
+Cached throughput barely moves; the recompute path collapses, because its work per
+step grows with the sequence it re-reads. **The 1.21× headline is the weakest point
+on this curve, not a general figure** — at OSL 1024 the cache is worth nearly 3×,
+and it keeps climbing with length.
+
+Re-measuring it required checking out history, which is the standing cost of the
+"a clear win replaces what it beat" rule: once the loser's code is deleted, its
+claims can only be re-validated against an old tree.
+
+### liteinfer could not run ISL 1024 at all
+
+| shape | liteinfer | vLLM |
+|---|---:|---:|
+| 128 / 256 | 1,369.1 | 4,458.7 |
+| 128 / 1024 | 942.3 | 4,211.9 |
+| 1024 / 256 | **OOM** | 2,871.2 |
+| 1024 / 1024 | **OOM** | 3,240.6 |
+
+The failure was an out-of-memory in `softmax`. Eager attention materialises the
+score matrix, and the softmax upcasts it to fp32: at 32 sequences × 32 heads ×
+1024², that is 4.00 GiB in one allocation. vLLM never materialises it, which is
+what FlashAttention is for — filed as §3.3, and now a capability gate rather than
+an optimisation.
+
+The KV pool compounds it: it claims 32.74 GiB when the configuration can only ever
+use 4.00 GiB, leaving 5.77 GiB for activations — so the engine ran out of memory
+while holding ~29 GiB of KV space it was structurally unable to reach.
+
+---
+
 ## Certification
 
 **Against vLLM's own tooling.** At the identical shape (ISL 128, OSL 256, 200

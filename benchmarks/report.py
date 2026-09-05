@@ -129,6 +129,26 @@ def rows(members: list[dict], mode: str) -> list[Row]:
     ]
 
 
+def by_shape(results: list[dict], mode: str) -> tuple[list[tuple[int, int]], dict[str, dict]]:
+    """Headline metric per config across every measured (ISL, OSL) shape.
+
+    A ratio measured at one shape says nothing about another, so when several
+    shapes exist the report shows the trend rather than leaving them as
+    unrelated tables.
+    """
+    key, _, _ = COLUMNS[mode][0]
+    shapes: set[tuple[int, int]] = set()
+    values: dict[str, dict[tuple[int, int], float]] = {}
+    for result in results:
+        if result["mode"] != mode:
+            continue
+        shape = (result["dataset"]["target_isl"], result["dataset"]["target_osl"])
+        shapes.add(shape)
+        values.setdefault(result["config"], {})[shape] = result["summary"][key]
+    ordered = sorted(values, key=lambda name: _ORDER.get(name, len(_ORDER)))
+    return sorted(shapes), {name: values[name] for name in ordered}
+
+
 def _mismatched(members: list[dict]) -> bool:
     return len({r["dataset"]["sha256"] for r in members}) > 1
 
@@ -168,6 +188,21 @@ def as_text(results: list[dict]) -> str:
                 f"{name:<27}{row.base or '-':<25}{values}"
                 f"{_fmt(row.vs_base):>9}{_fmt(row.vs_root):>9}{_fmt(row.vs_vllm):>9}"
             )
+    for mode in ("throughput", "latency"):
+        shapes, values = by_shape(results, mode)
+        if len(shapes) < 2:
+            continue
+        _, head_label, _ = COLUMNS[mode][0]
+        lines.append(f"\n{mode} across shapes  |  {head_label}")
+        header = f"{'config':<27}" + "".join(f"{f'{i}/{o}':>13}" for i, o in shapes)
+        lines.append(header)
+        lines.append("-" * len(header))
+        for name, per_shape in values.items():
+            cells = "".join(
+                f"{per_shape[s]:>13,.1f}" if s in per_shape else f"{'-':>13}" for s in shapes
+            )
+            lines.append(f"{name:<27}{cells}")
+
     if any(_is_historical(row) for members, mode in _groups(results) for row in rows(members, mode)):
         lines.append("\n* measured before the code was removed; no longer runnable")
     return "\n".join(lines)
@@ -309,6 +344,26 @@ def as_html(results: list[dict], title: str = "liteinfer benchmarks") -> str:
             if _mismatched(members):
                 sections.append('<p class="warn">These runs did not all use the same prompts.</p>')
             sections.append(_table(members, mode))
+        for mode in ("throughput", "latency"):
+            shapes, values = by_shape(results, mode)
+            if len(shapes) < 2:
+                continue
+            _, head_label, _ = COLUMNS[mode][0]
+            head = "".join(f"<th>{i}&thinsp;/&thinsp;{o}</th>" for i, o in shapes)
+            body_rows = []
+            for name, per_shape in values.items():
+                cells = "".join(
+                    f"<td>{per_shape[s]:,.1f}</td>" if s in per_shape else '<td class="nil">—</td>'
+                    for s in shapes
+                )
+                body_rows.append(f'<tr><td class="name">{html.escape(name)}</td>{cells}</tr>')
+            sections.append(
+                f"<h2>{mode} across shapes</h2>"
+                f'<p class="meta">{head_label} at each ISL&thinsp;/&thinsp;OSL. '
+                "A ratio measured at one shape is a claim about that shape only.</p>"
+                f'<div class="scroll"><table><thead><tr><th>config</th>{head}</tr></thead>'
+                f"<tbody>{''.join(body_rows)}</tbody></table></div>"
+            )
         body = "".join(sections)
 
     return (
