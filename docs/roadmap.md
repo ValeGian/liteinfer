@@ -262,36 +262,49 @@ listed.
 - **Surface change.** Loader streams shards onto the right rank;
   attention layers all-reduce.
 
-### 3.5 Let SDPA broadcast the grouped-query heads
+### 3.5 Broadcast the grouped-query heads on the cuDNN backend
 - **Status.** `planned`
-- **Blocked on.** §3.6. Attempted ahead of it and reverted — see below.
-- **Why.** `eager_attention` and `sdpa_attention` both call `_repeat_kv` first,
-  materialising a 4x copy of K and V so 8 KV heads line up with 32 query heads.
-  The profile put ~10% of decode GPU time in `clone`, almost all of it that copy.
-  `scaled_dot_product_attention(..., enable_gqa=True)` broadcasts the heads
-  inside the kernel instead.
-- **Why it cannot be done yet.** With an attention mask, broadcast KV heads take
-  SDPA off its fused backends and onto the math fallback, which materialises the
-  score matrix — exactly what §3.3 removed. Measured on one attention call,
-  4 seqs × 32 heads × 2048 tokens, bf16:
+- **PRs.** _none yet_
+- **Why.** Two costs, one fix. `_repeat_kv` materialises a 4x copy of K and V so
+  8 KV heads line up with 32 query heads, and the expanded tensors then make the
+  attention kernel read four times the KV it needs. Asking the kernel to
+  broadcast instead removes both — but *only on the right backend*, and picking
+  it is the whole content of this item.
 
-  | | peak |
-  |---|---:|
-  | mask + expanded heads *(what ships today)* | 96 MiB |
-  | mask + `enable_gqa` | **4,904 MiB** |
-  | no mask + `enable_gqa` | 33 MiB |
+  Measured on one attention call, bf16, with the mask the engine builds:
 
-  So the change is a large regression before §3.6 and an improvement on today
-  after it — 33 MiB against the current 96. Numerical agreement is not the test
-  that matters here: values match to 2 bf16 ULP in every one of those rows, and
-  the memory is what separates them. `tests/unit/test_attention_kernels.py
-  ::test_sdpa_does_not_materialise_the_score_matrix` is what caught the
-  regression; keep it pointed at whatever the fused path is.
-- **Scope.** Once the mask is gone, pass `enable_gqa` from `sdpa_attention` and
-  drop `_repeat_kv` on that path. `eager_attention` keeps the expansion, since
-  writing it out is what makes it the readable reference.
-- **Parity test.** Unchanged output against `eager_attention`, *and* peak memory
-  no worse than the expanded-head path.
+  | | peak | decode B=32 ctx 2048 | ctx 256 | prefill B=8 len 1024 |
+  |---|---:|---:|---:|---:|
+  | expanded heads *(ships today)* | 96 MiB | 2.329 ms | 0.312 ms | 1.632 ms |
+  | `enable_gqa`, default dispatch | **4,904 MiB** | — | — | — |
+  | `enable_gqa` on **cuDNN** | **32 MiB** | **0.229 ms** | **0.047 ms** | 1.706 ms |
+
+  **6.7-10x on the decode attention kernel**, a third of the memory, and roughly
+  neutral on prefill — which is the right trade, since a request pays prefill
+  once and decode hundreds of times.
+- **Why it is not automatic.** PyTorch will not choose this on its own. With
+  broadcast heads and a mask, the memory-efficient backend refuses ("both fused
+  kernels require query, key and value to have the same num_heads") and flash is
+  already out on the mask, so the default dispatch falls to **math**, which
+  materialises the score matrix and undoes §3.3 — the 4,904 MiB row. cuDNN
+  attention serves it, but is runtime-disabled by default in this build, so it
+  has to be selected explicitly with
+  `torch.nn.attention.sdpa_kernel(SDPBackend.CUDNN_ATTENTION)`.
+- **Scope.** Select the backend explicitly in `sdpa_attention` and drop
+  `_repeat_kv` on that path; `eager_attention` keeps the expansion, since writing
+  it out is what makes it the readable reference. **A fallback is required**: on
+  a machine where cuDNN attention is unavailable, forcing it raises "No available
+  kernel", and the broadcast path cannot fall back to memory-efficient — it has
+  to fall back to expanding the heads. That fallback is the reason this is not a
+  one-line change.
+- **Parity test.** The kernels differ by ~1e-3 in bf16 here, more than the
+  current path, so pin equivalence in fp32 as §3.3 did — and assert peak memory
+  no worse than the expanded-head path, since numerical agreement is exactly the
+  check that misses a math-backend fallback.
+- **Note.** An earlier version of this item claimed `enable_gqa` was verified
+  viable, then that it was blocked on §3.6. Both were wrong: the first tested
+  values and not memory, the second assumed the mask was the obstacle when the
+  obstacle was the backend.
 
 ### 3.6 Pack the batch instead of padding it
 - **Status.** `planned`
@@ -310,10 +323,10 @@ listed.
   replaces it. Touches the runner's input builders, the cache's `slot_table`
   right-alignment, and the null block, which exists to absorb padded positions.
 - **Unblocks.** §1.3 needs the same per-sequence length metadata to mix prefill
-  and decode in one pass, and §3.5 cannot be done at all until the mask is gone —
-  so this is their prerequisite as much as its own change. Removing the mask is
-  worth more than it first looks: it is the single condition standing between
-  liteinfer and both remaining attention improvements.
+  and decode in one pass, so this is its prerequisite as much as its own change.
+  It also buys flash over the memory-efficient backend for the padded case, and
+  stops computing on positions that are discarded. Note what it does *not* gate:
+  §3.5 turned out to be reachable without it, on a different backend.
 - **Parity test.** Greedy output unchanged on a variable-length batch, which is
   the case padding exists to serve.
 
