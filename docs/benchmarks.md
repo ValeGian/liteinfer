@@ -93,9 +93,12 @@ refuses to run them.
 | `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | **current** |
 | `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
 
-`liteinfer-continuous` stays runnable rather than becoming `historical`: it is the
-same engine with `attn_implementation="eager"`, which is the parity reference the
-fused kernel is checked against, not a superseded design.
+`liteinfer-continuous` stays runnable rather than becoming `historical`. Note what
+that is not: the replacement rule, read literally, says delete the eager kernel —
+`sdpa` covers its whole domain and wins there. It is kept as a deliberate
+exception, because it is the only attention written out in the repo and the
+independent reference the fused path is checked against, and because that costs
+22 lines. See `milestones.md`.
 
 ---
 

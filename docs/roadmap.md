@@ -158,12 +158,13 @@ listed.
 - **Status.** `planned`
 - **PRs.** _none yet_
 - **Why.** Paged gathers non-contiguous KV blocks into a contiguous buffer before
-  attention. Since the gather was vectorised that costs ~8-10% against
-  native-eager (0.92x throughput at B=1, 0.90x at B=4 and on ITL), and what is
-  left is memory traffic rather than overhead: the gather still copies the whole
-  K/V history every decode step. A fused paged-attention kernel reads the block
-  table inside the CUDA kernel and removes the copy entirely, the same approach
-  as vLLM's PagedAttention.
+  attention. That gather is now measured rather than inferred: profiled at B=32
+  it is `vectorized_gather_kernel` at **0.652 ms, 5.9% of GPU time** per decode
+  step. Worth having, and smaller than this item used to claim — the ~8-10%
+  figure it carried was measured at B=1 before the flat-slot rewrite, and is no
+  longer the number to plan against. A fused paged-attention kernel reads the
+  block table inside the CUDA kernel and removes the copy entirely, the same
+  approach as vLLM's PagedAttention.
 - **Scope.** Custom CUDA/Triton kernel for block-table attention;
   `ContinuousModelRunner` switches to it for the decode pass.
 - **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the entry point to
@@ -207,6 +208,12 @@ listed.
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
 - **PRs.** _none yet_
+- **Why.** Elementwise work is the second-largest slice of decode GPU time and
+  the most fusible: profiled at B=32, `elementwise_kernel` accounts for
+  **17.9% + 2.6% across ~143 launches per step** — RoPE, residual adds, norms
+  and the mask fills — against 30.1% for the projection GEMMs that actually do
+  the model's arithmetic. Fusion removes both the time and the launches, so this
+  overlaps §3.2; do §3.2 first and re-measure before sizing this one.
 - **Scope.** Wrap the `ContinuousModelRunner` forward passes in `torch.compile`,
   gated by `EngineConfig.enable_torch_compile`. First call pays
   compile cost; subsequent calls run the compiled graph.
@@ -218,6 +225,24 @@ listed.
 ### 3.2 CUDA graph capture for decode
 - **Status.** `planned`
 - **PRs.** _none yet_
+- **Why.** The largest measured cost in the decode path is not a kernel — it is
+  the gaps between kernels. Profiled on the current tree, one decode step at
+  B=32 (Llama-3.2-1B, ISL 128, A40):
+
+  | | |
+  |---|---:|
+  | step wall time | 14.68 ms |
+  | weight-read floor | 3.56 ms |
+  | GPU busy | 11.08 ms (75%) |
+  | **GPU idle, waiting on Python** | **3.60 ms (25%)** |
+  | CUDA kernels launched per step | **883** |
+
+  Graph replay collapses those 883 launches into one, so the idle quarter is
+  what it directly recovers — about 1.3x before any kernel gets faster. It is
+  also the only item that attacks the deficit the benchmark has shown all along:
+  liteinfer sits at 0.28-0.35x of vLLM at *every* batch width, and a gap that
+  stays flat as concurrency grows is a fixed per-step cost, not an algorithmic
+  one.
 - **Scope.** Capture the single-token-decode step and replay it, behind
   `enable_cuda_graph`. Continuous batching varies the decode width per
   step, so capture needs a set of graphs at padded batch sizes rather
@@ -237,21 +262,59 @@ listed.
 - **Surface change.** Loader streams shards onto the right rank;
   attention layers all-reduce.
 
-### 3.5 Let SDPA expand the grouped-query heads
+### 3.5 Broadcast the grouped-query heads on the cuDNN backend
 - **Status.** `planned`
-- **PRs.** follow-up to §3.3
-- **Why.** `models/attention.py` still calls `_repeat_kv` before both kernels,
-  materialising a 4x copy of K and V so 8 KV heads line up with 32 query heads.
-  The profile put ~10% of decode GPU time in `clone`, almost all of it that
-  copy. `scaled_dot_product_attention(..., enable_gqa=True)` broadcasts the KV
-  heads inside the kernel instead, which removes the copy and the memory it
-  holds. Measured viable: it dispatches on this torch and agrees with the eager
-  kernel to 2 bf16 ULP.
-- **Scope.** Pass `enable_gqa` from `sdpa_attention` and stop expanding on that
-  path; `eager_attention` keeps `_repeat_kv`, since writing the expansion out is
-  what makes it the readable reference.
-- **Parity test.** Unchanged output against `eager_attention`; the win is
-  `latency` mode ITL plus peak memory, so measure both.
+- **PRs.** _none yet_
+- **Why.** Two costs, one fix. `_repeat_kv` materialises a 4x copy of K and V so
+  8 KV heads line up with 32 query heads, and the expanded tensors then make the
+  attention kernel read four times the KV it needs. Asking the kernel to
+  broadcast instead removes both — but *only on the right backend*, and picking
+  it is the whole content of this item.
+
+  Measured on one attention call, bf16, with the mask the engine builds:
+
+  | | peak | decode B=32 ctx 2048 | ctx 256 | prefill B=8 len 1024 |
+  |---|---:|---:|---:|---:|
+  | expanded heads *(ships today)* | 96 MiB | 2.329 ms | 0.312 ms | 1.632 ms |
+  | `enable_gqa`, default dispatch | **4,904 MiB** | — | — | — |
+  | `enable_gqa` on **cuDNN** | **32 MiB** | **0.229 ms** | **0.047 ms** | 1.706 ms |
+
+  **6.7-10x on the decode attention kernel**, a third of the memory, and roughly
+  neutral on prefill — which is the right trade, since a request pays prefill
+  once and decode hundreds of times.
+- **Why it is not automatic.** PyTorch will not choose this on its own. With
+  broadcast heads and a mask, the memory-efficient backend refuses ("both fused
+  kernels require query, key and value to have the same num_heads") and flash is
+  already out on the mask, so the default dispatch falls to **math**, which
+  materialises the score matrix and undoes §3.3 — the 4,904 MiB row. cuDNN
+  attention serves it, but is runtime-disabled by default in this build, so it
+  has to be selected explicitly with
+  `torch.nn.attention.sdpa_kernel(SDPBackend.CUDNN_ATTENTION)`.
+- **Scope.** Select the backend explicitly in `sdpa_attention` and drop
+  `_repeat_kv` on that path; `eager_attention` keeps the expansion, since writing
+  it out is what makes it the readable reference. **A fallback is required**: on
+  a machine where cuDNN attention is unavailable, forcing it raises "No available
+  kernel", and the broadcast path cannot fall back to memory-efficient — it has
+  to fall back to expanding the heads. That fallback is the reason this is not a
+  one-line change.
+- **Predicted effect, written before the run.** Amdahl caps this well below the
+  kernel number. Attention is 1.57 ms of a 14.68 ms decode step (14.2% of the
+  11.08 ms the GPU is busy; the other 3.60 ms it is idle). A 10x attention
+  kernel therefore buys **1.11x** on the step, or about **1.13-1.16x** once the
+  `_repeat_kv` expansion goes with it — against a 1.1x threshold and ±4%
+  run-to-run variance. The end-to-end benchmark figure will move less again,
+  since prefill is neutral and some of the wall is outside the forward pass
+  (§6.4). **Do not report the 6.7-10x as a liteinfer speedup**; it is a kernel
+  measurement, and quoting it as an engine result is the mistake this item has
+  already made three times in other forms.
+- **Parity test.** The kernels differ by ~1e-3 in bf16 here, more than the
+  current path, so pin equivalence in fp32 as §3.3 did — and assert peak memory
+  no worse than the expanded-head path, since numerical agreement is exactly the
+  check that misses a math-backend fallback.
+- **Note.** An earlier version of this item claimed `enable_gqa` was verified
+  viable, then that it was blocked on §3.6. Both were wrong: the first tested
+  values and not memory, the second assumed the mask was the obstacle when the
+  obstacle was the backend.
 
 ### 3.6 Pack the batch instead of padding it
 - **Status.** `planned`
@@ -271,6 +334,9 @@ listed.
   right-alignment, and the null block, which exists to absorb padded positions.
 - **Unblocks.** §1.3 needs the same per-sequence length metadata to mix prefill
   and decode in one pass, so this is its prerequisite as much as its own change.
+  It also buys flash over the memory-efficient backend for the padded case, and
+  stops computing on positions that are discarded. Note what it does *not* gate:
+  §3.5 turned out to be reachable without it, on a different backend.
 - **Parity test.** Greedy output unchanged on a variable-length batch, which is
   the case padding exists to serve.
 
@@ -361,6 +427,25 @@ listed.
   (§6.3), and nothing consumes it.
 - **Scope.** `python -m liteinfer.dashboard` printing rolling
   prefill/decode tok/s, batch width and KV usage from the stats stream.
+
+### 6.4 Account for the time outside the forward pass
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** Decode measured in isolation runs at **2,179 tok/s** at B=32, while
+  the benchmark's end-to-end figure at the same shape is **1,445 tok/s**. Some
+  of that difference is real work the isolated measurement skips — prefilling
+  200 prompts, and the ramp-up and drain where the batch is narrower than 32 —
+  and some is engine overhead: scheduling, sampling, detokenisation, the asyncio
+  round trip per token. **Nobody knows the split**, and the difference is large
+  enough that it could be worth more than any kernel item on this list. Every
+  performance item in §3 optimises the forward pass; this one asks whether the
+  forward pass is where the time is.
+- **Scope.** `StepMetrics` already records wall time per forward pass (§6.3), so
+  the engine loop can report forward time against total loop time and attribute
+  the remainder. No new measurement machinery, just a consumer of what is
+  already collected — which is also what §6.2 wants.
+- **Parity test.** None; this is a measurement. The result is a number, and it
+  decides what to optimise next.
 
 ---
 
