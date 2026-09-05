@@ -16,6 +16,10 @@ def resolve_stop_status(
 
     ``min_tokens`` gates every early-stop signal (EOS, stop token ids, stop
     strings) but never the length limits, so a sequence can always terminate.
+
+    Stop strings are matched against ``seq.output_text``, which the caller has
+    already advanced for this token — the text is decoded once per step and
+    read here and by the stream event, rather than rebuilt by each.
     """
     params = seq.sampling_params
     num_output = seq.num_output_tokens
@@ -25,10 +29,8 @@ def resolve_stop_status(
         hit_stop_token = bool(params.stop_token_ids) and last_token_id in params.stop_token_ids
         if hit_eos or hit_stop_token:
             return SequenceStatus.FINISHED_STOPPED
-        if params.stop:
-            text = tokenizer.decode(seq.output_token_ids)
-            if any(s in text for s in params.stop):
-                return SequenceStatus.FINISHED_STOPPED
+        if params.stop and any(s in seq.output_text for s in params.stop):
+            return SequenceStatus.FINISHED_STOPPED
 
     if num_output >= params.max_tokens or len(seq) >= max_model_len:
         return SequenceStatus.FINISHED_LENGTH

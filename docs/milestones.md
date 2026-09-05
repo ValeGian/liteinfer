@@ -4,6 +4,17 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — §5.2 Incremental detokenization
+
+- **PRs.** [#25](https://github.com/ValeGian/liteinfer/pull/25)
+- **What.** The engine decoded each sequence's *entire* output text on every step, so the work per token grew with the tokens already generated. It now decodes a short window ending at the new token, decodes the same window one token shorter, and keeps the difference. The text is advanced once per step and read by both the stop rule and the stream event, where before each rebuilt it independently.
+- **Why not simply append the new token's text.** Two reasons, and both are in the tests. A UTF-8 character can span two tokens, so decoding one token alone yields U+FFFD; and a byte-level BPE piece renders differently depending on what precedes it. The window-and-difference approach handles both: when the window ends mid-character the decoder emits U+FFFD, which is not text yet, so the window is left to grow until the next token completes it.
+- **Measured.** The `deliver` stage (§6.4) goes from 6.9% of loop time at OSL 256 and 16.9% at OSL 1024 to **1.0% at both** — flat with output length, which is the property that was missing. In the harness: 1,445.5 → 1,509.7 tok/s at ISL 128 / OSL 256, and 959.7 → **1,106.4** at OSL 1024.
+- **Read those two rows together.** Removing a cost worth ~7% of the loop reads as 1.04x, which is inside the ±4% noise band and not a result on its own; removing one worth ~17% reads as 1.15x, which is. Same code in both rows — what differs is how much there was to remove. Measuring this at one short shape would have found nothing.
+- **Cost.** None measured. `Sequence` carries an `IncrementalDetokenizer`; the stop rule reads `seq.output_text` rather than decoding, which also removes the second full decode it was doing whenever stop strings were set.
+
+---
+
 ## 05-09-2026 — §6.4 The engine accounts for its own time
 
 - **PRs.** [#24](https://github.com/ValeGian/liteinfer/pull/24)

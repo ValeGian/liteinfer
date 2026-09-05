@@ -266,15 +266,15 @@ class AsyncLLMEngine:
         for i, seq in enumerate(seqs):
             token_id = int(sampled[i].item())
             seq.output_token_ids.append(token_id)
+            seq.detokenizer.update(self.tokenizer, seq.output_token_ids)
             self._maybe_finish(seq, token_id)
 
     def _build_event(self, seq: Sequence) -> StreamEvent:
-        text = self.tokenizer.decode(seq.output_token_ids)
         return StreamEvent(
             request_id=seq.request_id,
             prompt=seq.prompt,
             output_token_ids=list(seq.output_token_ids),
-            text=text,
+            text=seq.output_text,
             is_finished=seq.is_finished,
             finish_reason=_FINISH_REASONS.get(seq.status) if seq.is_finished else None,
         )

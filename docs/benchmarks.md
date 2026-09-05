@@ -317,11 +317,32 @@ for 99% of its own wall time. Measured on 32 sequences, A40, Llama-3.2-1B:
 
 Two things worth taking from it. **Scheduling and the async plumbing are free** —
 together under 1.5%, and no candidate for optimisation despite being the parts
-that look most like overhead. And **detokenisation is not**: `_build_event`
-re-decodes a sequence's entire output text on every step, so four times the
-output length costs twelve times the work. At OSL 1024 it is the second-largest
-cost in the engine, ahead of sampling and behind only the model itself, and it
-keeps climbing with length. That is §5.2, and it needs no kernel work.
+that look most like overhead. And **detokenisation was not**: `_build_event`
+re-decoded a sequence's entire output text on every step, so four times the
+output length cost twelve times the work — the second-largest cost in the engine
+at OSL 1024, ahead of sampling and behind only the model itself.
+
+§5.2 fixed that by decoding a short window per token instead of the whole
+prefix, and the same attribution measures the result:
+
+| stage | OSL 256 | OSL 1024 |
+|---|---:|---:|
+| deliver, before | 6.9% | 16.9% |
+| **deliver, after** | **1.0%** | **1.0%** |
+
+Flat with output length, which is the property that was missing. End to end, in
+the harness:
+
+| shape | before | after | |
+|---|---:|---:|---:|
+| ISL 128 / OSL 256 | 1,445.5 | 1,509.7 | 1.04× |
+| ISL 128 / OSL 1024 | 959.7 | 1,106.4 | **1.15×** |
+
+Read those two rows together. Removing a cost worth ~7% of the loop shows up as
+1.04×, which is *inside* the ±4% noise band and not a result on its own;
+removing one worth ~17% shows up as 1.15×, which is. The fix is the same code in
+both rows — what changes is how much there was to remove, and that is a property
+of the workload. A shorter benchmark would have found nothing here.
 
 Inside the forward pass, one decode step at B=32 profiles as 14.68 ms wall
 against a 3.56 ms weight-read floor: 11.08 ms of GPU work spread over **883
