@@ -17,6 +17,59 @@ by the substantive bullets:
 - **Parity test.** <how correctness is pinned>
 ```
 
+## Shipping an improvement
+
+Every change that claims to make liteinfer faster follows the same loop. The
+point is that the claim is always backed by a number measured the same way
+before and after, and that a feature which wins outright replaces the one it
+beats rather than sitting beside it.
+
+**1. Measure the baseline.** The config being improved must already have stored
+results in `benchmarks/results/`. If it does not, run it first — a claim needs a
+before.
+
+**2. Add the config, not a branch.** New work is a `BenchmarkConfig` entry in
+`benchmarks/configs.py` whose `baseline` names the config it improves on. That
+is what makes `bench report` print the 1:1 delta.
+
+**3. Measure the right thing.** The two modes answer different questions, and
+using the wrong one hides the effect:
+
+| The change affects | Run | Read |
+|---|---|---|
+| how much work fits at once (batching, scheduling, memory) | `throughput` | tok/s, req/s |
+| how long one step costs (kernels, cache layout, attention) | `latency` | ITL, TTFT |
+
+Same dataset, same ISL/OSL, same sample count as the baseline. Latency runs
+sequentially — `--gpus` distorts TTFT. Against vLLM, compare only at **matched
+batch width**; a B=1 engine against a B=32 one measures the batch width.
+Run-to-run variance is about ±4%, so an effect under ~1.1x is not an effect.
+
+**4. Say what it cost.** Report the metric that got worse as plainly as the one
+that got better. Continuous batching won throughput 4.5x and lost ~9% on
+single-request ITL; both belong in the write-up.
+
+**5. Update the docs in the same PR.** Results and analysis in
+`docs/benchmarks.md`, headline numbers in `README.md`, a milestone entry with
+its PR link, and the roadmap item flipped to `landed`.
+
+**6. If it is a clear win, delete what it beat.** A clear win is: better on the
+mode the feature targets, by more than variance, with any regression elsewhere
+small enough to state and accept. Then, in order:
+
+   - confirm the superseded config's results are stored — that measurement is
+     the only record once the code is gone;
+   - flag its `BenchmarkConfig` entry `historical` so the report keeps rendering
+     the progression while `bench run` refuses it;
+   - delete the code, and everything that existed only to serve it;
+   - **simplify what is left.** Removing one of two paths usually makes an
+     abstraction pointless: a mode flag with one value, a dispatcher with one
+     entry, a base class with one subclass. Collapse them in the same PR, or
+     the codebase keeps the shape of a choice it no longer offers.
+
+Keeping a slower path "just in case" is how the codebase stops being readable.
+The benchmark exists so that deleting it is safe.
+
 ## Marking an item done
 
 When an item lands:
@@ -28,6 +81,10 @@ When an item lands:
 3. If a follow-up is created (e.g. v1 lands but v2 is the polished
    version), leave a stub here with status `planned` and a backlink
    to the original PR.
+
+Number new items by area: section 2 is KV cache, 5 is engine ergonomics, 6 is
+observability. Check `milestones.md` before picking a number — landed items keep
+theirs.
 
 Status badges keep half-done work visible: an item can sit at
 `in-progress` with one PR linked while the remaining scope stays
@@ -114,12 +171,13 @@ listed.
 ### 3.2 CUDA graph capture for decode
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Capture the single-token-decode step (fixed shape after
-  prefill) and replay. Behind `enable_cuda_graph`. Requires §1.1
-  (fixed batch size during capture). Graph capture also eliminates the
-  per-step `torch.zeros` allocation in `build_additive_mask` and the
-  associated Python-side slice fills, which currently incur a GPU
-  allocation + multiple kernel launches every forward pass.
+- **Scope.** Capture the single-token-decode step and replay it, behind
+  `enable_cuda_graph`. Continuous batching varies the decode width per
+  step, so capture needs a set of graphs at padded batch sizes rather
+  than one — the batch is padded up to the nearest captured width.
+  Capture also removes the per-step `torch.zeros` allocation in
+  `build_continuous_decode_mask` and its Python-side slice fills, which
+  cost a GPU allocation plus several kernel launches every pass.
 - **Pre-req.** §3.1 helps but is not strictly required.
 
 ### 3.3 Flash / SDPA attention
@@ -136,7 +194,7 @@ listed.
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Per-rank `ModelRunner` plus a process group. Layer
+- **Scope.** Per-rank `ContinuousModelRunner` plus a process group. Layer
   weights sharded along output dim (column-parallel) or input dim
   (row-parallel) per HF `_tp_plan`. Already declared in vendored
   models.
@@ -194,10 +252,10 @@ listed.
 ### 6.2 Live dashboard runner
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** Listener API exists; no canonical consumer.
+- **Why.** `EngineStats` now records a `StepMetrics` per forward pass
+  (§6.3), and nothing consumes it.
 - **Scope.** `python -m liteinfer.dashboard` printing rolling
-  prefill/decode tok/s, batch size, KV usage. Builds on §1.1 to be
-  meaningful.
+  prefill/decode tok/s, batch width and KV usage from the stats stream.
 
 ---
 
@@ -207,8 +265,8 @@ listed.
   lands.
 - Vectorize `Sampler.__call__` per-row loop when params are
   homogeneous across batch.
-- Tighten `KVCache` ABC — richer `payload` contract landed with §2.1; may still obviate eager wrapper.
-- Add `tests/integration/` B=1 vs B=N parity tests once §1.1 lands.
+- Trim `EngineStats`: six derived throughput properties, the `on_step`
+  listener and four running totals have no callers outside their own tests.
 
 ---
 

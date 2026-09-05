@@ -44,6 +44,14 @@ length, `(e2e - ttft) / (osl - 1)` is the mean decode-step cost. TTFT comes from
 separate pass capped at a single token. Both engines are therefore measured by
 the same clock, with no per-token hooks that each would implement differently.
 
+## Shipping an improvement
+
+This harness exists so that a faster path can *replace* a slower one instead of
+sitting next to it. The loop — measure the baseline, add a config naming what it
+improves on, read the mode that matches the change, then delete what it beat and
+simplify — is written up in [`docs/roadmap.md`](../docs/roadmap.md) under
+"Shipping an improvement".
+
 ## Configs
 
 `benchmarks/configs.py` is the matrix. Each entry names the config it improves

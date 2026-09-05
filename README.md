@@ -177,6 +177,10 @@ Engines: `liteinfer`, `vllm`. See [`benchmarks/README.md`](benchmarks/README.md)
 for the config matrix and controls, and [`docs/benchmarks.md`](docs/benchmarks.md)
 for methodology and results.
 
+Every performance change is measured against the config it improves on, and a
+clear win replaces that config rather than joining it — see "Shipping an
+improvement" in [`docs/roadmap.md`](docs/roadmap.md).
+
 ## Roadmap
 
 High-level direction:
