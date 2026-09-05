@@ -63,6 +63,11 @@ class BlockPool:
         self._free_blocks: list[int] = list(range(1, num_blocks + 1))
 
     @property
+    def nbytes(self) -> int:
+        """Bytes of GPU memory this pool holds, keys and values together."""
+        return self._keys.numel() * self._keys.element_size() * 2
+
+    @property
     def device(self) -> torch.device:
         return self._keys.device
 

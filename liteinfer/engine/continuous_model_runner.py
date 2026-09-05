@@ -9,6 +9,9 @@ mixed pass, which would need a flash-attention-style kernel. See roadmap §1.3.
 
 from __future__ import annotations
 
+import logging
+import math
+
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
@@ -19,6 +22,9 @@ from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.loader import load_hf_model
 from liteinfer.tokenizer import Tokenizer
+
+_LOGGER = logging.getLogger(__name__)
+_GIB = 1 << 30
 
 
 class ContinuousModelRunner:
@@ -147,15 +153,46 @@ class ContinuousModelRunner:
         )
 
     def _compute_num_blocks(self, num_layers: int, num_kv_heads: int, head_dim: int) -> int:
-        if self.config.num_gpu_blocks is not None:
-            return self.config.num_gpu_blocks
+        """Size the pool to the smaller of what memory allows and what the engine can reach.
+
+        `max_num_seqs` sequences of `max_model_len` tokens is the most KV that can
+        ever exist, so blocks beyond that are memory the engine is structurally
+        unable to use — and that surplus is what the forward pass needs for
+        activations.
+        """
         dtype_bytes = torch.finfo(self.config.dtype).bits // 8
         bytes_per_block = (
             self.config.block_size * num_kv_heads * head_dim * dtype_bytes * 2 * num_layers
         )
-        if self.device.type == "cuda":
-            free_bytes, _ = torch.cuda.mem_get_info(self.device)
-            usable_bytes = int(free_bytes * 0.85)
+        if self.config.num_gpu_blocks is not None:
+            self._log_pool(self.config.num_gpu_blocks, bytes_per_block, "set by num_gpu_blocks")
+            return self.config.num_gpu_blocks
+
+        budget = (
+            torch.cuda.mem_get_info(self.device)[0] if self.device.type == "cuda" else 1 << 30
+        )
+        affordable = int(budget * self.config.kv_cache_memory_fraction) // bytes_per_block
+        reachable = math.ceil(
+            self.config.max_num_seqs * self.config.max_model_len / self.config.block_size
+        )
+
+        if affordable < reachable:
+            _LOGGER.warning(
+                "KV pool holds %d blocks but this config could need %d: "
+                "%d concurrent sequences of %d tokens may exhaust it. "
+                "Lower max_num_seqs or max_model_len, or raise kv_cache_memory_fraction.",
+                affordable, reachable, self.config.max_num_seqs, self.config.max_model_len,
+            )
+            num_blocks = max(1, affordable)
+            reason = "limited by free memory"
         else:
-            usable_bytes = 1 << 30
-        return max(1, usable_bytes // bytes_per_block)
+            num_blocks = max(1, reachable)
+            reason = f"sized for {self.config.max_num_seqs} x {self.config.max_model_len} tokens"
+        self._log_pool(num_blocks, bytes_per_block, reason)
+        return num_blocks
+
+    def _log_pool(self, num_blocks: int, bytes_per_block: int, reason: str) -> None:
+        _LOGGER.info(
+            "KV pool: %d blocks x %d tokens = %.2f GiB (%s)",
+            num_blocks, self.config.block_size, num_blocks * bytes_per_block / _GIB, reason,
+        )

@@ -24,7 +24,8 @@ class EngineConfig:
 
     # KV block pool.
     block_size: int = 16
-    num_gpu_blocks: int | None = None  # None → auto-computed after model load
+    kv_cache_memory_fraction: float = 0.85  # share of free VRAM the pool may claim
+    num_gpu_blocks: int | None = None  # None → sized from the fraction and the workload
 
     def __post_init__(self) -> None:
         if self.max_num_seqs < 1:
@@ -33,6 +34,8 @@ class EngineConfig:
             raise ValueError("max_model_len must be >= 1")
         if self.block_size < 1:
             raise ValueError("block_size must be >= 1")
+        if not 0 < self.kv_cache_memory_fraction <= 1:
+            raise ValueError("kv_cache_memory_fraction must be in (0, 1]")
 
     def resolved_device(self) -> torch.device:
         """Return the concrete `torch.device` after resolving ``"auto"``."""

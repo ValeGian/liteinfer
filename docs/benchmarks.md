@@ -224,8 +224,8 @@ claims can only be re-validated against an old tree.
 |---|---:|---:|
 | 128 / 256 | 1,369.1 | 4,458.7 |
 | 128 / 1024 | 942.3 | 4,211.9 |
-| 1024 / 256 | **OOM** | 2,871.2 |
-| 1024 / 1024 | **OOM** | 3,240.6 |
+| 1024 / 256 | *OOM* → **646.0** | 2,871.2 |
+| 1024 / 1024 | *OOM* → **574.1** | 3,240.6 |
 
 The failure was an out-of-memory in `softmax`. Eager attention materialises the
 score matrix, and the softmax upcasts it to fp32: at 32 sequences × 32 heads ×
@@ -233,9 +233,15 @@ score matrix, and the softmax upcasts it to fp32: at 32 sequences × 32 heads ×
 what FlashAttention is for — filed as §3.3, and now a capability gate rather than
 an optimisation.
 
-The KV pool compounds it: it claims 32.74 GiB when the configuration can only ever
-use 4.00 GiB, leaving 5.77 GiB for activations — so the engine ran out of memory
-while holding ~29 GiB of KV space it was structurally unable to reach.
+The KV pool compounded it. It claimed 32.74 GiB when the configuration could only
+ever use 4.00 GiB — `max_num_seqs` × `max_model_len` × 32 KB — so the engine ran
+out of memory while holding ~29 GiB of KV space it was structurally unable to
+reach. Sizing the pool to that ceiling frees the surplus and both shapes now run,
+which is the arrow in the table above.
+
+The materialisation itself is untouched and will fail again at longer prompts or
+wider batches. §3.3 is the real fix; right-sizing the pool only stops it stealing
+the memory attention needs.
 
 ---
 
