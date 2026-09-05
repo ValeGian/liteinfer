@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from benchmarks.configs import CONFIGS, get
+from liteinfer.models.attention import IMPLEMENTATIONS
 
 
 def test_every_baseline_names_a_known_config() -> None:
@@ -36,7 +37,12 @@ def test_historical_configs_still_name_a_baseline_chain() -> None:
 
 def test_at_least_one_liteinfer_config_is_runnable() -> None:
     runnable = [c for c in CONFIGS.values() if c.engine == "liteinfer" and not c.historical]
-    assert len(runnable) == 1
+    assert runnable != []
+
+
+def test_every_config_pins_a_kernel_the_engine_knows() -> None:
+    unknown = {c.attn_implementation for c in CONFIGS.values()} - set(IMPLEMENTATIONS)
+    assert unknown == set()
 
 
 def test_get_rejects_an_unknown_name() -> None:

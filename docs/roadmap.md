@@ -227,22 +227,6 @@ listed.
   cost a GPU allocation plus several kernel launches every pass.
 - **Pre-req.** §3.1 helps but is not strictly required.
 
-### 3.3 Flash / SDPA attention
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** This is a capability gate, not a speedup. Eager attention
-  materialises the full `[batch, heads, q, k]` score matrix, and softmax
-  upcasts it to fp32: at ISL 1024 / B=32 that is 4.00 GiB in one allocation,
-  and liteinfer died where vLLM completed (`docs/benchmarks.md`, "Long
-  prompts are liteinfer's weak shape"). SDPA never materialises it. Vendored
-  modeling already supports `_attn_implementation` switching; loader pins
-  `eager` for v0.
-- **Scope.** Allow `EngineConfig.attn_implementation` and pass through
-  to `hf_config._attn_implementation`. Default to `sdpa` once parity
-  proven.
-- **Parity test.** SDPA vs eager: outputs match within `torch.testing
-  .assert_close` tolerances.
-
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`
 - **PRs.** _none yet_
@@ -252,6 +236,22 @@ listed.
   models.
 - **Surface change.** Loader streams shards onto the right rank;
   attention layers all-reduce.
+
+### 3.5 Let SDPA expand the grouped-query heads
+- **Status.** `planned`
+- **PRs.** follow-up to §3.3
+- **Why.** `models/attention.py` still calls `_repeat_kv` before both kernels,
+  materialising a 4x copy of K and V so 8 KV heads line up with 32 query heads.
+  The profile put ~10% of decode GPU time in `clone`, almost all of it that
+  copy. `scaled_dot_product_attention(..., enable_gqa=True)` broadcasts the KV
+  heads inside the kernel instead, which removes the copy and the memory it
+  holds. Measured viable: it dispatches on this torch and agrees with the eager
+  kernel to 2 bf16 ULP.
+- **Scope.** Pass `enable_gqa` from `sdpa_attention` and stop expanding on that
+  path; `eager_attention` keeps `_repeat_kv`, since writing the expansion out is
+  what makes it the readable reference.
+- **Parity test.** Unchanged output against `eager_attention`; the win is
+  `latency` mode ITL plus peak memory, so measure both.
 
 ---
 
@@ -345,8 +345,6 @@ listed.
 
 ## 7. Hygiene / housekeeping
 
-- Drop loader's `_attn_implementation = "eager"` override once §3.3
-  lands.
 - Vectorize `Sampler.__call__` per-row loop when params are
   homogeneous across batch.
 - Trim `EngineStats`: six derived throughput properties, the `on_step`

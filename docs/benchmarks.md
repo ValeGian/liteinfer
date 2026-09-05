@@ -89,8 +89,13 @@ refuses to run them.
 | `liteinfer-eager-b4` | Static batching, B=4 | `liteinfer-eager` | removed |
 | `liteinfer-native-eager-b4` | Static batching, B=4, plain tensors | `liteinfer-native-eager` | removed |
 | `liteinfer-paged-b4` | Static batching, B=4, paged | `liteinfer-paged` | removed |
-| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | **current** |
+| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | eager kernel |
+| `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | **current** |
 | `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
+
+`liteinfer-continuous` stays runnable rather than becoming `historical`: it is the
+same engine with `attn_implementation="eager"`, which is the parity reference the
+fused kernel is checked against, not a superseded design.
 
 ---
 

@@ -15,6 +15,8 @@ from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from liteinfer.models.attention import resolve
+
 
 @dataclass
 class CausalLMOutput:
@@ -99,18 +101,6 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand grouped-query KV heads back to the number of query heads."""
-    if n_rep == 1:
-        return hidden_states
-    batch, num_kv_heads, slen, head_dim = hidden_states.shape
-    return (
-        hidden_states[:, :, None, :, :]
-        .expand(batch, num_kv_heads, n_rep, slen, head_dim)
-        .reshape(batch, num_kv_heads * n_rep, slen, head_dim)
-    )
-
-
 class LlamaMLP(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
@@ -124,16 +114,16 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaAttention(nn.Module):
-    """Grouped-query causal self-attention with eager (matmul) kernel.
+    """Grouped-query causal self-attention.
 
-    SDPA / FlashAttention paths are intentionally not branched on here:
-    the engine pins eager. A fused-kernel variant is a future drop-in
-    behind `EngineConfig.attn_implementation` (see `docs/roadmap.md`).
+    The kernel that computes the attention itself comes from
+    `models/attention.py`, chosen by `EngineConfig.attn_implementation`.
     """
 
     def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.attention = resolve(config._attn_implementation)
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -166,15 +156,8 @@ class LlamaAttention(nn.Module):
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
 
-        k = _repeat_kv(k, self.num_kv_groups)
-        v = _repeat_kv(v, self.num_kv_groups)
-
-        attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[-2]]
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_output = torch.matmul(attn_weights, v).transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch, seq_len, -1)
+        attn_output = self.attention(q, k, v, attention_mask, self.scaling, self.num_kv_groups)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch, seq_len, -1)
         return self.o_proj(attn_output)
 
 

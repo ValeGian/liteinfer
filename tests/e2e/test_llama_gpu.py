@@ -121,6 +121,58 @@ def test_greedy_matches_transformers(llm: LLM, hf_model, prompt: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Parity: sdpa vs eager kernel
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def fp32_kernel_outputs(model_dir):
+    """Greedy output of both kernels in fp32, one engine resident at a time.
+
+    fp32 is the precision at which the two kernels are exactly comparable. In
+    bf16 they agree to about two ULP, which greedy decoding turns into a
+    different token as soon as the top two logits fall inside that margin —
+    around token 17 on these prompts. That is precision, not a difference in
+    what the kernels compute, so the equivalence is pinned here instead.
+    """
+    params = SamplingParams(max_tokens=_PARITY_MAX_TOKENS, temperature=0.0)
+    outputs = {}
+    for kernel in ("sdpa", "eager"):
+        engine = LLM(
+            str(model_dir), device=_DEVICE, dtype=torch.float32, attn_implementation=kernel
+        )
+        try:
+            outputs[kernel] = {
+                "one_prompt": _liteinfer_greedy(engine, _PARITY_PROMPTS[0], _PARITY_MAX_TOKENS),
+                "left_padded_batch": [o.token_ids for o in engine.generate(_PARITY_PROMPTS, params)],
+            }
+        finally:
+            engine.close()
+            del engine
+            gc.collect()
+            torch.cuda.empty_cache()
+    return outputs
+
+
+@pytest.mark.gpu
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_sdpa_matches_eager_on_one_prompt(fp32_kernel_outputs) -> None:
+    assert fp32_kernel_outputs["sdpa"]["one_prompt"] == fp32_kernel_outputs["eager"]["one_prompt"]
+
+
+@pytest.mark.gpu
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_sdpa_matches_eager_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
+    """Prompts of different lengths are where a mask-handling difference would show."""
+    assert (
+        fp32_kernel_outputs["sdpa"]["left_padded_batch"]
+        == fp32_kernel_outputs["eager"]["left_padded_batch"]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parity: eager cache vs transformers
 # ---------------------------------------------------------------------------
 

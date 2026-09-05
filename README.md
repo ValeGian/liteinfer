@@ -104,6 +104,10 @@ One engine: continuous batching over a paged KV cache.
 - **`ContinuousKVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
   `slot_table` maps logical token positions to physical slots, so a whole batch
   is read or written with a single indexing op.
+- **`models/attention.py`** — the attention kernel, one per
+  `attn_implementation`. `sdpa` (default) never materialises the score matrix;
+  `eager` writes it out in plain matmuls, which reads better and is the parity
+  reference, but caps the prompt length that fits in memory.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
 without touching the engine. `stats` records a `StepMetrics` per forward pass.

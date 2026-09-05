@@ -7,7 +7,3 @@ Each model exposes a constructor that accepts an `EngineConfig` and a
 The dispatch table from HF architecture name to local class is owned by
 `load_hf_model`.
 """
-
-from liteinfer.models.loader import load_hf_model
-
-__all__ = ["load_hf_model"]
