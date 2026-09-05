@@ -94,9 +94,7 @@ def load_hf_model(config: EngineConfig, model_dir: Path) -> tuple[nn.Module, Pre
         raise ValueError(f"unsupported architecture {architecture!r}; known: {sorted(_DISPATCH)}")
 
     hf_config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
-    # Force eager attention path; SDPA/flash require correct masking and
-    # are an optimization to add later behind a flag.
-    hf_config._attn_implementation = "eager"
+    hf_config._attn_implementation = config.attn_implementation
 
     model_cls = _DISPATCH[architecture]
     device = config.resolved_device()

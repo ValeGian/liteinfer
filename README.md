@@ -104,6 +104,10 @@ One engine: continuous batching over a paged KV cache.
 - **`ContinuousKVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
   `slot_table` maps logical token positions to physical slots, so a whole batch
   is read or written with a single indexing op.
+- **`models/attention.py`** — the attention kernel, one per
+  `attn_implementation`. `sdpa` (default) never materialises the score matrix;
+  `eager` writes it out in plain matmuls, which reads better and is the parity
+  reference, but caps the prompt length that fits in memory.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
 without touching the engine. `stats` records a `StepMetrics` per forward pass.
@@ -157,7 +161,10 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 prefill compute, so read it as offline round-trip latency, not prefill speed.
 
 Batching is competitive at both tiers; what remains is a roughly flat ~3× per-step
-decode constant at every batch width — no CUDA graphs, no fused attention.
+decode constant at every batch width — no CUDA graphs, no varlen packing.
+Attention is fused (SDPA), which bought prompt length rather than speed: at
+ISL 2048 the eager kernel asks for 16 GiB in one allocation and dies, while the
+fused one runs.
 Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:
 [`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).
 

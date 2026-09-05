@@ -43,7 +43,11 @@ class LiteInferAdapter:
     def __enter__(self) -> LiteInferAdapter:
         from liteinfer import LLM
 
-        self._llm = LLM(model=self._model, max_num_seqs=self._config.max_num_seqs)
+        self._llm = LLM(
+            model=self._model,
+            max_num_seqs=self._config.max_num_seqs,
+            attn_implementation=self._config.attn_implementation,
+        )
         return self
 
     def __exit__(self, *exc) -> None:

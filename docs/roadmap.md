@@ -227,22 +227,6 @@ listed.
   cost a GPU allocation plus several kernel launches every pass.
 - **Pre-req.** §3.1 helps but is not strictly required.
 
-### 3.3 Flash / SDPA attention
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** This is a capability gate, not a speedup. Eager attention
-  materialises the full `[batch, heads, q, k]` score matrix, and softmax
-  upcasts it to fp32: at ISL 1024 / B=32 that is 4.00 GiB in one allocation,
-  and liteinfer died where vLLM completed (`docs/benchmarks.md`, "Long
-  prompts are liteinfer's weak shape"). SDPA never materialises it. Vendored
-  modeling already supports `_attn_implementation` switching; loader pins
-  `eager` for v0.
-- **Scope.** Allow `EngineConfig.attn_implementation` and pass through
-  to `hf_config._attn_implementation`. Default to `sdpa` once parity
-  proven.
-- **Parity test.** SDPA vs eager: outputs match within `torch.testing
-  .assert_close` tolerances.
-
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`
 - **PRs.** _none yet_
@@ -252,6 +236,43 @@ listed.
   models.
 - **Surface change.** Loader streams shards onto the right rank;
   attention layers all-reduce.
+
+### 3.5 Let SDPA expand the grouped-query heads
+- **Status.** `planned`
+- **PRs.** follow-up to §3.3
+- **Why.** `models/attention.py` still calls `_repeat_kv` before both kernels,
+  materialising a 4x copy of K and V so 8 KV heads line up with 32 query heads.
+  The profile put ~10% of decode GPU time in `clone`, almost all of it that
+  copy. `scaled_dot_product_attention(..., enable_gqa=True)` broadcasts the KV
+  heads inside the kernel instead, which removes the copy and the memory it
+  holds. Measured viable: it dispatches on this torch and agrees with the eager
+  kernel to 2 bf16 ULP.
+- **Scope.** Pass `enable_gqa` from `sdpa_attention` and stop expanding on that
+  path; `eager_attention` keeps `_repeat_kv`, since writing the expansion out is
+  what makes it the readable reference.
+- **Parity test.** Unchanged output against `eager_attention`; the win is
+  `latency` mode ITL plus peak memory, so measure both.
+
+### 3.6 Pack the batch instead of padding it
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** Prompts of different lengths are left-padded, so every attention call
+  needs an explicit additive mask to hide each row's pad prefix. That mask is
+  what keeps liteinfer off FlashAttention: PyTorch reports "Flash Attention does
+  not support non-null attn_mask", so SDPA falls to the memory-efficient
+  backend. Both tile the softmax, so §3.3's memory win is unaffected — but flash
+  is the faster of the two, and the padding also costs real compute on positions
+  that are thrown away. Verified: the same tensors with no mask and
+  `is_causal=True` make flash available.
+- **Scope.** Pack the batch as one flat token run plus cumulative sequence-length
+  offsets (`cu_seqlens`), the varlen entry point vLLM uses. Padding stops
+  existing, so `engine/attention_mask.py` has nothing to mask and `is_causal`
+  replaces it. Touches the runner's input builders, the cache's `slot_table`
+  right-alignment, and the null block, which exists to absorb padded positions.
+- **Unblocks.** §1.3 needs the same per-sequence length metadata to mix prefill
+  and decode in one pass, so this is its prerequisite as much as its own change.
+- **Parity test.** Greedy output unchanged on a variable-length batch, which is
+  the case padding exists to serve.
 
 ---
 
@@ -345,8 +366,6 @@ listed.
 
 ## 7. Hygiene / housekeeping
 
-- Drop loader's `_attn_implementation = "eager"` override once §3.3
-  lands.
 - Vectorize `Sampler.__call__` per-row loop when params are
   homogeneous across batch.
 - Trim `EngineStats`: six derived throughput properties, the `on_step`

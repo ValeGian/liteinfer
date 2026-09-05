@@ -19,6 +19,9 @@ class BenchmarkConfig:
     engine: Engine
     description: str
     max_num_seqs: int = 1
+    attn_implementation: str = "eager"
+    """Pinned per row rather than inherited from `EngineConfig`: a stored result
+    has to keep meaning the same thing after the engine default moves on."""
     baseline: str | None = None
     historical: bool = False
     """Measured before the code was removed. Kept so the report still shows the
@@ -86,6 +89,15 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         max_num_seqs=32,
         baseline="liteinfer-paged-b4",
         description="Continuous batching, up to 32 concurrent sequences",
+    ),
+    # --- liteinfer: fused attention kernel (§3.3) ---
+    BenchmarkConfig(
+        name="liteinfer-sdpa",
+        engine="liteinfer",
+        max_num_seqs=32,
+        attn_implementation="sdpa",
+        baseline="liteinfer-continuous",
+        description="Continuous batching, attention through PyTorch SDPA",
     ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(

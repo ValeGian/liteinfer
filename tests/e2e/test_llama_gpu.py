@@ -104,19 +104,90 @@ def _liteinfer_greedy(llm: LLM, prompt: str, max_tokens: int) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(scope="module")
+def eager_llm(model_dir):
+    """liteinfer with the same attention kernel `hf_model` uses.
+
+    This test isolates liteinfer's *model* — RoPE, norms, projections, the
+    cache — against the reference implementation, so the kernel has to be held
+    constant on both sides. Left on the default `sdpa` against an eager
+    reference, it would instead measure bf16 rounding: the two kernels agree to
+    about two ULP, and greedy decoding turns that into a different token around
+    position 11. That the kernels agree is pinned separately, in fp32, below.
+    """
+    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, attn_implementation="eager")
+    yield engine
+    engine.close()
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.parametrize("prompt", _PARITY_PROMPTS)
-def test_greedy_matches_transformers(llm: LLM, hf_model, prompt: str) -> None:
+def test_greedy_matches_transformers(eager_llm: LLM, hf_model, prompt: str) -> None:
     """liteinfer greedy output must match transformers token-for-token."""
-    prompt_ids = llm.tokenizer.encode(prompt)
+    prompt_ids = eager_llm.tokenizer.encode(prompt)
     expected = _hf_greedy(hf_model, prompt_ids, _PARITY_MAX_TOKENS)
-    actual = _liteinfer_greedy(llm, prompt, _PARITY_MAX_TOKENS)
+    actual = _liteinfer_greedy(eager_llm, prompt, _PARITY_MAX_TOKENS)
     assert actual == expected, (
         f"prompt={prompt!r}\n"
         f"  liteinfer : {actual}\n"
         f"  transformers: {expected}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parity: sdpa vs eager kernel
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def fp32_kernel_outputs(model_dir):
+    """Greedy output of both kernels in fp32, one engine resident at a time.
+
+    fp32 is the precision at which the two kernels are exactly comparable. In
+    bf16 they agree to about two ULP, which greedy decoding turns into a
+    different token as soon as the top two logits fall inside that margin —
+    around token 17 on these prompts. That is precision, not a difference in
+    what the kernels compute, so the equivalence is pinned here instead.
+    """
+    params = SamplingParams(max_tokens=_PARITY_MAX_TOKENS, temperature=0.0)
+    outputs = {}
+    for kernel in ("sdpa", "eager"):
+        engine = LLM(
+            str(model_dir), device=_DEVICE, dtype=torch.float32, attn_implementation=kernel
+        )
+        try:
+            outputs[kernel] = {
+                "one_prompt": _liteinfer_greedy(engine, _PARITY_PROMPTS[0], _PARITY_MAX_TOKENS),
+                "left_padded_batch": [o.token_ids for o in engine.generate(_PARITY_PROMPTS, params)],
+            }
+        finally:
+            engine.close()
+            del engine
+            gc.collect()
+            torch.cuda.empty_cache()
+    return outputs
+
+
+@pytest.mark.gpu
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_sdpa_matches_eager_on_one_prompt(fp32_kernel_outputs) -> None:
+    assert fp32_kernel_outputs["sdpa"]["one_prompt"] == fp32_kernel_outputs["eager"]["one_prompt"]
+
+
+@pytest.mark.gpu
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_sdpa_matches_eager_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
+    """Prompts of different lengths are where a mask-handling difference would show."""
+    assert (
+        fp32_kernel_outputs["sdpa"]["left_padded_batch"]
+        == fp32_kernel_outputs["eager"]["left_padded_batch"]
     )
 
 

@@ -1,12 +1,12 @@
 {
-  "config": "liteinfer-continuous",
+  "config": "liteinfer-sdpa",
   "engine": "liteinfer",
-  "description": "Continuous batching, up to 32 concurrent sequences",
-  "baseline": "liteinfer-paged-b4",
+  "description": "Continuous batching, attention through PyTorch SDPA",
+  "baseline": "liteinfer-continuous",
   "mode": "throughput",
   "model": "unsloth/Llama-3.2-1B-Instruct",
   "max_num_seqs": 32,
-  "timestamp": "2026-09-05T15:30:26+00:00",
+  "timestamp": "2026-09-05T15:15:57+00:00",
   "dataset": {
     "path": "benchmarks/datasets/isl1024_osl1024_n200_unsloth_llama_3_2_1b_instruct.json",
     "target_isl": 1024,
@@ -15,12 +15,12 @@
     "sha256": "3cde2ae99bfcac4ea7d756022ac50586c0edfac70e04ebdc3b620a9635bf9b7e"
   },
   "summary": {
-    "output_tokens_per_s": 572.8662366241698,
-    "requests_per_s": 0.5594396842032908,
-    "wall_time_s": 357.50055930484086
+    "output_tokens_per_s": 592.837920377479,
+    "requests_per_s": 0.5789432816186318,
+    "wall_time_s": 345.45698404312134
   },
   "raw": {
-    "wall_time_s": 357.50055930484086,
+    "wall_time_s": 345.45698404312134,
     "output_tokens": 204800
   }
 }

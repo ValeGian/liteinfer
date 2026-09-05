@@ -89,8 +89,13 @@ refuses to run them.
 | `liteinfer-eager-b4` | Static batching, B=4 | `liteinfer-eager` | removed |
 | `liteinfer-native-eager-b4` | Static batching, B=4, plain tensors | `liteinfer-native-eager` | removed |
 | `liteinfer-paged-b4` | Static batching, B=4, paged | `liteinfer-paged` | removed |
-| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | **current** |
+| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | eager kernel |
+| `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | **current** |
 | `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
+
+`liteinfer-continuous` stays runnable rather than becoming `historical`: it is the
+same engine with `attn_implementation="eager"`, which is the parity reference the
+fused kernel is checked against, not a superseded design.
 
 ---
 
@@ -230,7 +235,9 @@ claims can only be re-validated against an old tree.
 An 8x longer prompt costs liteinfer 2.1x throughput while vLLM gives up 1.6x, so
 the gap widens from 3.3x to 4.4x. The bottom two rows are also the ones the sweep
 was worth running for: on the first pass liteinfer did not produce them at all. It
-died with an out-of-memory in `softmax`, and only vLLM finished the shape.
+died with an out-of-memory in `softmax`, and only vLLM finished the shape. Both
+halves of that failure are now fixed — the pool below, the allocation itself in
+the section after it.
 
 Eager attention materialises the score matrix and the softmax upcasts it to fp32:
 at 32 sequences × 32 heads × 1024², that is 4.00 GiB in one allocation. vLLM never
@@ -243,9 +250,50 @@ out of memory while holding ~29 GiB of KV space it was structurally unable to
 reach. Sizing the pool to that ceiling freed the surplus, which is why the shape
 runs at all.
 
-The materialisation itself is untouched and will fail again at longer prompts or
-wider batches. §3.3 is the real fix; right-sizing the pool only stops it stealing
-the memory attention needs.
+The materialisation itself is untouched by that fix and fails again at longer
+prompts or wider batches. Removing it is §3.3, below.
+
+### The fused kernel buys prompt length, not throughput
+
+Attention now goes through `torch.nn.functional.scaled_dot_product_attention`,
+which tiles the softmax and never assembles the score matrix. Measured directly
+on one attention call — 4 sequences × 32 heads × 2048 tokens, bf16, the mask the
+engine actually builds:
+
+| kernel | peak allocation for the call |
+|---|---:|
+| `eager` | 5,192 MiB |
+| `sdpa` | 96 MiB |
+
+End to end it changes almost nothing until it changes everything. Both kernels
+re-measured on the same tree, same datasets:
+
+| shape | `eager` | `sdpa` | |
+|---|---:|---:|---:|
+| 128 / 256 | 1,344.4 | 1,445.5 | 1.08× |
+| 128 / 1024 | 937.9 | 959.7 | 1.02× |
+| 1024 / 256 | 645.2 | 711.1 | 1.10× |
+| 1024 / 1024 | 572.9 | 592.8 | 1.03× |
+| **2048 / 128** | **OOM** | **385.3** | *runs at all* |
+
+Four of those five rows are inside run-to-run variance: **this is not a
+speedup**, and the ~1.1× at 1024/256 is the top of the noise band rather than an
+effect. The last row is the whole feature. At ISL 2048 eager asks for
+**16.02 GiB in one allocation** and dies — 32 sequences × 32 heads × 2048², at
+4 bytes once the softmax upcasts — while `sdpa` completes the same workload.
+That number is the score matrix and nothing else, which is why removing it moves
+the ceiling and not the clock.
+
+It is worth being precise about which fix unlocked which shape. The ISL 1024
+rows ran before this change: **PR #20's pool sizing** freed the memory they
+needed, and both kernels serve them. ISL 2048 is the first shape only the fused
+kernel can reach.
+
+Which backend serves it is not the obvious one. Left-padded batches need an
+explicit additive mask, and FlashAttention accepts only `is_causal`, so PyTorch
+falls to its **memory-efficient** backend, which does take a mask and tiles the
+same way. Probed on these tensors: flash unavailable, mem-efficient available,
+and forcing the math fallback instead costs +4,872 MiB against its +32 MiB.
 
 ---
 
