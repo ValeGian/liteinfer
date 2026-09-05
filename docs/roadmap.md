@@ -253,6 +253,27 @@ listed.
 - **Parity test.** Unchanged output against `eager_attention`; the win is
   `latency` mode ITL plus peak memory, so measure both.
 
+### 3.6 Pack the batch instead of padding it
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** Prompts of different lengths are left-padded, so every attention call
+  needs an explicit additive mask to hide each row's pad prefix. That mask is
+  what keeps liteinfer off FlashAttention: PyTorch reports "Flash Attention does
+  not support non-null attn_mask", so SDPA falls to the memory-efficient
+  backend. Both tile the softmax, so §3.3's memory win is unaffected — but flash
+  is the faster of the two, and the padding also costs real compute on positions
+  that are thrown away. Verified: the same tensors with no mask and
+  `is_causal=True` make flash available.
+- **Scope.** Pack the batch as one flat token run plus cumulative sequence-length
+  offsets (`cu_seqlens`), the varlen entry point vLLM uses. Padding stops
+  existing, so `engine/attention_mask.py` has nothing to mask and `is_causal`
+  replaces it. Touches the runner's input builders, the cache's `slot_table`
+  right-alignment, and the null block, which exists to absorb padded positions.
+- **Unblocks.** §1.3 needs the same per-sequence length metadata to mix prefill
+  and decode in one pass, so this is its prerequisite as much as its own change.
+- **Parity test.** Greedy output unchanged on a variable-length batch, which is
+  the case padding exists to serve.
+
 ---
 
 ## 4. Modeling and parity

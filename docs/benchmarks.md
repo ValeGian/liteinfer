@@ -248,9 +248,26 @@ out of memory while holding ~29 GiB of KV space it was structurally unable to
 reach. Sizing the pool to that ceiling freed the surplus, which is why the shape
 runs at all.
 
-The materialisation itself is untouched and will fail again at longer prompts or
-wider batches. §3.3 is the real fix; right-sizing the pool only stops it stealing
-the memory attention needs.
+The materialisation itself is untouched by that fix and fails again at longer
+prompts or wider batches. Removing it is §3.3, below.
+
+### The fused kernel removes the allocation, not the time
+
+Attention now goes through `torch.nn.functional.scaled_dot_product_attention`,
+which tiles the softmax and never assembles the score matrix. Measured directly
+on one attention call — 4 sequences × 32 heads × 2048 tokens, bf16, the mask the
+engine actually builds:
+
+| kernel | peak allocation for the call |
+|---|---:|
+| `eager` | 5,192 MiB |
+| `sdpa` | 96 MiB |
+
+Which backend serves it is not the obvious one. Left-padded batches need an
+explicit additive mask, and FlashAttention accepts only `is_causal`, so PyTorch
+falls to its **memory-efficient** backend, which does take a mask and tiles the
+same way. Probed on these tensors: flash unavailable, mem-efficient available,
+and forcing the math fallback instead costs +4,872 MiB against its +32 MiB.
 
 ---
 
