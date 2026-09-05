@@ -1,5 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""Sampler — logits → token ids, per-row Python loop."""
+"""Sampler — logits → token ids."""
 
 from __future__ import annotations
 
@@ -21,13 +21,30 @@ class Sampler:
         logits: torch.Tensor,  # shape: [batch, vocab]
         params: list[SamplingParams],  # one entry per row of `logits`
     ) -> torch.Tensor:  # shape: [batch], dtype long
+        """Sample one token per row.
+
+        Greedy rows do not depend on their parameters — the answer is the
+        argmax either way — so they are taken together in one kernel rather
+        than one per row. Stochastic rows each need their own temperature,
+        top-k, top-p and RNG stream, so they stay a loop.
+        """
         if logits.ndim != 2:
             raise ValueError(f"expected 2D logits, got shape {tuple(logits.shape)}")
         if len(params) != logits.shape[0]:
             raise ValueError(f"params length {len(params)} != batch size {logits.shape[0]}")
+
+        is_greedy = [p.greedy or p.top_k == 1 for p in params]
+        if all(is_greedy):
+            return torch.argmax(logits, dim=-1)
+
         out = torch.empty(logits.shape[0], dtype=torch.long, device=logits.device)
+        greedy_rows = [i for i, greedy in enumerate(is_greedy) if greedy]
+        if greedy_rows:
+            rows = torch.tensor(greedy_rows, device=logits.device)
+            out[rows] = torch.argmax(logits[rows], dim=-1)
         for i, p in enumerate(params):
-            out[i] = self._sample_one(logits[i], p)
+            if not is_greedy[i]:
+                out[i] = self._sample_one(logits[i], p)
         return out
 
     def _sample_one(self, row_logits: torch.Tensor, p: SamplingParams) -> torch.Tensor:

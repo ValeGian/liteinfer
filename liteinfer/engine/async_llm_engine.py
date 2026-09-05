@@ -263,8 +263,9 @@ class AsyncLLMEngine:
         self._step_idx += 1
 
     def _apply_sampled(self, seqs: list[Sequence], sampled) -> None:
-        for i, seq in enumerate(seqs):
-            token_id = int(sampled[i].item())
+        # One transfer for the batch: `.item()` per row is a separate
+        # device-to-host copy, and each one stalls the pipeline behind it.
+        for seq, token_id in zip(seqs, sampled.tolist(), strict=True):
             seq.output_token_ids.append(token_id)
             seq.detokenizer.update(self.tokenizer, seq.output_token_ids)
             self._maybe_finish(seq, token_id)

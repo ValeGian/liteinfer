@@ -344,11 +344,17 @@ removing one worth ~17% shows up as 1.15×, which is. The fix is the same code i
 both rows — what changes is how much there was to remove, and that is a property
 of the workload. A shorter benchmark would have found nothing here.
 
-Inside the forward pass, one decode step at B=32 profiles as 14.68 ms wall
+Sampling was the next item that showed up here, at 10.7% of loop time: a Python
+loop taking one `argmax` per row, and then one `.item()` per row to read the
+tokens back. Taking the greedy rows in a single kernel and the batch in a single
+`.tolist()` drops it to **3.1%**, worth 1.07x end to end.
+
+Inside the forward pass, one decode step at B=32 profiles as 14.75 ms wall
 against a 3.56 ms weight-read floor: 11.08 ms of GPU work spread over **883
-kernel launches**, and 3.60 ms — a quarter of the step — with the GPU idle
+kernel launches**, and 3.67 ms — a quarter of the step — with the GPU idle
 waiting for Python to issue the next one. That idle quarter is what §3.2's CUDA
-graphs recover.
+graphs recover, and it is unchanged by the sampling fix: sampling sits outside
+the forward pass, so it was never what the GPU was waiting for.
 
 ---
 

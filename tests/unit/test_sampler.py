@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+import pytest
 import torch
 
 from liteinfer.sampling.params import SamplingParams
@@ -400,3 +401,58 @@ def test_1d_logits_raise_value_error() -> None:
     import pytest
     with pytest.raises(ValueError, match="2D"):
         sampler(torch.randn(8), [SamplingParams()])
+
+
+# ---------------------------------------------------------------------------
+# Batched greedy: the fast path must not change which token wins (§7)
+# ---------------------------------------------------------------------------
+
+
+def test_all_greedy_batch_matches_row_by_row_argmax() -> None:
+    """The whole-batch shortcut must agree with taking each row on its own."""
+    torch.manual_seed(0)
+    logits = torch.randn(8, 50)
+    params = [SamplingParams(temperature=0.0) for _ in range(8)]
+
+    expected = torch.stack([torch.argmax(logits[i], dim=-1) for i in range(8)])
+    assert torch.equal(Sampler()(logits, params), expected)
+
+
+def test_mixed_batch_gives_greedy_rows_their_argmax() -> None:
+    """A stochastic neighbour must not disturb a greedy row's answer."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, 50)
+    params = [
+        SamplingParams(temperature=0.0),
+        SamplingParams(temperature=1.0, seed=1),
+        SamplingParams(temperature=0.0),
+        SamplingParams(temperature=1.0, seed=2),
+    ]
+
+    out = Sampler()(logits, params)
+    assert [int(out[0]), int(out[2])] == [
+        int(torch.argmax(logits[0])),
+        int(torch.argmax(logits[2])),
+    ]
+
+
+def test_mixed_batch_leaves_stochastic_rows_stochastic() -> None:
+    """The greedy shortcut must not swallow rows that asked to sample."""
+    logits = torch.zeros(2, 200)
+    logits[1, 7] = 0.01  # nearly uniform, so an argmax would be a giveaway
+    params = [SamplingParams(temperature=0.0), SamplingParams(temperature=100.0, seed=3)]
+
+    sampler = Sampler()  # one instance, so the seeded stream advances between draws
+    draws = {int(sampler(logits, params)[1]) for _ in range(30)}
+    assert len(draws) > 1
+
+
+def test_top_k_1_row_is_routed_through_the_greedy_path(monkeypatch) -> None:
+    """`top_k=1` is greedy by another name, and must not reach `_sample_one`."""
+    sampler = Sampler()
+    monkeypatch.setattr(
+        sampler, "_sample_one", lambda *a: pytest.fail("top_k=1 should take the greedy path")
+    )
+    logits = torch.randn(3, 20)
+
+    sampler(logits, [SamplingParams(temperature=0.7, top_k=1) for _ in range(3)])

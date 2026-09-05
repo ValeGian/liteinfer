@@ -238,7 +238,11 @@ listed.
   | CUDA kernels launched per step | **883** |
 
   Graph replay collapses those 883 launches into one, so the idle quarter is
-  what it directly recovers — about 1.3x before any kernel gets faster. It is
+  what it directly recovers — about 1.3x before any kernel gets faster.
+  Re-measured after §7 vectorised the sampler, in case those per-row `.item()`
+  syncs were part of the idle: **unchanged at 14.75 ms, 25% idle, 883
+  launches**. Sampling sits outside the forward pass, so it never was — this
+  item is worth its full size. It is
   also the only item that attacks the deficit the benchmark has shown all along:
   liteinfer sits at 0.28-0.35x of vLLM at *every* batch width, and a gap that
   stays flat as concurrency grows is a fixed per-step cost, not an algorithmic
@@ -423,8 +427,6 @@ listed.
 
 ## 7. Hygiene / housekeeping
 
-- Vectorize `Sampler.__call__` per-row loop when params are homogeneous across
-  batch. §6.4 measures it at 5.5-7% of loop time, steady across output lengths.
 - Trim `EngineStats`: six derived throughput properties, the `on_step`
   listener and four running totals have no callers outside their own tests.
 - Fix the five `reportOptionalMemberAccess` errors pyright reports on package
