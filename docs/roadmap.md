@@ -239,6 +239,11 @@ listed.
 
   Graph replay collapses those 883 launches into one, so the idle quarter is
   what it directly recovers — about 1.3x before any kernel gets faster.
+  It has a second payoff §3.5 discovered the hard way: a captured graph runs a
+  *fixed* shape, and a fixed shape is the one condition under which cuDNN's
+  broadcast-KV attention is worth having. Capture would make §3.5 viable as a
+  side effect.
+
   These numbers have been re-measured twice, because two other changes might
   have eaten into them. §7's sampler vectorisation did not: sampling sits
   outside the forward pass, and the step was unchanged at 14.75 ms, 25% idle,
@@ -268,59 +273,39 @@ listed.
 - **Surface change.** Loader streams shards onto the right rank;
   attention layers all-reduce.
 
-### 3.5 Broadcast the grouped-query heads on the cuDNN backend
+### 3.5 Broadcast the grouped-query heads instead of expanding them
 - **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Two costs, one fix. `_repeat_kv` materialises a 4x copy of K and V so
-  8 KV heads line up with 32 query heads, and the expanded tensors then make the
-  attention kernel read four times the KV it needs. Asking the kernel to
-  broadcast instead removes both — but *only on the right backend*, and picking
-  it is the whole content of this item.
+- **Blocked on.** A decode shape that stops changing every step. See below.
+- **Why it is worth wanting.** `_repeat_kv` materialises a 4x copy of K and V so
+  8 KV heads line up with 32 query heads: **0.74 GiB of writes per decode step**
+  at 32 sequences, about 15% of GPU time, on top of making the attention kernel
+  read four times the KV it needs. `scaled_dot_product_attention(...,
+  enable_gqa=True)` broadcasts the heads inside the kernel instead. On a fixed
+  shape the pair is worth 4.7x on the attention call — 0.223 ms to 0.047 ms.
+- **Why it does not work.** Only the cuDNN backend will broadcast heads under an
+  additive mask (memory-efficient refuses mismatched head counts, flash refuses
+  the mask, and the default dispatch then falls to maths, which materialises the
+  score matrix and undoes §3.3). And cuDNN builds an execution plan per shape.
+  Decode grows the KV length by one every step, so every step is a new shape:
 
-  Measured on one attention call, bf16, with the mask the engine builds:
+  | attention call, B=32 | `_repeat_kv` + memory-efficient | cuDNN + `enable_gqa` |
+  |---|---:|---:|
+  | fixed shape | 0.223 ms | **0.047 ms** |
+  | shape grows by 1 each call | 0.293 ms | **36.177 ms** |
+  | padded to 64-token buckets | 0.345 ms | 0.352 ms |
 
-  | | peak | decode B=32 ctx 2048 | ctx 256 | prefill B=8 len 1024 |
-  |---|---:|---:|---:|---:|
-  | expanded heads *(ships today)* | 96 MiB | 2.329 ms | 0.312 ms | 1.632 ms |
-  | `enable_gqa`, default dispatch | **4,904 MiB** | — | — | — |
-  | `enable_gqa` on **cuDNN** | **32 MiB** | **0.229 ms** | **0.047 ms** | 1.706 ms |
-
-  **6.7-10x on the decode attention kernel**, a third of the memory, and roughly
-  neutral on prefill — which is the right trade, since a request pays prefill
-  once and decode hundreds of times.
-- **Why it is not automatic.** PyTorch will not choose this on its own. With
-  broadcast heads and a mask, the memory-efficient backend refuses ("both fused
-  kernels require query, key and value to have the same num_heads") and flash is
-  already out on the mask, so the default dispatch falls to **math**, which
-  materialises the score matrix and undoes §3.3 — the 4,904 MiB row. cuDNN
-  attention serves it, but is runtime-disabled by default in this build, so it
-  has to be selected explicitly with
-  `torch.nn.attention.sdpa_kernel(SDPBackend.CUDNN_ATTENTION)`.
-- **Scope.** Select the backend explicitly in `sdpa_attention` and drop
-  `_repeat_kv` on that path; `eager_attention` keeps the expansion, since writing
-  it out is what makes it the readable reference. **A fallback is required**: on
-  a machine where cuDNN attention is unavailable, forcing it raises "No available
-  kernel", and the broadcast path cannot fall back to memory-efficient — it has
-  to fall back to expanding the heads. That fallback is the reason this is not a
-  one-line change.
-- **Predicted effect, written before the run.** Amdahl caps this well below the
-  kernel number. Attention is 1.57 ms of a 14.68 ms decode step (14.2% of the
-  11.08 ms the GPU is busy; the other 3.60 ms it is idle). A 10x attention
-  kernel therefore buys **1.11x** on the step, or about **1.13-1.16x** once the
-  `_repeat_kv` expansion goes with it — against a 1.1x threshold and ±4%
-  run-to-run variance. The end-to-end benchmark figure will move less again,
-  since prefill is neutral and some of the wall is outside the forward pass
-  (§6.4). **Do not report the 6.7-10x as a liteinfer speedup**; it is a kernel
-  measurement, and quoting it as an engine result is the mistake this item has
-  already made three times in other forms.
-- **Parity test.** The kernels differ by ~1e-3 in bf16 here, more than the
-  current path, so pin equivalence in fp32 as §3.3 did — and assert peak memory
-  no worse than the expanded-head path, since numerical agreement is exactly the
-  check that misses a math-backend fallback.
-- **Note.** An earlier version of this item claimed `enable_gqa` was verified
-  viable, then that it was blocked on §3.6. Both were wrong: the first tested
-  values and not memory, the second assumed the mask was the obstacle when the
-  obstacle was the backend.
+  Shipped into the engine it measured **0.64x** at ISL 128 / OSL 256 and 0.84x
+  at OSL 1024 — a large regression, reverted. Bucketing the KV length cuts 128
+  distinct shapes to 3 and brings cuDNN back to *parity*, not to a win: three
+  plan searches amortised over a run still cost about what the copy did.
+- **What would unblock it.** An attention shape that is genuinely constant over
+  many steps, so the plan cost amortises to nothing — which is what §3.2's
+  capture at padded widths would create. The two belong together: §3.2 makes the
+  shape static, and a static shape is what makes this worth doing.
+- **Parity test.** Unchanged output against `eager_attention`, peak memory no
+  worse than the expanded-head path, **and a decode benchmark rather than a
+  kernel benchmark** — a fixed-shape microbenchmark reports this change as a
+  4.7x win when in the engine it is a 1.6x loss.
 
 ### 3.6 Pack the batch instead of padding it
 - **Status.** `planned`

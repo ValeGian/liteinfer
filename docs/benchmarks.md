@@ -364,6 +364,31 @@ for Python to issue the next one. That idle fifth is what §3.2's CUDA graphs
 recover. It was a quarter before the transfers were fixed, and unchanged by the
 sampling fix, because sampling sits outside the forward pass.
 
+### A kernel benchmark is not an engine benchmark
+
+Worth recording because it cost a day and nearly shipped a regression. Attention
+expands 8 KV heads to 32 with a real copy — 0.74 GiB of writes per decode step,
+~15% of GPU time. `scaled_dot_product_attention(..., enable_gqa=True)` asks the
+kernel to broadcast instead, and only cuDNN will do that under an additive mask.
+Benchmarked on one attention call it looked decisive:
+
+| attention call, B=32 | `_repeat_kv` + memory-efficient | cuDNN + `enable_gqa` |
+|---|---:|---:|
+| fixed shape | 0.223 ms | **0.047 ms** |
+| shape grows by 1 each call | 0.293 ms | **36.177 ms** |
+| padded to 64-token buckets | 0.345 ms | 0.352 ms |
+
+The first row is the one a microbenchmark reports. The second is what decode
+actually does: the KV length grows by one every step, and cuDNN builds an
+execution plan per shape. In the engine it measured **0.64x** at ISL 128 /
+OSL 256 — reverted.
+
+This is the fourth change in a row where the component measurement and the
+engine measurement disagreed, and the first where they disagreed about the
+*sign*. The other three read 30-60% high. The rule the benchmark exists to
+enforce: **measure the component to find the target, measure the engine to size
+it** — and never ship on the first number alone.
+
 ---
 
 ## Certification
