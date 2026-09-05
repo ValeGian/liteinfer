@@ -4,6 +4,17 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — Vectorised sampling
+
+- **PRs.** [#26](https://github.com/ValeGian/liteinfer/pull/26)
+- **What.** `Sampler.__call__` ran a Python loop over rows, taking one `argmax` per sequence, and `_apply_sampled` then pulled each token back with its own `.item()` — 32 separate device-to-host copies per step. Greedy rows do not depend on their parameters, so they are now taken together in one kernel, and the batch comes back in one `.tolist()`. Stochastic rows still need their own temperature, top-k, top-p and RNG stream, so they stay a loop.
+- **Measured in isolation.** One batched `argmax` against the per-row loop: 1.271 → 0.040 ms, 31.5x. One `.tolist()` against 32 `.item()` calls: 0.372 → 0.014 ms, 27x.
+- **Measured in the engine.** The `sample` stage (§6.4) falls from 10.7% of loop time to **3.1%** at OSL 256, and from 8.6% to **2.4%** at OSL 1024. In the harness, 1,509.7 → **1,614.7** tok/s at ISL 128 / OSL 256 and 1,106.4 → **1,173.0** at OSL 1024 — 1.07x and 1.06x.
+- **The prediction was 1.12x and the answer was 1.07x.** The error was the denominator: 1.588 ms of avoidable work against a *14.68 ms decode step*, when sampling is not inside that step. Against loop time the sum is 7.6%, which predicts 1.08x — and that is what happened. A saving is only as large as the total it is measured against.
+- **A guess that did not survive.** Ranking this item, I argued it would partly displace §3.2, on the theory that 32 per-row `.item()` syncs were stalling the pipeline and inflating the "25% GPU idle" figure. Re-profiled afterwards: the forward-only step is **unchanged** at 14.75 ms, 25% idle, 883 launches. Sampling happens outside the forward pass, so it was never part of that idle. §3.2 is worth its full size.
+
+---
+
 ## 05-09-2026 — §5.2 Incremental detokenization
 
 - **PRs.** [#25](https://github.com/ValeGian/liteinfer/pull/25)
