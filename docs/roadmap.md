@@ -237,21 +237,36 @@ listed.
 - **Surface change.** Loader streams shards onto the right rank;
   attention layers all-reduce.
 
-### 3.5 Let SDPA expand the grouped-query heads
+### 3.5 Let SDPA broadcast the grouped-query heads
 - **Status.** `planned`
-- **PRs.** follow-up to §3.3
-- **Why.** `models/attention.py` still calls `_repeat_kv` before both kernels,
+- **Blocked on.** §3.6. Attempted ahead of it and reverted — see below.
+- **Why.** `eager_attention` and `sdpa_attention` both call `_repeat_kv` first,
   materialising a 4x copy of K and V so 8 KV heads line up with 32 query heads.
-  The profile put ~10% of decode GPU time in `clone`, almost all of it that
-  copy. `scaled_dot_product_attention(..., enable_gqa=True)` broadcasts the KV
-  heads inside the kernel instead, which removes the copy and the memory it
-  holds. Measured viable: it dispatches on this torch and agrees with the eager
-  kernel to 2 bf16 ULP.
-- **Scope.** Pass `enable_gqa` from `sdpa_attention` and stop expanding on that
-  path; `eager_attention` keeps `_repeat_kv`, since writing the expansion out is
-  what makes it the readable reference.
-- **Parity test.** Unchanged output against `eager_attention`; the win is
-  `latency` mode ITL plus peak memory, so measure both.
+  The profile put ~10% of decode GPU time in `clone`, almost all of it that copy.
+  `scaled_dot_product_attention(..., enable_gqa=True)` broadcasts the heads
+  inside the kernel instead.
+- **Why it cannot be done yet.** With an attention mask, broadcast KV heads take
+  SDPA off its fused backends and onto the math fallback, which materialises the
+  score matrix — exactly what §3.3 removed. Measured on one attention call,
+  4 seqs × 32 heads × 2048 tokens, bf16:
+
+  | | peak |
+  |---|---:|
+  | mask + expanded heads *(what ships today)* | 96 MiB |
+  | mask + `enable_gqa` | **4,904 MiB** |
+  | no mask + `enable_gqa` | 33 MiB |
+
+  So the change is a large regression before §3.6 and an improvement on today
+  after it — 33 MiB against the current 96. Numerical agreement is not the test
+  that matters here: values match to 2 bf16 ULP in every one of those rows, and
+  the memory is what separates them. `tests/unit/test_attention_kernels.py
+  ::test_sdpa_does_not_materialise_the_score_matrix` is what caught the
+  regression; keep it pointed at whatever the fused path is.
+- **Scope.** Once the mask is gone, pass `enable_gqa` from `sdpa_attention` and
+  drop `_repeat_kv` on that path. `eager_attention` keeps the expansion, since
+  writing it out is what makes it the readable reference.
+- **Parity test.** Unchanged output against `eager_attention`, *and* peak memory
+  no worse than the expanded-head path.
 
 ### 3.6 Pack the batch instead of padding it
 - **Status.** `planned`
@@ -270,7 +285,10 @@ listed.
   replaces it. Touches the runner's input builders, the cache's `slot_table`
   right-alignment, and the null block, which exists to absorb padded positions.
 - **Unblocks.** §1.3 needs the same per-sequence length metadata to mix prefill
-  and decode in one pass, so this is its prerequisite as much as its own change.
+  and decode in one pass, and §3.5 cannot be done at all until the mask is gone —
+  so this is their prerequisite as much as its own change. Removing the mask is
+  worth more than it first looks: it is the single condition standing between
+  liteinfer and both remaining attention improvements.
 - **Parity test.** Greedy output unchanged on a variable-length batch, which is
   the case padding exists to serve.
 
