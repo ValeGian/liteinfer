@@ -4,6 +4,17 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — One transfer per step, not one per sequence
+
+- **PRs.** [#27](https://github.com/ValeGian/liteinfer/pull/27)
+- **What.** Two per-step tensors were built by looping over sequences in Python, each iteration making its own `torch.tensor(..., device=cuda)` — a separate **pageable** host-to-device copy, which blocks. `slot_table` did it once per sequence to assemble the block tables, and `build_continuous_decode_mask` did a slice assignment per sequence to write its pad prefix. Both now pad on the host and move the batch in a single transfer. `slot_table` also read `int(count.max())` off the device to learn a width the Python counts already knew, which synced the whole queue every step; it uses `max(counts)`.
+- **Measured.** Host-to-device copies per decode step fall from **35 to 5**, kernels from 883 to 822, and the step from 14.75 to **13.96 ms** — GPU idle 3.67 → **2.93 ms**. In the harness, 1,614.7 → **1,732.8** tok/s at ISL 128 / OSL 256 and 1,173.0 → **1,230.4** at OSL 1024, so 1.07x and 1.05x.
+- **How it was found.** Not from the roadmap — from counting the 883 kernel launches after §7, looking for what §3.2 would have to capture. The 35 pageable memcpys stood out because their *count* tracked the batch size, which is the signature of a Python loop over sequences.
+- **The isolated numbers over-predicted again.** Benchmarked on their own the two functions saved 1.021 + 0.290 = 1.31 ms; in the engine the step moved 0.79 ms, about 60% of that. The isolated figures include synchronisation that partly overlapped with real work. This is the third time in a row that a microbenchmark has read high — §3.5's 10x kernel win predicted 1.15x end to end, §7's predicted 1.12x and gave 1.07x — and the pattern is worth keeping: **measure the component to find the target, measure the engine to size it.**
+- **§3.2 re-sized.** Its case rested on 883 launches and a 25% idle step. Both were partly this: it is now 822 launches and 21%, which is what CUDA graphs actually stand to recover. The roadmap entry carries the corrected numbers rather than the ones that made the item look biggest.
+
+---
+
 ## 05-09-2026 — Vectorised sampling
 
 - **PRs.** [#26](https://github.com/ValeGian/liteinfer/pull/26)

@@ -349,12 +349,20 @@ loop taking one `argmax` per row, and then one `.item()` per row to read the
 tokens back. Taking the greedy rows in a single kernel and the batch in a single
 `.tolist()` drops it to **3.1%**, worth 1.07x end to end.
 
-Inside the forward pass, one decode step at B=32 profiles as 14.75 ms wall
-against a 3.56 ms weight-read floor: 11.08 ms of GPU work spread over **883
-kernel launches**, and 3.67 ms — a quarter of the step — with the GPU idle
-waiting for Python to issue the next one. That idle quarter is what §3.2's CUDA
-graphs recover, and it is unchanged by the sampling fix: sampling sits outside
-the forward pass, so it was never what the GPU was waiting for.
+Counting those launches found the next item, which was not on the roadmap at
+all. Two per-step tensors — the cache's block tables and the decode mask — were
+built by looping over sequences in Python, one `torch.tensor(..., device=cuda)`
+per sequence. Those are pageable copies, and pageable copies block: **35 of them
+per decode step**, a count that tracked the batch size, which is the signature
+of a per-sequence loop. Padding on the host and moving the batch in one transfer
+leaves 5.
+
+Inside the forward pass, one decode step at B=32 now profiles as 13.96 ms wall
+against a 3.56 ms weight-read floor: 11.02 ms of GPU work spread over **822
+kernel launches**, and 2.93 ms — a fifth of the step — with the GPU idle waiting
+for Python to issue the next one. That idle fifth is what §3.2's CUDA graphs
+recover. It was a quarter before the transfers were fixed, and unchanged by the
+sampling fix, because sampling sits outside the forward pass.
 
 ---
 
