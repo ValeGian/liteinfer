@@ -43,8 +43,30 @@ print(f'{major}.{minor}.{patch}')
 
 printf "Bumping %s → %s (%s)\n" "$CURRENT" "$NEW" "$BUMP"
 
-sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" pyproject.toml
-sed -i "s/^__version__ = \"$CURRENT\"/__version__ = \"$NEW\"/" liteinfer/__init__.py
+# Rewrite in python3 rather than `sed -i`: BSD sed (macOS) reads the argument
+# after -i as a backup suffix, so the GNU-style one-liner is not portable.
+python3 - "$CURRENT" "$NEW" <<'PY'
+import pathlib
+import re
+import sys
+
+current, new = sys.argv[1], sys.argv[2]
+targets = {
+    "pyproject.toml": 'version = "{}"',
+    "liteinfer/__init__.py": '__version__ = "{}"',
+}
+
+# Anchor at line start so a version pin nested elsewhere in the file is not hit.
+for path, template in targets.items():
+    file = pathlib.Path(path)
+    content = file.read_text()
+    old_line, new_line = template.format(current), template.format(new)
+    pattern = re.compile("^" + re.escape(old_line) + "$", re.MULTILINE)
+    if not pattern.search(content):
+        sys.exit(f"error: could not find '{old_line}' in {path}")
+    # A lambda replacement keeps re from interpreting escapes in the new version line.
+    file.write_text(pattern.sub(lambda _match: new_line, content, count=1))
+PY
 
 git add pyproject.toml liteinfer/__init__.py
 git commit -m "chore: release v${NEW}"
