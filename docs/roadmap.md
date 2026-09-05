@@ -129,7 +129,7 @@ listed.
   It also bounds peak activation memory: a chunk size caps how many prefill
   tokens enter one pass, so prompt length stops setting the size of the
   largest allocation. That is the second half of the ISL 1024 failure
-  (`docs/benchmarks.md`, "liteinfer could not run ISL 1024 at all") — §3.3
+  (`docs/benchmarks.md`, "Long prompts are liteinfer's weak shape") — §3.3
   removes the score matrix, §1.3 caps what feeds it.
 - **Scope.** Requires a flash-attention-style kernel that accepts
   per-sequence key-length metadata (block tables + variable query
@@ -233,8 +233,8 @@ listed.
 - **Why.** This is a capability gate, not a speedup. Eager attention
   materialises the full `[batch, heads, q, k]` score matrix, and softmax
   upcasts it to fp32: at ISL 1024 / B=32 that is 4.00 GiB in one allocation,
-  and liteinfer dies where vLLM completes (`docs/benchmarks.md`, "liteinfer
-  could not run ISL 1024 at all"). SDPA never materialises it. Vendored
+  and liteinfer died where vLLM completed (`docs/benchmarks.md`, "Long
+  prompts are liteinfer's weak shape"). SDPA never materialises it. Vendored
   modeling already supports `_attn_implementation` switching; loader pins
   `eager` for v0.
 - **Scope.** Allow `EngineConfig.attn_implementation` and pass through
