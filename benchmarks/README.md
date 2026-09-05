@@ -21,6 +21,18 @@ bench run --all --dataset "$DS" --mode latency    -n 50
 bench report --out docs/index.html
 ```
 
+Sweep a grid of shapes — a speedup measured at one shape is a claim about that
+shape only:
+
+```bash
+bench sweep --config liteinfer-continuous vllm-continuous \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --isl 128 1024 --osl 256 1024 --mode throughput -n 200 --gpus 0 1
+```
+
+Missing datasets are generated as needed, and `bench report` grows a
+*across shapes* table whenever more than one shape has results.
+
 Run one config while iterating:
 
 ```bash

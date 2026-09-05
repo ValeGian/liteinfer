@@ -1,0 +1,26 @@
+{
+  "config": "liteinfer-continuous",
+  "engine": "liteinfer",
+  "description": "Continuous batching, up to 32 concurrent sequences",
+  "baseline": "liteinfer-paged-b4",
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-09-05T13:31:03+00:00",
+  "dataset": {
+    "path": "benchmarks/datasets/isl128_osl1024_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": 128,
+    "target_osl": 1024,
+    "num_samples": 200,
+    "sha256": "d97d71495aff03159e2deb9e9a6e918dc6698b03311bd955a7d6f8b306273cb8"
+  },
+  "summary": {
+    "output_tokens_per_s": 942.2626590259893,
+    "requests_per_s": 0.9201783779550676,
+    "wall_time_s": 217.34916271828115
+  },
+  "raw": {
+    "wall_time_s": 217.34916271828115,
+    "output_tokens": 204800
+  }
+}

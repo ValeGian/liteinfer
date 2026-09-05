@@ -4,6 +4,13 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — §8.3 Sequence-length sweep
+
+- **PRs.** _none yet_
+- **What.** `bench sweep` runs the configs across a grid of (ISL, OSL) shapes, generating any missing datasets, and `bench report` grows an *across shapes* table once more than one shape has results — because a ratio measured at one shape is a claim about that shape only. The sweep earned itself twice over on its first run. It showed that the KV cache's advantage is strongly shape-dependent: measured on the pre-#17 tree, where `liteinfer-nocache` still exists, the cache is worth 1.15x at OSL 256, 1.61x at OSL 512 and 2.88x at OSL 1024 — cached throughput stays flat (69.5, 71.9, 69.6 tok/s) while the recompute path collapses (60.7, 44.6, 24.1). The 1.21x recorded at ISL 128 / OSL 256 was the weakest point on that curve, not a general figure. It also found that liteinfer could not run ISL 1024 at all: eager attention materialises a `[32, 32, 1024, 1024]` score matrix, which the softmax upcasts to fp32 — 4 GiB in a single allocation — and the run died where vLLM completed. Removing that materialisation is §3.3; the KV pool's share of the blame is fixed separately.
+
+---
+
 ## 29-08-2026 — §5.4 Per-request failure isolation
 
 - **PRs.** [#17](https://github.com/ValeGian/liteinfer/pull/17)

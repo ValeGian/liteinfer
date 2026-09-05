@@ -163,3 +163,26 @@ def test_html_reports_an_empty_results_dir() -> None:
 
 def test_text_reports_an_empty_results_dir() -> None:
     assert report.as_text([]) == "No results found."
+
+
+def test_shapes_are_collected_across_results() -> None:
+    long_prompt = _throughput("liteinfer-continuous", 900.0, dataset={"target_isl": 1024})
+    shapes, _ = report.by_shape([_throughput("liteinfer-continuous", 1200.0), long_prompt], "throughput")
+    assert shapes == [(16, 8), (1024, 8)]
+
+
+def test_each_config_reports_its_value_per_shape() -> None:
+    long_prompt = _throughput("liteinfer-continuous", 900.0, dataset={"target_isl": 1024})
+    _, values = report.by_shape([_throughput("liteinfer-continuous", 1200.0), long_prompt], "throughput")
+    assert values["liteinfer-continuous"] == {(16, 8): 1200.0, (1024, 8): 900.0}
+
+
+def test_a_single_shape_produces_no_trend_section() -> None:
+    page = report.as_html([_throughput("liteinfer-continuous", 1200.0)])
+    assert "across shapes" not in page
+
+
+def test_two_shapes_produce_a_trend_section() -> None:
+    long_prompt = _throughput("liteinfer-continuous", 900.0, dataset={"target_isl": 1024})
+    page = report.as_html([_throughput("liteinfer-continuous", 1200.0), long_prompt])
+    assert "across shapes" in page
