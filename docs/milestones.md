@@ -4,6 +4,13 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — KV pool sized to demand
+
+- **PRs.** _none yet_
+- **What.** The block pool took 85% of *free* VRAM and never asked how much the engine could actually use. `max_num_seqs` × `max_model_len` is a hard ceiling on how much KV can ever exist — 4.00 GiB for the default config — but the pool allocated 32.74 GiB, leaving 5.77 GiB for activations, and then died trying to allocate a 4.02 GiB attention score matrix while holding ~29 GiB it could never reach. The pool is now `min(affordable, reachable)`, which frees that surplus and lets ISL 1024 run at all (646.0 and 574.1 tok/s, previously OOM). Sizing is also no longer silent or fixed: it logs the size it chose and why, warns when memory rather than the workload is the binding constraint — which means the configured concurrency may exhaust the pool under load — and the hardcoded 0.85 becomes `EngineConfig.kv_cache_memory_fraction`, applied identically on CPU and CUDA so the knob is testable without a GPU. `BlockPool.nbytes` reports the footprint. Pool sizing previously had no tests at all, which is how an 8x oversize went unnoticed; it now has ten.
+
+---
+
 ## 05-09-2026 — §8.3 Sequence-length sweep
 
 - **PRs.** _none yet_
