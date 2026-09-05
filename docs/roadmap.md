@@ -97,7 +97,9 @@ When an item lands:
 1. Flip `Status` to `landed` and append the merging PR(s) to `PRs`.
 2. Move the item out of this file into `milestones.md`, under the
    current month's heading. Keep the `PRs` line so the milestone log
-   has the same audit trail.
+   has the same audit trail — **always link the PR, even before it is
+   merged**. A milestone written in the same PR that delivers it knows
+   its own number; `_none yet_` there is a link nobody goes back to add.
 3. If a follow-up is created (e.g. v1 lands but v2 is the polished
    version), leave a stub here with status `planned` and a backlink
    to the original PR.
@@ -124,6 +126,11 @@ listed.
   prefill tokens and decode tokens in the same batch tensor. This halves
   kernel launches in the common case and reduces TTFT for waiting
   sequences.
+  It also bounds peak activation memory: a chunk size caps how many prefill
+  tokens enter one pass, so prompt length stops setting the size of the
+  largest allocation. That is the second half of the ISL 1024 failure
+  (`docs/benchmarks.md`, "Long prompts are liteinfer's weak shape") — §3.3
+  removes the score matrix, §1.3 caps what feeds it.
 - **Scope.** Requires a flash-attention-style kernel that accepts
   per-sequence key-length metadata (block tables + variable query
   lengths). `ContinuousModelRunner` grows a `mixed_step(prefill_seqs,
@@ -173,6 +180,26 @@ listed.
 - **Risk.** Quality regression on long contexts; needs a tolerance
   parity test against fp16/bf16.
 
+### 2.6 KV pool sizing from a measured activation budget
+- **Status.** `planned`
+- **PRs.** follow-up to [#20](https://github.com/ValeGian/liteinfer/pull/20)
+- **Why.** #20 sized the pool as `min(affordable, reachable)`, which stops it
+  hoarding VRAM it can never address. `affordable` is still a guess: a fraction
+  of whatever happens to be free when `load_model` runs. Two consequences. It is
+  not reproducible — the same config on the same GPU sizes differently depending
+  on what else was resident a second earlier, which makes a benchmark's pool a
+  property of the machine's history. And the fraction is a stand-in for the real
+  question, which is how much memory the forward pass needs at full width.
+- **Scope.** Two steps, in order. First move the fraction to *total* VRAM, so
+  the size is a function of the config and the device only. Then replace it:
+  run one worst-case forward pass at `max_num_seqs` × `max_model_len` during
+  load, record peak allocation, and give the pool what is left — vLLM's
+  approach. The WARNING #20 added stays useful either way; it names which of
+  the two constraints bound the pool.
+- **Parity test.** Pool size is identical across two loads separated by an
+  unrelated allocation; profiled size leaves a forward pass at full width
+  headroom to complete.
+
 ---
 
 ## 3. Performance optimizations
@@ -203,8 +230,13 @@ listed.
 ### 3.3 Flash / SDPA attention
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** Vendored modeling already supports `_attn_implementation`
-  switching; loader pins `eager` for v0.
+- **Why.** This is a capability gate, not a speedup. Eager attention
+  materialises the full `[batch, heads, q, k]` score matrix, and softmax
+  upcasts it to fp32: at ISL 1024 / B=32 that is 4.00 GiB in one allocation,
+  and liteinfer died where vLLM completed (`docs/benchmarks.md`, "Long
+  prompts are liteinfer's weak shape"). SDPA never materialises it. Vendored
+  modeling already supports `_attn_implementation` switching; loader pins
+  `eager` for v0.
 - **Scope.** Allow `EngineConfig.attn_implementation` and pass through
   to `hf_config._attn_implementation`. Default to `sdpa` once parity
   proven.
@@ -251,10 +283,42 @@ listed.
 - **Status.** `planned`
 - **PRs.** _none yet_
 - **Why.** Stop-string detection currently re-decodes the entire
-  output every step (`engine/llm_engine.py::_maybe_finish`). Fine for
-  v0; pathological on long outputs.
+  output every step (`engine/stopping.py::resolve_stop_status`). Fine
+  for v0; pathological on long outputs.
 - **Scope.** Cache the last decoded suffix and only decode the new
   token's contribution.
+
+### 5.5 Backpressure on admission
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** `max_num_seqs` caps how many sequences run, not how many are
+  accepted. `AsyncLLMEngine._pending` and `ContinuousScheduler.waiting` are both
+  unbounded, so a caller that submits faster than the engine drains grows two
+  Python lists without limit until the process dies — and it dies holding
+  admitted work that never ran. Every production serving stack rejects or blocks
+  instead; that liteinfer does not is a gap, not a simplification.
+- **Scope.** `EngineConfig.max_waiting_seqs`, enforced in `add_request`. Decide
+  the failure mode explicitly: `await` on a bounded `asyncio.Queue` gives the
+  caller backpressure, raising gives it a fast 429-shaped answer. Prefer
+  raising — it is visible, and a hung `add_request` is the bug this item
+  exists to avoid.
+- **Parity test.** Submitting `max_waiting_seqs + 1` requests raises on the
+  last one and leaves the first ones running.
+
+### 5.6 Request cancellation
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** `FINISHED_ABORTED` only ever comes from the engine aborting a failed
+  forward pass (§5.4). A caller has no way to abort its own request: a client
+  that disconnects mid-stream, or an `async for` that breaks out early, leaves
+  the sequence running to `max_tokens`, holding a slot and its KV blocks. Under
+  a bounded batch that is capacity another request could have used.
+- **Scope.** `AsyncLLM.abort(request_id)` marking the sequence
+  `FINISHED_ABORTED` so the scheduler evicts it and frees its blocks on the next
+  step; `stream()` aborts on generator close, so breaking out of the loop does
+  the right thing without the caller knowing the API exists.
+- **Parity test.** Breaking out of `stream()` releases the sequence's blocks
+  back to the pool within one step.
 
 ---
 
@@ -287,6 +351,12 @@ listed.
   homogeneous across batch.
 - Trim `EngineStats`: six derived throughput properties, the `on_step`
   listener and four running totals have no callers outside their own tests.
+- Fix the five `reportOptionalMemberAccess` errors pyright reports on package
+  code: `hf_config` and `tokenizer` are declared optional because they are
+  assigned in `load_model` rather than `__init__`, so every read of them is an
+  error. Either construct the runner already loaded, or keep a loaded-state
+  object the type system can see. The remaining pyright output is
+  `reportPrivateImportUsage` against torch's re-exports, which is noise.
 
 ---
 
