@@ -4,6 +4,26 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — §6.4 The engine accounts for its own time
+
+- **PRs.** [#24](https://github.com/ValeGian/liteinfer/pull/24)
+- **What.** `EngineStats.time` is a `TimeBreakdown` charging every part of a step to a stage — `forward`, `sample`, `deliver`, `schedule` — with `unattributed` for what is left. The loop now accounts for 99% of its own wall time, so "where does it go" is a property you can read instead of a script someone has to write.
+- **Why it was needed.** Every performance item on the roadmap optimises the forward pass. Nothing had checked whether the forward pass is where the time is.
+- **What it found.** It is — but less so the longer the output runs, and the second-biggest item is not a kernel. Measured on 32 sequences, A40, Llama-3.2-1B:
+
+  | stage | OSL 256 | OSL 1024 |
+  |---|---:|---:|
+  | forward | 84.9% | 76.6% |
+  | **deliver** (detokenise) | **6.9%** | **16.9%** |
+  | sample | 7.0% | 5.5% |
+  | schedule | 0.3% | 0.2% |
+  | unattributed (asyncio, queues) | 1.0% | 0.8% |
+
+  `_build_event` re-decodes a sequence's whole output text every step, so four times the output length costs twelve times the detokenisation. That promotes §5.2 from a "fine for v0" nicety to the second-largest cost in the engine at OSL 1024, and it is pure Python with no kernel work involved. Scheduling and the asyncio round trip, which might plausibly have been suspects, are together under 1.5% and need no attention at all.
+- **A measurement bug fixed on the way.** `StepMetrics.wall_time_s` was documented as one forward pass but timed the forward pass *plus* sampling and the stop check. Sampling now has its own stage, so the two are no longer conflated — which is what made the 5.5-7% sampling cost visible as a separate line.
+
+---
+
 ## 05-09-2026 — §3.3 Fused SDPA attention
 
 - **PRs.** [#22](https://github.com/ValeGian/liteinfer/pull/22)

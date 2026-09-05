@@ -300,6 +300,37 @@ and forcing the math fallback instead costs +4,872 MiB against its +32 MiB.
 
 ---
 
+## Where the engine's time goes
+
+Every performance item on the roadmap optimises the forward pass. §6.4 added the
+attribution that checks whether the forward pass is where the time is:
+`EngineStats.time` charges each part of a step to a stage, and the loop accounts
+for 99% of its own wall time. Measured on 32 sequences, A40, Llama-3.2-1B:
+
+| stage | OSL 256 | OSL 1024 |
+|---|---:|---:|
+| forward pass | 84.9% | 76.6% |
+| **deliver** — one `StreamEvent` per sequence, which detokenises | **6.9%** | **16.9%** |
+| sample | 7.0% | 5.5% |
+| schedule | 0.3% | 0.2% |
+| unattributed — asyncio, queue puts | 1.0% | 0.8% |
+
+Two things worth taking from it. **Scheduling and the async plumbing are free** —
+together under 1.5%, and no candidate for optimisation despite being the parts
+that look most like overhead. And **detokenisation is not**: `_build_event`
+re-decodes a sequence's entire output text on every step, so four times the
+output length costs twelve times the work. At OSL 1024 it is the second-largest
+cost in the engine, ahead of sampling and behind only the model itself, and it
+keeps climbing with length. That is §5.2, and it needs no kernel work.
+
+Inside the forward pass, one decode step at B=32 profiles as 14.68 ms wall
+against a 3.56 ms weight-read floor: 11.08 ms of GPU work spread over **883
+kernel launches**, and 3.60 ms — a quarter of the step — with the GPU idle
+waiting for Python to issue the next one. That idle quarter is what §3.2's CUDA
+graphs recover.
+
+---
+
 ## Certification
 
 **Against vLLM's own tooling.** At the identical shape (ISL 128, OSL 256, 200

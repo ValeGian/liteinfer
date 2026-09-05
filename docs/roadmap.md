@@ -369,11 +369,25 @@ listed.
 ### 5.2 Incremental detokenization
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** Stop-string detection currently re-decodes the entire
-  output every step (`engine/stopping.py::resolve_stop_status`). Fine
-  for v0; pathological on long outputs.
-- **Scope.** Cache the last decoded suffix and only decode the new
-  token's contribution.
+- **Why.** `_build_event` decodes a sequence's **entire** output text on every
+  step, for every running sequence, so the work per token grows with the tokens
+  already generated. Measured with §6.4's attribution (32 sequences, A40):
+
+  | OSL | share of loop time | seconds |
+  |---:|---:|---:|
+  | 256 | 6.9% | 0.45 |
+  | 1024 | **16.9%** | 5.41 |
+
+  Four times the output length costs **twelve times** the detokenisation, which
+  is the quadratic showing through. At OSL 256 it is a minor cost; by OSL 1024
+  it is the second-largest item in the engine after the forward pass itself, and
+  it keeps climbing. `resolve_stop_status` re-decodes the same way when stop
+  strings are set.
+- **Scope.** Cache the last decoded suffix per sequence and decode only the new
+  token's contribution, in `_build_event` and in `resolve_stop_status`.
+- **Parity test.** Streamed text identical to the current full re-decode,
+  including across a multi-byte character split over two tokens — which is the
+  reason this is not simply string concatenation.
 
 ### 5.5 Backpressure on admission
 - **Status.** `planned`
@@ -423,36 +437,17 @@ listed.
 ### 6.2 Live dashboard runner
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** `EngineStats` now records a `StepMetrics` per forward pass
-  (§6.3), and nothing consumes it.
+- **Why.** `EngineStats` records a `StepMetrics` per forward pass (§6.3) and a
+  `TimeBreakdown` per loop (§6.4), and nothing consumes either.
 - **Scope.** `python -m liteinfer.dashboard` printing rolling
   prefill/decode tok/s, batch width and KV usage from the stats stream.
-
-### 6.4 Account for the time outside the forward pass
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Decode measured in isolation runs at **2,179 tok/s** at B=32, while
-  the benchmark's end-to-end figure at the same shape is **1,445 tok/s**. Some
-  of that difference is real work the isolated measurement skips — prefilling
-  200 prompts, and the ramp-up and drain where the batch is narrower than 32 —
-  and some is engine overhead: scheduling, sampling, detokenisation, the asyncio
-  round trip per token. **Nobody knows the split**, and the difference is large
-  enough that it could be worth more than any kernel item on this list. Every
-  performance item in §3 optimises the forward pass; this one asks whether the
-  forward pass is where the time is.
-- **Scope.** `StepMetrics` already records wall time per forward pass (§6.3), so
-  the engine loop can report forward time against total loop time and attribute
-  the remainder. No new measurement machinery, just a consumer of what is
-  already collected — which is also what §6.2 wants.
-- **Parity test.** None; this is a measurement. The result is a number, and it
-  decides what to optimise next.
 
 ---
 
 ## 7. Hygiene / housekeeping
 
-- Vectorize `Sampler.__call__` per-row loop when params are
-  homogeneous across batch.
+- Vectorize `Sampler.__call__` per-row loop when params are homogeneous across
+  batch. §6.4 measures it at 5.5-7% of loop time, steady across output lengths.
 - Trim `EngineStats`: six derived throughput properties, the `on_step`
   listener and four running totals have no callers outside their own tests.
 - Fix the five `reportOptionalMemberAccess` errors pyright reports on package

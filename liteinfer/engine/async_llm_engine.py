@@ -168,14 +168,19 @@ class AsyncLLMEngine:
         self.scheduler.add(seq)
 
     def _step(self) -> None:
-        finished = self.scheduler.remove_finished()
-        for seq in finished:
-            self.model_runner.deregister_sequence(seq)
-            queue = self._request_queues.pop(seq.request_id, None)
-            if queue is not None:
-                queue.put_nowait(None)
+        with self._timed("loop"):
+            self._run_step()
 
-        sched = self.scheduler.schedule()
+    def _run_step(self) -> None:
+        with self._timed("schedule", sync=False):
+            finished = self.scheduler.remove_finished()
+            for seq in finished:
+                self.model_runner.deregister_sequence(seq)
+                queue = self._request_queues.pop(seq.request_id, None)
+                if queue is not None:
+                    queue.put_nowait(None)
+            sched = self.scheduler.schedule()
+
         if not sched.prefill_seqs and not sched.decode_seqs:
             return
 
@@ -188,15 +193,25 @@ class AsyncLLMEngine:
                 self._abort(seqs, error)  # the pass failed, so its sequences cannot continue
                 return
 
-        newly_finished = 0
-        for seq in sched.all_seqs:
-            queue = self._request_queues.get(seq.request_id)
-            if queue is not None:
-                queue.put_nowait(self._build_event(seq))
-            if seq.is_finished:
-                newly_finished += 1
+        with self._timed("deliver", sync=False):
+            newly_finished = 0
+            for seq in sched.all_seqs:
+                queue = self._request_queues.get(seq.request_id)
+                if queue is not None:
+                    queue.put_nowait(self._build_event(seq))
+                if seq.is_finished:
+                    newly_finished += 1
 
         self.stats.num_requests_finished += newly_finished
+
+    def _timed(self, stage: str, sync: bool = True) -> StepTimer:
+        """Charge a block of the step to one stage of `stats.time`."""
+        return StepTimer(
+            self.model_runner.device,
+            self.stats.time if self.config.collect_stats else None,
+            stage,
+            sync=sync,
+        )
 
     def _fail(self, request_id: str, error: Exception) -> None:
         """Hand `error` to one waiting caller and forget the request."""
@@ -218,14 +233,17 @@ class AsyncLLMEngine:
 
         Prefill and decode are separate passes, so a step that admits new
         sequences records two — which is what makes the two-pass cost (§1.3)
-        visible in `stats`.
+        visible in `stats`. `StepMetrics.wall_time_s` is the pass itself;
+        sampling is charged to `stats.time.sample` instead, so the two are not
+        conflated.
         """
         run = self.model_runner.prefill if phase is Phase.PREFILL else self.model_runner.decode
         input_tokens = (
             sum(len(seq.prompt_token_ids) for seq in seqs) if phase is Phase.PREFILL else len(seqs)
         )
-        with StepTimer(self.model_runner.device) as timer:
+        with self._timed("forward") as timer:
             logits = run(seqs)
+        with self._timed("sample"):
             sampled = self.sampler(logits, [seq.sampling_params for seq in seqs])
             self._apply_sampled(seqs, sampled)
 
