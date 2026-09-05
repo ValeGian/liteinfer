@@ -158,12 +158,13 @@ listed.
 - **Status.** `planned`
 - **PRs.** _none yet_
 - **Why.** Paged gathers non-contiguous KV blocks into a contiguous buffer before
-  attention. Since the gather was vectorised that costs ~8-10% against
-  native-eager (0.92x throughput at B=1, 0.90x at B=4 and on ITL), and what is
-  left is memory traffic rather than overhead: the gather still copies the whole
-  K/V history every decode step. A fused paged-attention kernel reads the block
-  table inside the CUDA kernel and removes the copy entirely, the same approach
-  as vLLM's PagedAttention.
+  attention. That gather is now measured rather than inferred: profiled at B=32
+  it is `vectorized_gather_kernel` at **0.652 ms, 5.9% of GPU time** per decode
+  step. Worth having, and smaller than this item used to claim — the ~8-10%
+  figure it carried was measured at B=1 before the flat-slot rewrite, and is no
+  longer the number to plan against. A fused paged-attention kernel reads the
+  block table inside the CUDA kernel and removes the copy entirely, the same
+  approach as vLLM's PagedAttention.
 - **Scope.** Custom CUDA/Triton kernel for block-table attention;
   `ContinuousModelRunner` switches to it for the decode pass.
 - **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the entry point to
@@ -207,6 +208,12 @@ listed.
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
 - **PRs.** _none yet_
+- **Why.** Elementwise work is the second-largest slice of decode GPU time and
+  the most fusible: profiled at B=32, `elementwise_kernel` accounts for
+  **17.9% + 2.6% across ~143 launches per step** — RoPE, residual adds, norms
+  and the mask fills — against 30.1% for the projection GEMMs that actually do
+  the model's arithmetic. Fusion removes both the time and the launches, so this
+  overlaps §3.2; do §3.2 first and re-measure before sizing this one.
 - **Scope.** Wrap the `ContinuousModelRunner` forward passes in `torch.compile`,
   gated by `EngineConfig.enable_torch_compile`. First call pays
   compile cost; subsequent calls run the compiled graph.
@@ -218,6 +225,24 @@ listed.
 ### 3.2 CUDA graph capture for decode
 - **Status.** `planned`
 - **PRs.** _none yet_
+- **Why.** The largest measured cost in the decode path is not a kernel — it is
+  the gaps between kernels. Profiled on the current tree, one decode step at
+  B=32 (Llama-3.2-1B, ISL 128, A40):
+
+  | | |
+  |---|---:|
+  | step wall time | 14.68 ms |
+  | weight-read floor | 3.56 ms |
+  | GPU busy | 11.08 ms (75%) |
+  | **GPU idle, waiting on Python** | **3.60 ms (25%)** |
+  | CUDA kernels launched per step | **883** |
+
+  Graph replay collapses those 883 launches into one, so the idle quarter is
+  what it directly recovers — about 1.3x before any kernel gets faster. It is
+  also the only item that attacks the deficit the benchmark has shown all along:
+  liteinfer sits at 0.28-0.35x of vLLM at *every* batch width, and a gap that
+  stays flat as concurrency grows is a fixed per-step cost, not an algorithmic
+  one.
 - **Scope.** Capture the single-token-decode step and replay it, behind
   `enable_cuda_graph`. Continuous batching varies the decode width per
   step, so capture needs a set of graphs at padded batch sizes rather
@@ -379,6 +404,25 @@ listed.
   (§6.3), and nothing consumes it.
 - **Scope.** `python -m liteinfer.dashboard` printing rolling
   prefill/decode tok/s, batch width and KV usage from the stats stream.
+
+### 6.4 Account for the time outside the forward pass
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** Decode measured in isolation runs at **2,179 tok/s** at B=32, while
+  the benchmark's end-to-end figure at the same shape is **1,445 tok/s**. Some
+  of that difference is real work the isolated measurement skips — prefilling
+  200 prompts, and the ramp-up and drain where the batch is narrower than 32 —
+  and some is engine overhead: scheduling, sampling, detokenisation, the asyncio
+  round trip per token. **Nobody knows the split**, and the difference is large
+  enough that it could be worth more than any kernel item on this list. Every
+  performance item in §3 optimises the forward pass; this one asks whether the
+  forward pass is where the time is.
+- **Scope.** `StepMetrics` already records wall time per forward pass (§6.3), so
+  the engine loop can report forward time against total loop time and attribute
+  the remainder. No new measurement machinery, just a consumer of what is
+  already collected — which is also what §6.2 wants.
+- **Parity test.** None; this is a measurement. The result is a number, and it
+  decides what to optimise next.
 
 ---
 
