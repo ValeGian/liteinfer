@@ -88,11 +88,17 @@ class ContinuousModelRunner:
         request_ids = [s.request_id for s in seqs]
         input_ids, position_ids = self._build_decode_inputs(seqs)
 
+        # Account for this step's token before addressing it, then build the slot
+        # table and mask here rather than on the first layer: the forward pass
+        # must contain no host-side work.
+        self._cache.advance(request_ids)
+        slots = self._cache.slot_table_for(request_ids)
+
         # seq_total_len includes the current decode token (prompt + all output tokens).
         seq_total_lens = [len(s.prompt_token_ids) + len(s.output_token_ids) for s in seqs]
         _, build_decode = builders_for(type(self.model).__name__)
         attention_mask = build_decode(seq_total_lens, self.config.dtype, self.device)
-        payload = self._cache.make_decode_payload(request_ids)
+        payload = self._cache.make_decode_payload(slots)
         out = self.model(
             input_ids=input_ids,
             position_ids=position_ids,

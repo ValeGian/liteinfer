@@ -224,44 +224,45 @@ listed.
 
 ### 3.2 CUDA graph capture for decode
 - **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** The largest measured cost in the decode path is not a kernel — it is
-  the gaps between kernels. Profiled on the current tree, one decode step at
-  B=32 (Llama-3.2-1B, ISL 128, A40):
+- **Blocked on.** §2.3. Built, measured at 1.06x, and reverted — see below.
+- **Why it looked compelling.** A decode step issues **822 kernels** to do 10.34 ms
+  of GPU work in a 13.96 ms step; the gaps between launches are idle time, and a
+  graph replays the whole sequence as one submission.
+- **What it actually measured.** The saving is real but small, and the padding a
+  graph forces costs more than it saves at most bucket sizes. A graph fixes
+  every shape, so the KV length has to be rounded up to a bucket:
 
-  | | |
-  |---|---:|
-  | step wall time | 13.96 ms |
-  | weight-read floor | 3.56 ms |
-  | GPU busy | 11.02 ms (79%) |
-  | **GPU idle, waiting on Python** | **2.93 ms (21%)** |
-  | CUDA kernels launched per step | **822** |
+  | KV bucket | throughput | vs no graphs |
+  |---:|---:|---:|
+  | none | 1,809 tok/s | — |
+  | 256 | 1,759 | 0.97x |
+  | **64** | **1,912** | **1.06x** |
+  | 32 | 1,840 | 1.02x |
+  | 16 | 1,679 | 0.93x |
 
-  Graph replay collapses those 883 launches into one, so the idle quarter is
-  what it directly recovers — about 1.3x before any kernel gets faster.
-  It has a second payoff §3.5 discovered the hard way: a captured graph runs a
-  *fixed* shape, and a fixed shape is the one condition under which cuDNN's
-  broadcast-KV attention is worth having. Capture would make §3.5 viable as a
-  side effect.
-
-  These numbers have been re-measured twice, because two other changes might
-  have eaten into them. §7's sampler vectorisation did not: sampling sits
-  outside the forward pass, and the step was unchanged at 14.75 ms, 25% idle,
-  883 launches. Building the per-step tensors in one transfer did: 35 pageable
-  host-to-device copies per step became 5, which is where the drop to 13.96 ms,
-  21% and 822 launches came from. What is left is launch overhead proper. It is
-  also the only item that attacks the deficit the benchmark has shown all along:
-  liteinfer sits at 0.28-0.35x of vLLM at *every* batch width, and a gap that
-  stays flat as concurrency grows is a fixed per-step cost, not an algorithmic
-  one.
-- **Scope.** Capture the single-token-decode step and replay it, behind
-  `enable_cuda_graph`. Continuous batching varies the decode width per
-  step, so capture needs a set of graphs at padded batch sizes rather
-  than one — the batch is padded up to the nearest captured width.
-  Capture also removes the per-step `torch.zeros` allocation in
-  `build_continuous_decode_mask` and its Python-side slice fills, which
-  cost a GPU allocation plus several kernel launches every pass.
-- **Pre-req.** §3.1 helps but is not strictly required.
+  Large buckets waste attention and gather work on padding; small ones spend the
+  gain on captures. The best point is 1.06x — and the same no-graph
+  configuration measured 1,809 and 1,932 tok/s on two consecutive runs, so the
+  effect is smaller than the noise. Replaying the forward in isolation saves
+  0.858 ms of 12.85 ms, which is the whole prize.
+- **Why it is blocked, and on what.** The cost is the *gather*. liteinfer copies
+  the whole KV history into a contiguous tensor every decode step, so padding
+  the KV length pads a copy — real bytes, per layer, per step. §2.3's fused
+  paged-attention kernel reads the block table inside the kernel and never
+  gathers, so there is nothing for the padding to inflate. That is why vLLM
+  captures graphs profitably and liteinfer cannot yet: **§2.3 first, then this.**
+- **Scope, when it comes back.** Static buffers written in place, one capture per
+  (batch width, KV bucket), padded rows attending to nothing and discarded.
+  Roughly 150 lines; the implementation is in the history of the PR that filed
+  this measurement.
+- **Prerequisite already landed.** The slot table and block allocation used to be
+  computed on the first layer, inside the forward pass. They now happen in
+  `decode()` before it, so the forward contains no host-side work — which any
+  capture requires, and which §2.3 wants anyway.
+- **Parity test.** Graphed output is token-identical to eager in fp32. In bf16 it
+  diverges around token 11, because attention then sums over a padded key axis
+  in a different order — the same class of difference as §3.3, and the reason
+  the parity claim has to be made in fp32.
 
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`

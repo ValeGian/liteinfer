@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from liteinfer.cache.block_pool import slot_table
+from liteinfer.cache.block_pool import BlockPool, slot_table
+from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
 
 CPU = torch.device("cpu")
 BLOCK_SIZE = 4
@@ -61,3 +62,18 @@ def test_max_total_comes_from_the_counts_not_the_device() -> None:
     table = slot_table([[1], [1]], counts=[3, 9], block_size=16, device=torch.device("cpu"))
 
     assert table.shape[1] == 9
+
+
+def test_advance_allocates_a_block_only_when_the_last_one_fills() -> None:
+    """Block allocation is host-side bookkeeping, and must stay out of the forward."""
+    pool = BlockPool(
+        num_blocks=8, block_size=4, num_layers=1, num_kv_heads=1, head_dim=2,
+        dtype=torch.float32, device=torch.device("cpu"),
+    )
+    cache = ContinuousKVCache(pool)
+    cache.register("r0", prompt_len=4)          # one block, exactly full
+    blocks_after_prompt = len(cache._block_tables["r0"])
+
+    cache.advance(["r0"])                        # token 5 needs a second block
+
+    assert len(cache._block_tables["r0"]) == blocks_after_prompt + 1

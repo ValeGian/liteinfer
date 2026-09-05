@@ -73,9 +73,22 @@ class ContinuousKVCache:
         """Return a payload for one prefill forward pass over ``request_ids``."""
         return _PrefillPayload(self, request_ids, prompt_lens)
 
-    def make_decode_payload(self, request_ids: list[str]) -> _DecodePayload:
-        """Return a payload for one decode forward pass over ``request_ids``."""
-        return _DecodePayload(self, request_ids)
+    def make_decode_payload(self, slots: torch.Tensor) -> _DecodePayload:
+        """Return a payload for one decode forward pass reading ``slots``.
+
+        The slot table is computed by the caller rather than on the first layer,
+        so the forward pass contains no host-side work — which is what lets it
+        be captured into a CUDA graph, and what keeps the GPU from stalling
+        mid-pass otherwise.
+        """
+        return _DecodePayload(self, slots)
+
+    def advance(self, request_ids: list[str]) -> None:
+        """Account for the token about to be decoded, allocating a block if needed."""
+        for request_id in request_ids:
+            if self._token_counts[request_id] % self._pool.block_size == 0:
+                self._block_tables[request_id].append(self._pool.allocate())
+            self._token_counts[request_id] += 1
 
     # ------------------------------------------------------------------
     # Internal helpers shared by payloads
@@ -140,12 +153,15 @@ class _PrefillPayload:
 
 
 class _DecodePayload:
-    """Decode-pass payload for the currently running sequences."""
+    """Decode-pass payload reading a slot table the caller already built.
 
-    def __init__(self, cache: ContinuousKVCache, request_ids: list[str]) -> None:
+    Every operation here is a tensor op on fixed pool storage, which is what
+    makes the pass capturable: nothing decides anything on the host.
+    """
+
+    def __init__(self, cache: ContinuousKVCache, slots: torch.Tensor) -> None:
         self._cache = cache
-        self._request_ids = request_ids
-        self._slots = torch.empty(0, dtype=torch.long)
+        self._slots = slots
 
     def update(
         self,
@@ -153,22 +169,9 @@ class _DecodePayload:
         value_states: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Append each sequence's decode token; return gathered left-padded K/V."""
-        if layer_idx == 0:
-            self._advance_slots()
-            self._slots = self._cache.slot_table_for(self._request_ids)
-
+        """Store each sequence's decode token; return the gathered left-padded K/V."""
         self._cache.scatter(layer_idx, self._slots[:, -1:], key_states, value_states)
         return self._cache.gather(layer_idx, self._slots)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        if not self._request_ids:
-            return 0
-        return max(self._cache._token_counts[rid] for rid in self._request_ids)
-
-    def _advance_slots(self) -> None:
-        for req_id in self._request_ids:
-            current = self._cache._token_counts[req_id]
-            if current % self._cache._pool.block_size == 0:
-                self._cache._block_tables[req_id].append(self._cache._pool.allocate())
-            self._cache._token_counts[req_id] += 1
+        return int(self._slots.shape[1])

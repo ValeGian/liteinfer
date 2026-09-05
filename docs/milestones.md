@@ -4,6 +4,16 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 05-09-2026 — No host-side work inside the forward pass
+
+- **PRs.** [#29](https://github.com/ValeGian/liteinfer/pull/29)
+- **What.** The decode payload used to allocate blocks and build the slot table on layer 0 — Python running in the middle of a forward pass, with the GPU waiting on it. `decode()` now calls `cache.advance()` and `cache.slot_table_for()` before the model, and the payload is handed a slot tensor it only reads. Measured at 1.00x: the work moved rather than went away. It ships because the shape is right — a forward pass that decides nothing on the host is what CUDA graph capture requires, and what a fused paged-attention kernel (§2.3) wants too.
+- **The rest of the attempt did not ship.** This was the prerequisite for §3.2, which was then built, measured at **1.06x** at its best bucket size, and reverted. A graph fixes every shape, so the KV length must be rounded up to a bucket: 256-token buckets waste attention and gather work and measure 0.97x, 16-token buckets spend the gain on captures and measure 0.93x, and the 1.06x peak at 64 is smaller than the run-to-run variance the same configuration showed on consecutive runs (1,809 and 1,932 tok/s).
+- **Why, and what unblocks it.** The cost is the gather: liteinfer copies the whole KV history into a contiguous tensor every step, so padding the KV length pads a copy — real bytes, per layer, per step. §2.3's fused kernel reads the block table directly and never gathers, leaving the padding nothing to inflate. That is the difference between liteinfer and an engine that captures graphs profitably, and it makes §3.2 depend on §2.3.
+- **Two large items in a row that measurement killed** — §3.5 at 0.64x, §3.2 at 1.06x. Both had a plausible mechanism and a promising component benchmark; neither survived the engine. The roadmap now carries the numbers and the dependency for each, so the next attempt starts from what was learned rather than from the same estimate.
+
+---
+
 ## 05-09-2026 — One transfer per step, not one per sequence
 
 - **PRs.** [#27](https://github.com/ValeGian/liteinfer/pull/27)
