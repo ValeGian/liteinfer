@@ -17,6 +17,79 @@ by the substantive bullets:
 - **Parity test.** <how correctness is pinned>
 ```
 
+## Shipping an improvement
+
+Every change that claims to make liteinfer faster follows the same loop: the
+claim is backed by a number measured the same way before and after, and a
+general improvement that wins outright replaces the path it beats rather than
+sitting beside it. A specialised improvement — one that only applies under some
+precondition — joins instead. Step 6 is where that is decided.
+
+**1. Measure the baseline.** The config being improved must already have stored
+results in `benchmarks/results/`. If it does not, run it first — a claim needs a
+before.
+
+**2. Add the config, not a branch.** New work is a `BenchmarkConfig` entry in
+`benchmarks/configs.py` whose `baseline` names the config it improves on. That
+is what makes `bench report` print the 1:1 delta.
+
+**3. Measure the right thing.** The two modes answer different questions, and
+using the wrong one hides the effect:
+
+| The change affects | Run | Read |
+|---|---|---|
+| how much work fits at once (batching, scheduling, memory) | `throughput` | tok/s, req/s |
+| how long one step costs (kernels, cache layout, attention) | `latency` | ITL, TTFT |
+
+Same dataset, same ISL/OSL, same sample count as the baseline. Latency runs
+sequentially — `--gpus` distorts TTFT. Against vLLM, compare only at **matched
+batch width**; a B=1 engine against a B=32 one measures the batch width.
+Run-to-run variance is about ±4%, so an effect under ~1.1x is not an effect.
+
+**4. Say what it cost.** Report the metric that got worse as plainly as the one
+that got better. Continuous batching won throughput 4.5x and lost ~9% on
+single-request ITL; both belong in the write-up.
+
+**5. Update the docs in the same PR.** Results and analysis in
+`docs/benchmarks.md`, headline numbers in `README.md`, a milestone entry with
+its PR link, and the roadmap item flipped to `landed`.
+
+**6. Does it replace, or does it join?** Two questions, in this order.
+
+*Does it cover the whole domain of the thing it beats?* Continuous batching
+serves every workload static batching served — any model, any batch size — so
+static batching had no remaining reason to exist. An MoE kernel, a quantized
+path, a long-context attention variant: each may win by a wide margin inside its
+domain and still replace nothing, because outside that domain it does not apply.
+If there is any workload the old path serves and the new one cannot, they both
+stay. Two paths chosen by a precondition are not debt; they are the feature.
+
+*If it does cover the domain, is it a clear win there?* Better on the mode the
+feature targets, by more than run-to-run variance, with any regression elsewhere
+small enough to state and accept.
+
+**Both yes → delete what it beat**, in order:
+
+   - confirm the superseded config's results are stored — that measurement is
+     the only record once the code is gone;
+   - flag its `BenchmarkConfig` entry `historical` so the report keeps rendering
+     the progression while `bench run` refuses it;
+   - delete the code, and everything that existed only to serve it;
+   - **simplify what is left.** Removing one of two paths usually makes an
+     abstraction pointless: a mode flag with one value, a dispatcher with one
+     entry, a base class with one subclass. Collapse them in the same PR, or
+     the codebase keeps the shape of a choice it no longer offers.
+
+**Conditional win → keep both**, and say so explicitly: the config stays
+runnable and its `description` names the precondition, so the report shows what
+the row applies to. Measure it *inside its domain*. Comparing an MoE kernel against a dense baseline measures
+the model, not the kernel — so a specialised path usually needs its own dataset
+or model in the matrix, not just its own config.
+
+Keeping a slower *general* path "just in case" is how the codebase stops being
+readable, and the benchmark exists so that deleting it is safe. Keeping a
+*specialised* path is not the same thing: it is the only thing serving its case.
+
 ## Marking an item done
 
 When an item lands:
@@ -28,6 +101,10 @@ When an item lands:
 3. If a follow-up is created (e.g. v1 lands but v2 is the polished
    version), leave a stub here with status `planned` and a backlink
    to the original PR.
+
+Number new items by area: section 2 is KV cache, 5 is engine ergonomics, 6 is
+observability. Check `milestones.md` before picking a number — landed items keep
+theirs.
 
 Status badges keep half-done work visible: an item can sit at
 `in-progress` with one PR linked while the remaining scope stays
@@ -80,8 +157,8 @@ listed.
   K/V history every decode step. A fused paged-attention kernel reads the block
   table inside the CUDA kernel and removes the copy entirely, the same approach
   as vLLM's PagedAttention.
-- **Scope.** Custom CUDA/Triton kernel for block-table attention; `ModelRunner`
-  switches to it when `cache_mode="paged"`.
+- **Scope.** Custom CUDA/Triton kernel for block-table attention;
+  `ContinuousModelRunner` switches to it for the decode pass.
 - **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the entry point to
   swap in a custom attention backend.
 - **Parity test.** Paged greedy output identical to eager; benchmark shows
@@ -100,26 +177,10 @@ listed.
 
 ## 3. Performance optimizations
 
-### 2.7 Async engine step metrics
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** `AsyncLLMEngine` never calls `stats.record()`, so the continuous
-  path emits no `StepMetrics` at all — no phase, batch width, token count or
-  per-step wall time. `LLMEngine` records all of it. Diagnosing the continuous
-  batching shortfall behind §2.3 required monkey-patching
-  `ContinuousScheduler.schedule` from a throwaway script to recover batch
-  occupancy, which is not a workflow anyone should need to repeat.
-- **Scope.** Record a `StepMetrics` per step in `AsyncLLMEngine._step`, with a
-  phase for the mixed prefill+decode case the two-pass step creates. Reuse
-  `EngineStats`; no new types.
-- **Parity test.** A continuous run reports the same total token count through
-  `EngineStats` as the returned outputs contain, and batch width never exceeds
-  `max_num_seqs`.
-
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Wrap `ModelRunner._execute_eager` in `torch.compile`,
+- **Scope.** Wrap the `ContinuousModelRunner` forward passes in `torch.compile`,
   gated by `EngineConfig.enable_torch_compile`. First call pays
   compile cost; subsequent calls run the compiled graph.
 - **Risk.** Dynamic shapes (variable sequence length) defeat compile
@@ -130,12 +191,13 @@ listed.
 ### 3.2 CUDA graph capture for decode
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Capture the single-token-decode step (fixed shape after
-  prefill) and replay. Behind `enable_cuda_graph`. Requires §1.1
-  (fixed batch size during capture). Graph capture also eliminates the
-  per-step `torch.zeros` allocation in `build_additive_mask` and the
-  associated Python-side slice fills, which currently incur a GPU
-  allocation + multiple kernel launches every forward pass.
+- **Scope.** Capture the single-token-decode step and replay it, behind
+  `enable_cuda_graph`. Continuous batching varies the decode width per
+  step, so capture needs a set of graphs at padded batch sizes rather
+  than one — the batch is padded up to the nearest captured width.
+  Capture also removes the per-step `torch.zeros` allocation in
+  `build_continuous_decode_mask` and its Python-side slice fills, which
+  cost a GPU allocation plus several kernel launches every pass.
 - **Pre-req.** §3.1 helps but is not strictly required.
 
 ### 3.3 Flash / SDPA attention
@@ -152,7 +214,7 @@ listed.
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Per-rank `ModelRunner` plus a process group. Layer
+- **Scope.** Per-rank `ContinuousModelRunner` plus a process group. Layer
   weights sharded along output dim (column-parallel) or input dim
   (row-parallel) per HF `_tp_plan`. Already declared in vendored
   models.
@@ -210,10 +272,10 @@ listed.
 ### 6.2 Live dashboard runner
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** Listener API exists; no canonical consumer.
+- **Why.** `EngineStats` now records a `StepMetrics` per forward pass
+  (§6.3), and nothing consumes it.
 - **Scope.** `python -m liteinfer.dashboard` printing rolling
-  prefill/decode tok/s, batch size, KV usage. Builds on §1.1 to be
-  meaningful.
+  prefill/decode tok/s, batch width and KV usage from the stats stream.
 
 ---
 
@@ -223,8 +285,8 @@ listed.
   lands.
 - Vectorize `Sampler.__call__` per-row loop when params are
   homogeneous across batch.
-- Tighten `KVCache` ABC — richer `payload` contract landed with §2.1; may still obviate eager wrapper.
-- Add `tests/integration/` B=1 vs B=N parity tests once §1.1 lands.
+- Trim `EngineStats`: six derived throughput properties, the `on_step`
+  listener and four running totals have no callers outside their own tests.
 
 ---
 
@@ -252,8 +314,7 @@ listed.
   `torch.cat` KV growth adds per-step copy overhead. The crossover point
   — where KV cache starts winning — is model- and hardware-dependent and
   currently invisible in the benchmark suite. A sequence-length sweep
-  makes this crossover explicit, validates that §2.6 (pre-allocated
-  buffer) actually closes the gap, and guards against regressions.
+  makes this crossover explicit and guards against regressions.
 - **Scope.** New `bench run-sweep` subcommand iterating over `(ISL, OSL)` pairs,
   calling `harness.run()` for each. `report.py` renders a tok/s-vs-OSL section.
 - **Pre-req.** §8.1 (ISL/OSL-controlled workloads).

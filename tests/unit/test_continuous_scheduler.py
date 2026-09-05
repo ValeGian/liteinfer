@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from liteinfer.config import AsyncEngineConfig
+from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_scheduler import ContinuousScheduler
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
 
 
-def _make_config(max_num_seqs: int = 4) -> AsyncEngineConfig:
-    return AsyncEngineConfig(model="unused", max_num_seqs=max_num_seqs)
+def _make_config(max_num_seqs: int = 4) -> EngineConfig:
+    return EngineConfig(model="unused", max_num_seqs=max_num_seqs)
 
 
 def _make_seq(request_id: str) -> Sequence:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from liteinfer.config import AsyncEngineConfig
+from liteinfer.config import EngineConfig
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 
 
@@ -39,7 +39,7 @@ class ContinuousScheduler:
       lists so the engine can issue two targeted forward passes.
     """
 
-    def __init__(self, config: AsyncEngineConfig) -> None:
+    def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.waiting: list[Sequence] = []
         self.running: list[Sequence] = []

@@ -214,29 +214,6 @@ class LlamaDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _build_causal_mask(
-    seq_len: int,
-    past_len: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build a `[1, 1, seq_len, past_len + seq_len]` additive mask.
-
-    Positions that should be masked get the dtype's `min`; allowed
-    positions get 0. Cached tokens are always visible; new tokens see
-    only positions up to (and including) themselves.
-    """
-    total_len = past_len + seq_len
-    mask = torch.zeros((seq_len, total_len), dtype=dtype, device=device)
-    if seq_len > 1:
-        causal = torch.full(
-            (seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=device
-        )
-        causal = torch.triu(causal, diagonal=1)
-        mask[:, past_len:] = causal
-    return mask[None, None, :, :]
-
-
 class LlamaModel(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
@@ -251,22 +228,11 @@ class LlamaModel(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor,
+        past_key_values: Cache,
+        attention_mask: torch.Tensor,
     ) -> CausalLMOutput:
         inputs_embeds = self.embed_tokens(input_ids)
-        seq_len = inputs_embeds.shape[1]
-        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
-
-        if position_ids is None:
-            position_ids = torch.arange(
-                past_len, past_len + seq_len, device=inputs_embeds.device
-            ).unsqueeze(0)
-
-        if attention_mask is None:
-            attention_mask = _build_causal_mask(seq_len, past_len, inputs_embeds.dtype, inputs_embeds.device)
-
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
@@ -302,9 +268,9 @@ class LlamaForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor,
+        past_key_values: Cache,
+        attention_mask: torch.Tensor,
     ) -> CausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,

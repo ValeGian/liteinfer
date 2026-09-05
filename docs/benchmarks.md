@@ -75,16 +75,22 @@ same clock, with no per-token callbacks that each would implement differently.
 `benchmarks/configs.py` is the matrix; each entry names the config it improves
 on, and the report renders that as a 1:1 delta.
 
-| Config | What it adds | Baseline |
-|---|---|---|
-| `liteinfer-nocache` | No KV cache; every step re-feeds the sequence | — |
-| `liteinfer-eager` | KV cache via `DynamicCache` | `liteinfer-nocache` |
-| `liteinfer-native-eager` | KV cache as plain tensors | `liteinfer-eager` |
-| `liteinfer-paged` | Paged KV cache, block pool | `liteinfer-native-eager` |
-| `liteinfer-eager-b4` | Static batching, B=4 | `liteinfer-eager` |
-| `liteinfer-paged-b4` | Static batching, B=4, paged | `liteinfer-paged` |
-| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` |
-| `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — |
+Everything above `liteinfer-continuous` was measured and then **removed from the
+codebase** — the engine now has a single execution path. Their entries stay in
+the matrix, flagged `historical`, so the progression still renders; `bench run`
+refuses to run them.
+
+| Config | What it added | Baseline | |
+|---|---|---|---|
+| `liteinfer-nocache` | No KV cache; every step re-feeds the sequence | — | removed |
+| `liteinfer-eager` | KV cache via `DynamicCache` | `liteinfer-nocache` | removed |
+| `liteinfer-native-eager` | KV cache as plain tensors | `liteinfer-eager` | removed |
+| `liteinfer-paged` | Paged KV cache, block pool | `liteinfer-native-eager` | removed |
+| `liteinfer-eager-b4` | Static batching, B=4 | `liteinfer-eager` | removed |
+| `liteinfer-native-eager-b4` | Static batching, B=4, plain tensors | `liteinfer-native-eager` | removed |
+| `liteinfer-paged-b4` | Static batching, B=4, paged | `liteinfer-paged` | removed |
+| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | **current** |
+| `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
 
 ---
 

@@ -1,21 +1,10 @@
 # pyright: reportPrivateImportUsage=false
-"""Additive attention mask builder for static batching with left-padded prefill.
+"""Additive attention masks: 0 to attend, ``finfo(dtype).min`` to not.
 
-Returns a mask of shape ``[B, 1, query_len, past_len + query_len]`` whose
-entries are 0 for "attend" and ``finfo(dtype).min`` for "do not attend".
-Combines two sources of masking:
-
-* **Causal**: query token *q* may not attend to key token *k > q*.
-* **Left padding**: when prompts in a batch have different lengths, the
-  shorter ones are padded on the left during prefill. Padded positions
-  are stored in the KV cache (their values are arbitrary). Real query
-  rows must not attend to padded key columns; padded query rows are
-  fully masked since they do not produce any sampled token.
-
-The builder takes raw prompt lengths and reconstructs both effects in a
-single tensor that the model can add to attention scores directly.
+Prompts of different lengths are left-padded, so every mask has to hide the
+padded columns as well as enforce causality. Prefill and decode need different
+shapes, so they have separate builders.
 """
-
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -23,96 +12,37 @@ from collections.abc import Sequence
 import torch
 
 
-def build_additive_mask(
+def build_prefill_mask(
     prompt_lens: Sequence[int],
-    query_len: int,
-    past_len: int,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Build the additive attention mask for a static batch.
+    """Causal mask for one prefill pass over a left-padded batch.
 
-    Args:
-        prompt_lens: True (unpadded) prompt length per batch row.
-        query_len: Number of query tokens in this forward pass.
-            Equals max(prompt_lens) for prefill (with no past) and
-            ``1`` for a single decode step.
-        past_len: Number of key/value columns already cached. Equals
-            ``0`` for prefill, ``max(prompt_lens) + decode_step`` for
-            decode steps.
-        dtype: Mask dtype; must match the attention score tensor's dtype.
-        device: Mask device.
+    Prompts shorter than the longest are padded on the left, so each row's
+    first ``max_prompt_len - prompt_len`` columns are padding: padded query
+    rows are masked out entirely, and real query rows must not attend to
+    padded key columns.
 
-    Returns:
-        Tensor shaped ``[B, 1, query_len, past_len + query_len]``.
+    Returns ``[B, 1, max_prompt_len, max_prompt_len]`` additive mask.
     """
-    if not prompt_lens:
-        raise ValueError("prompt_lens must be non-empty")
-    max_prompt_len = max(prompt_lens)
-    is_prefill = past_len == 0
-    if is_prefill and query_len < max_prompt_len:
-        raise ValueError(f"prefill query_len={query_len} cannot be smaller than max prompt length {max_prompt_len}")
-
-    batch_size = len(prompt_lens)
-    key_len = past_len + query_len
     neg_inf = torch.finfo(dtype).min
-
-    mask = torch.zeros((batch_size, 1, query_len, key_len), dtype=dtype, device=device)
-
-    if query_len > 1:
-        causal = torch.triu(
-            torch.full((query_len, query_len), neg_inf, dtype=dtype, device=device),
+    max_prompt_len = max(prompt_lens)
+    mask = (
+        torch.triu(
+            torch.full((max_prompt_len, max_prompt_len), neg_inf, dtype=dtype, device=device),
             diagonal=1,
         )
-        mask[:, :, :, past_len:] = causal[None, None]
+        .expand(len(prompt_lens), 1, -1, -1)
+        .clone()
+    )
 
-    if is_prefill:
-        # Left padding lives in the first (max_prompt_len - prompt_len_i) columns
-        # of each row. Padded query rows mirror the same columns; padded key
-        # columns are masked from real query rows.
-        for i, pl in enumerate(prompt_lens):
-            pad = max_prompt_len - pl
-            if pad == 0:
-                continue
-            # Padded query rows: rows [0, pad) are pure padding.
+    for i, prompt_len in enumerate(prompt_lens):
+        pad = max_prompt_len - prompt_len
+        if pad:
             mask[i, 0, :pad, :] = neg_inf
-            # Real query rows must not see padded key columns.
             mask[i, 0, pad:, :pad] = neg_inf
-    else:
-        # Decode step: cache layout matches prefill — padded prefix lives in
-        # the first (max_prompt_len - prompt_len_i) columns of past_len.
-        for i, pl in enumerate(prompt_lens):
-            pad = max_prompt_len - pl
-            if pad == 0:
-                continue
-            mask[i, 0, :, :pad] = neg_inf
-
     return mask
-
-
-def build_for_model(
-    model_class_name: str,
-    *,
-    prompt_lens: Sequence[int],
-    query_len: int,
-    past_len: int,
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """Per-model dispatch returning the right ``attention_mask`` payload.
-
-    New architectures register themselves by extending this dispatch.
-    """
-    if model_class_name == "LlamaForCausalLM":
-        return build_additive_mask(
-            prompt_lens=prompt_lens,
-            query_len=query_len,
-            past_len=past_len,
-            dtype=dtype,
-            device=device,
-        )
-    raise NotImplementedError(f"no attention-mask builder registered for model class {model_class_name!r}")
-
 
 def build_continuous_decode_mask(
     seq_total_lens: list[int],
@@ -121,21 +51,10 @@ def build_continuous_decode_mask(
 ) -> torch.Tensor:
     """Additive attention mask for a continuous-batching decode step.
 
-    Unlike ``build_additive_mask``, sequences in a continuous batch may have
-    different total cached lengths (prompt + output tokens so far). The paged
-    KV cache returns tensors LEFT-PADDED to ``max(seq_total_lens)``. This mask
-    unmasks each sequence's real token positions (right side) and masks the
-    left-pad zeros.
-
-    Args:
-        seq_total_lens: total token count per sequence (prompt + output so far
-            PLUS the one new token being decoded). The length of this list
-            equals the batch size.
-        dtype: must match the attention score tensor.
-        device: target device.
-
-    Returns:
-        Tensor shaped ``[B, 1, 1, max_total]``.
+    Sequences in a continuous batch hold different numbers of cached tokens, and
+    the cache returns them left-padded to ``max(seq_total_lens)``, so each row
+    masks its own pad prefix. ``seq_total_lens`` counts prompt + output so far,
+    including the token being decoded. Returns ``[B, 1, 1, max_total]``.
     """
     if not seq_total_lens:
         raise ValueError("seq_total_lens must be non-empty")
@@ -149,18 +68,11 @@ def build_continuous_decode_mask(
     return mask
 
 
-def build_continuous_decode_for_model(
-    model_class_name: str,
-    *,
-    seq_total_lens: list[int],
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """Per-model dispatch for continuous-batching decode masks."""
-    if model_class_name == "LlamaForCausalLM":
-        return build_continuous_decode_mask(
-            seq_total_lens=seq_total_lens,
-            dtype=dtype,
-            device=device,
-        )
-    raise NotImplementedError(f"no continuous-decode mask builder for model class {model_class_name!r}")
+_BUILDERS = {"LlamaForCausalLM": (build_prefill_mask, build_continuous_decode_mask)}
+
+
+def builders_for(model_class_name: str):
+    """Return this architecture's ``(prefill, decode)`` mask builders."""
+    if model_class_name not in _BUILDERS:
+        raise NotImplementedError(f"no attention-mask builders for {model_class_name!r}")
+    return _BUILDERS[model_class_name]

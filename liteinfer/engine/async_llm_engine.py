@@ -32,16 +32,28 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 
-from liteinfer.async_llm_types import StreamEvent
-from liteinfer.config import AsyncEngineConfig
+from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
 from liteinfer.engine.continuous_scheduler import ContinuousScheduler
-from liteinfer.engine.metrics import EngineStats
+from liteinfer.engine.metrics import (
+    EngineStats,
+    Phase,
+    StepMetrics,
+    StepTimer,
+    peak_gpu_memory_bytes,
+)
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.engine.stopping import resolve_stop_status
+from liteinfer.outputs import StreamEvent
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
 from liteinfer.tokenizer import Tokenizer
+
+# A request's stream carries events, then either None (done) or the error that
+# ended it.
+_RequestQueue = asyncio.Queue[StreamEvent | Exception | None]
+
+_IDLE_POLL_S = 0.05
 
 _FINISH_REASONS: dict[SequenceStatus, str] = {
     SequenceStatus.FINISHED_STOPPED: "stop",
@@ -53,14 +65,15 @@ _FINISH_REASONS: dict[SequenceStatus, str] = {
 class AsyncLLMEngine:
     """Continuous-batching inference engine backed by an asyncio event loop."""
 
-    def __init__(self, config: AsyncEngineConfig) -> None:
+    def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.scheduler = ContinuousScheduler(config)
         self.model_runner = ContinuousModelRunner(config)
         self.sampler = Sampler()
+        self._step_idx = 0
         self.stats = EngineStats()
 
-        self._request_queues: dict[str, asyncio.Queue] = {}
+        self._request_queues: dict[str, _RequestQueue] = {}
         self._pending: asyncio.Queue = asyncio.Queue()
         self._loop_task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
@@ -87,37 +100,60 @@ class AsyncLLMEngine:
         prompt: str,
         sampling_params: SamplingParams,
     ) -> AsyncGenerator[StreamEvent, None]:
-        """Submit a request and stream ``StreamEvent`` objects until completion."""
-        queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
+        """Submit a request and stream ``StreamEvent`` objects until completion.
+
+        A failure belonging to this request is re-raised here rather than
+        silently ending the stream.
+        """
+        if self._loop_task is None or self._loop_task.done():
+            raise RuntimeError("engine loop is not running; call start() first")
+
+        queue: _RequestQueue = asyncio.Queue()
         self._request_queues[request_id] = queue
         await self._pending.put((request_id, prompt, sampling_params))
 
         while True:
-            event = await queue.get()
-            if event is None:
+            item = await queue.get()
+            if item is None:
                 return
-            yield event
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
     # ------------------------------------------------------------------
     # Background loop
     # ------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
-        while not self._shutdown.is_set():
-            self._drain_pending()
-            if self.scheduler.has_unfinished():
-                self._step()
-            else:
-                try:
-                    item = await asyncio.wait_for(self._pending.get(), timeout=0.05)
-                    self._enqueue(*item)
-                except asyncio.TimeoutError:
-                    pass
-            await asyncio.sleep(0)
+        try:
+            while not self._shutdown.is_set():
+                self._drain_pending()
+                if self.scheduler.has_unfinished():
+                    self._step()
+                else:
+                    try:
+                        item = await asyncio.wait_for(self._pending.get(), timeout=_IDLE_POLL_S)
+                        self._admit(item)
+                    except asyncio.TimeoutError:
+                        pass
+                await asyncio.sleep(0)
+        except BaseException as error:
+            # The loop is the only thing that ever completes a request, so if it
+            # dies every waiter must hear about it instead of hanging.
+            self._fail_all(error if isinstance(error, Exception) else RuntimeError(repr(error)))
+            raise
 
     def _drain_pending(self) -> None:
         while not self._pending.empty():
-            self._enqueue(*self._pending.get_nowait())
+            self._admit(self._pending.get_nowait())
+
+    def _admit(self, item: tuple[str, str, SamplingParams]) -> None:
+        """Tokenize and queue one request. A bad request fails only itself."""
+        request_id, prompt, sampling_params = item
+        try:
+            self._enqueue(request_id, prompt, sampling_params)
+        except Exception as error:
+            self._fail(request_id, error)
 
     def _enqueue(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
         token_ids = self.tokenizer.encode(prompt)
@@ -143,15 +179,14 @@ class AsyncLLMEngine:
         if not sched.prefill_seqs and not sched.decode_seqs:
             return
 
-        if sched.prefill_seqs:
-            logits = self.model_runner.prefill(sched.prefill_seqs)
-            sampled = self.sampler(logits, [s.sampling_params for s in sched.prefill_seqs])
-            self._apply_sampled(sched.prefill_seqs, sampled)
-
-        if sched.decode_seqs:
-            logits = self.model_runner.decode(sched.decode_seqs)
-            sampled = self.sampler(logits, [s.sampling_params for s in sched.decode_seqs])
-            self._apply_sampled(sched.decode_seqs, sampled)
+        for phase, seqs in ((Phase.PREFILL, sched.prefill_seqs), (Phase.DECODE, sched.decode_seqs)):
+            if not seqs:
+                continue
+            try:
+                self._forward(phase, seqs)
+            except Exception as error:
+                self._abort(seqs, error)  # the pass failed, so its sequences cannot continue
+                return
 
         newly_finished = 0
         for seq in sched.all_seqs:
@@ -162,6 +197,52 @@ class AsyncLLMEngine:
                 newly_finished += 1
 
         self.stats.num_requests_finished += newly_finished
+
+    def _fail(self, request_id: str, error: Exception) -> None:
+        """Hand `error` to one waiting caller and forget the request."""
+        queue = self._request_queues.pop(request_id, None)
+        if queue is not None:
+            queue.put_nowait(error)
+
+    def _fail_all(self, error: Exception) -> None:
+        for request_id in list(self._request_queues):
+            self._fail(request_id, error)
+
+    def _abort(self, seqs: list[Sequence], error: Exception) -> None:
+        for seq in seqs:
+            seq.status = SequenceStatus.FINISHED_ABORTED
+            self._fail(seq.request_id, error)
+
+    def _forward(self, phase: Phase, seqs: list[Sequence]) -> None:
+        """Run one forward pass and record it.
+
+        Prefill and decode are separate passes, so a step that admits new
+        sequences records two — which is what makes the two-pass cost (§1.3)
+        visible in `stats`.
+        """
+        run = self.model_runner.prefill if phase is Phase.PREFILL else self.model_runner.decode
+        input_tokens = (
+            sum(len(seq.prompt_token_ids) for seq in seqs) if phase is Phase.PREFILL else len(seqs)
+        )
+        with StepTimer(self.model_runner.device) as timer:
+            logits = run(seqs)
+            sampled = self.sampler(logits, [seq.sampling_params for seq in seqs])
+            self._apply_sampled(seqs, sampled)
+
+        if not self.config.collect_stats:
+            return
+        self.stats.record(
+            StepMetrics(
+                step_idx=self._step_idx,
+                phase=phase,
+                num_seqs=len(seqs),
+                input_tokens=input_tokens,
+                new_tokens=len(seqs),
+                wall_time_s=timer.elapsed,
+                peak_gpu_mem_bytes=peak_gpu_memory_bytes(self.model_runner.device),
+            )
+        )
+        self._step_idx += 1
 
     def _apply_sampled(self, seqs: list[Sequence], sampled) -> None:
         for i, seq in enumerate(seqs):

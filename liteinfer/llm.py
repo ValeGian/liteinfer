@@ -2,80 +2,75 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from itertools import count
+import asyncio
 
-from liteinfer.config import EngineConfig
-from liteinfer.engine.llm_engine import LLMEngine
+from liteinfer.async_llm import AsyncLLM
 from liteinfer.engine.metrics import EngineStats
-from liteinfer.engine.sequence import SequenceStatus
+from liteinfer.outputs import RequestOutput
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.tokenizer import Tokenizer
 
 
-@dataclass
-class RequestOutput:
-    request_id: str
-    prompt: str
-    text: str
-    token_ids: list[int]
-    finish_reason: str  # "stop" | "length" | "abort"
-
-
-_FINISH_REASONS: dict[SequenceStatus, str] = {
-    SequenceStatus.FINISHED_STOPPED: "stop",
-    SequenceStatus.FINISHED_LENGTH: "length",
-    SequenceStatus.FINISHED_ABORTED: "abort",
-}
-
-
 class LLM:
-    """High-level offline inference API. Facade over `LLMEngine`."""
+    """Synchronous offline inference, backed by the continuous-batching engine.
+
+    Owns a private event loop so the async engine can be driven from ordinary
+    code. Inside an existing event loop, use `AsyncLLM` directly.
+
+    Usage::
+
+        llm = LLM("meta-llama/Llama-3.2-1B-Instruct")
+        outputs = llm.generate(prompts, SamplingParams(max_tokens=64))
+        llm.close()
+    """
 
     def __init__(self, model: str, **engine_kwargs) -> None:
-        self.config = EngineConfig(model=model, **engine_kwargs)
-        self.engine = LLMEngine(self.config)
-        self._req_id_gen = count(0)
+        if _event_loop_is_running():
+            raise RuntimeError(
+                "LLM owns an event loop and cannot be built inside a running one. "
+                "Use AsyncLLM here instead."
+            )
+        self._loop = asyncio.new_event_loop()
+        self._llm = AsyncLLM(model=model, **engine_kwargs)
+        self._loop.run_until_complete(self._llm.start())
 
-        self.engine.load_model()
+    @property
+    def config(self):
+        return self._llm.config
 
     @property
     def stats(self) -> EngineStats:
-        return self.engine.stats
+        return self._llm.engine.stats
 
     @property
     def tokenizer(self) -> Tokenizer:
-        return self.engine.model_runner.tokenizer
+        return self._llm.engine.tokenizer
 
     def generate(
         self,
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
     ) -> list[RequestOutput]:
-        """Generate completions. Submits all requests, then drains the engine.
+        """Generate completions, returned in the order the prompts were given."""
+        return self._loop.run_until_complete(self._llm.generate(prompts, sampling_params))
 
-        Output order matches input ``prompts`` order regardless of which
-        sequences finish first inside a static batch.
-        """
-        if isinstance(prompts, str):
-            prompts = [prompts]
-        params = sampling_params or SamplingParams()
+    def close(self) -> None:
+        """Stop the engine and release its event loop."""
+        if self._loop.is_closed():
+            return
+        self._loop.run_until_complete(self._llm.stop())
+        self._loop.close()
 
-        request_ids: list[str] = []
-        for prompt in prompts:
-            req_id = f"req-{next(self._req_id_gen)}"
-            self.engine.add_request(req_id, prompt, params)
-            request_ids.append(req_id)
+    def __enter__(self) -> LLM:
+        return self
 
-        finished_by_id: dict[str, RequestOutput] = {}
-        while self.engine.has_unfinished_requests():
-            for seq in self.engine.step():
-                finished_by_id[seq.request_id] = RequestOutput(
-                    request_id=seq.request_id,
-                    prompt=seq.prompt,
-                    text=self.tokenizer.decode(seq.output_token_ids),
-                    token_ids=list(seq.output_token_ids),
-                    finish_reason=_FINISH_REASONS.get(seq.status, "stop"),
-                )
+    def __exit__(self, *_) -> None:
+        self.close()
 
-        return [finished_by_id[req_id] for req_id in request_ids]
+
+def _event_loop_is_running() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True

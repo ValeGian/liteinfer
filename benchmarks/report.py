@@ -163,11 +163,23 @@ def as_text(results: list[dict]) -> str:
         lines.append("-" * len(header))
         for row in rows(members, mode):
             values = "".join(f"{row.value(k):>11,.1f}" for k, _, _ in columns)
+            name = row.result["config"] + ("*" if _is_historical(row) else "")
             lines.append(
-                f"{row.result['config']:<27}{row.base or '-':<25}{values}"
+                f"{name:<27}{row.base or '-':<25}{values}"
                 f"{_fmt(row.vs_base):>9}{_fmt(row.vs_root):>9}{_fmt(row.vs_vllm):>9}"
             )
+    if any(_is_historical(row) for members, mode in _groups(results) for row in rows(members, mode)):
+        lines.append("\n* measured before the code was removed; no longer runnable")
     return "\n".join(lines)
+
+
+def _groups(results: list[dict]):
+    return [(members, key[0]) for key, members in sorted(group(results).items())]
+
+
+def _is_historical(row: Row) -> bool:
+    config = CONFIGS.get(row.result["config"])
+    return bool(config and config.historical)
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +256,8 @@ def _table(members: list[dict], mode: str) -> str:
             css = ' class="best"' if value == best[key] else ""
             cells.append(f"<td{css}>{value:,.1f}</td>")
         lineage = f"improves on {row.base}" if row.base else "reference point"
+        if _is_historical(row):
+            lineage += " &middot; removed from the codebase"
         body.append(
             f'<tr class="{"ref" if result["engine"] == "vllm" else ""}">'
             f'<td class="name"><span class="label">{html.escape(result["config"])}</span>'

@@ -14,7 +14,6 @@ import torch
 class Phase(str, Enum):
     PREFILL = "prefill"
     DECODE = "decode"
-    RECOMPUTE = "recompute"
 
 
 @dataclass(frozen=True)

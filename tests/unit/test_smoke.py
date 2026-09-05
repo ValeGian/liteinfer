@@ -56,17 +56,6 @@ def test_engine_config_rejects_zero_max_model_len() -> None:
         EngineConfig(model="dummy", max_model_len=0)
 
 
-def test_engine_config_rejects_invalid_cache_mode() -> None:
-    with pytest.raises(ValueError):
-        EngineConfig(model="dummy", cache_mode="turbo")  # type: ignore[arg-type]
-
-
-def test_engine_config_accepts_paged_cache_mode() -> None:
-    cfg = EngineConfig(model="dummy", cache_mode="paged")
-    assert cfg.cache_mode == "paged"
-
-
 def test_engine_config_accepts_defaults() -> None:
     cfg = EngineConfig(model="dummy")
-    assert cfg.cache_mode == "none"
     assert cfg.device == "auto"
