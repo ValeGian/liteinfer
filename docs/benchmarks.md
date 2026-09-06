@@ -504,6 +504,39 @@ for Python to issue the next one. That idle fifth is what §3.2's CUDA graphs
 recover. It was a quarter before the transfers were fixed, and unchanged by the
 sampling fix, because sampling sits outside the forward pass.
 
+### One ULP decides a token, and that is why parity is claimed in fp32
+
+The 8B parity test failed when §2.3 landed, and what it caught is worth keeping.
+Its fixture compared liteinfer against `transformers` in bf16 without pinning the
+attention kernel, so it silently started measuring the *new* kernel against an
+eager reference. One prompt of three diverged at token 11. Both kernels rank the
+same three candidates there:
+
+| kernel | top-3 logits | top-2 gap | picks |
+|---|---|---:|---|
+| `sdpa` | 20.25, 20.125, 19.875 | 0.125 | 3169 |
+| `paged` | 20.125, 20.125, 19.875 | **0.000** | 279 |
+
+bf16 carries 8 mantissa bits, so between 16 and 32 the representable values are
+0.125 apart: `sdpa`'s "gap" is **one ULP**, the smallest disagreement the format
+can express, and `paged` rounds both candidates onto the same value. The
+tie-break then takes the lower token id, and twenty tokens of text change.
+
+Nothing here is wrong. The kernels are token-identical in fp32, agree to 1e-5
+there and to 2⁻⁶ in bf16 on real rows, and rank these candidates identically —
+what differs is the order in which the key axis is summed, since `paged` folds
+64 keys at a time through an online softmax where the dense kernels take the
+whole axis in one GEMM. What the failure actually shows is that **greedy
+decoding is a discontinuous readout of a continuous quantity**: at a tie it
+amplifies the last bit of the last accumulation into a completely different
+continuation.
+
+Two rules come out of it, and both were already written down — this is the run
+that made them concrete. A parity claim between kernels is made in **fp32**,
+where there is no tie to break. And a test that holds the *model* constant must
+pin the *kernel* on both sides, or the engine's own choice of kernel will
+eventually turn it into a precision test nobody meant to write.
+
 ### A kernel benchmark is not an engine benchmark
 
 Worth recording because it cost a day and nearly shipped a regression. Attention
