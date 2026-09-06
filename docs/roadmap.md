@@ -301,9 +301,11 @@ listed.
 - **Parity test.** Compiled vs eager: identical greedy outputs.
 
 ### 3.2 CUDA graph capture for decode
-- **Status.** `planned`
+- **Status.** `planned` — **the largest general win on the board, and its ceiling
+  is now measured rather than estimated: 1.50x at B=32, 1.76x at B=1.**
 - **Blocked on.** nothing, as of §2.3. Built, measured at 1.06x against the
-  gathering decode, and reverted — see below.
+  gathering decode, and reverted — see below. The 1.06x is not what this is worth
+  now; the section *Re-measured after §2.3* says why.
 - **Why it looked compelling.** A decode step issues **822 kernels** to do 10.34 ms
   of GPU work in a 13.96 ms step; the gaps between launches are idle time, and a
   graph replays the whole sequence as one submission.
@@ -344,12 +346,47 @@ listed.
   computed on the first layer, inside the forward pass. They now happen in
   `decode()` before it, so the forward contains no host-side work — which any
   capture requires, and which §2.3 wanted anyway.
-- **It was measured on the wrong batch width, and §2.7 found out.** The 1.06x
-  above is B=32, where a decode step has real GPU work in it. At **B=1** the same
-  step is 7.35 ms of GPU time inside 12.8 ms of wall clock — **43% idle across
-  ~700 launches** — and `paged_decode` alone costs 74 us of host time per call
-  against 11.8 us of kernel. Nothing has measured graphs there. Re-measure at B=1
-  before sizing this from the 1.06x.
+- **Re-measured after §2.3, and the number is completely different.** Two
+  independent methods, same conclusion. Profiling a decode forward: GPU busy is
+  6.19 / 6.88 / 7.97 ms at B=1 / 8 / 32 inside a wall of 12.8 / 13.6 / 13.6 ms, so
+  the GPU is **41-52% idle at every batch width**, across 693-725 launches, at a
+  flat **18.7 us of wall per launch**. Capturing the same forward and timing
+  replay agrees:
+
+  | | B=1 | B=8 | B=32 |
+  |---|---:|---:|---:|
+  | `decode()` step, eager | 12.39 ms | 12.96 ms | 13.20 ms |
+  | its forward, eager | 11.18 ms | 11.67 ms | 11.67 ms |
+  | its forward, replayed | **5.84 ms** | **6.41 ms** | **7.28 ms** |
+  | launch overhead | 48% of it | 45% | 38% |
+  | **step if launches were free** | **1.76x** | **1.68x** | **1.50x** |
+
+  Which is a general win: every batch width, every context, both modes. Projected
+  onto the stored rows it takes ITL p50 13.4 → ~7.6 ms (the gap to vLLM's 5.2 ms
+  closing from 2.58x to ~1.46x) and B=32 throughput 1,930 → ~2,900 tok/s.
+- **Why the first attempt read 1.06x.** It was measured before §2.3. A graph
+  fixes every shape, so the KV length must be bucketed — and back then padding the
+  KV length padded a *gather*, real bytes per layer per step. §2.3 deleted the
+  gather, so the same padding now costs a few masked loads inside one kernel.
+  §2.3 also cut the step's GPU work, which raised the share of it that is host
+  dispatch. Both changes push the same way.
+- **Feasibility is checked, not assumed.** The forward captures on today's code
+  first try — §29 having moved the host-side work out of it is what makes that
+  true. Replaying it against static buffers refilled from live engine state over
+  six steps, with per-sequence contexts of 207-215 and a 512-slot KV bucket 2.4x
+  wider than the real context, is **bit-identical to eager**: max logit difference
+  0, same argmax every step.
+- **That also retires the parity worry recorded below.** The bf16 divergence this
+  entry feared came from the dense path summing over a padded key axis in a
+  different order. The paged kernel never reads the padding — `context_lens`
+  bounds its loop — so the bucket is invisible to the answer and the fp32-only
+  parity claim is no longer necessary on this path.
+- **What it leaves for §3.1.** Replay is 7.28 ms at B=32 against a memory
+  roofline of **3.55 ms** (1.24B bf16 weights, A40 at 696 GB/s), so 2.05x. vLLM's
+  whole step is 5.2 ms, 1.47x roofline. After graphs the remaining gap is GPU work
+  — 725 launches is ~45 kernels per layer where a Llama layer needs ~10 — and that
+  is §3.1's target. Size §3.1 after this lands, not before: it is currently sized
+  against a step where a launch costs 18.7 us, and graphs change that.
 - **It gates §2.7.** Split-K makes the decode kernel up to 7.15x faster on the
   GPU and the engine 0.94x slower, because it adds one launch per layer to a step
   that is paying per launch. A capture removes that cost, which turns §2.7's GPU

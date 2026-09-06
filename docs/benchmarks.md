@@ -654,6 +654,90 @@ from the section above still holds, with a corollary: **measure the component to
 find the target, measure the engine to size it — and compute the ceiling before
 writing the kernel.**
 
+### The step is 40-50% launch overhead, at every batch width
+
+Asked where the next general win is, the engine's own instrumentation answers
+first. `TimeBreakdown` has recorded the loop's stages since §6.4 and nothing had
+read it. At B=32, ISL 128 / OSL 256, 64 prompts:
+
+| stage | share of loop |
+|---|---:|
+| forward | **93.0%** |
+| sample | 3.6% |
+| unattributed | 1.8% |
+| deliver | 1.3% |
+| schedule | 0.4% |
+
+So the five PRs that went after sampling, detokenisation and per-step transfers
+have finished that job: everything outside the forward is 7% of the loop. Whatever
+comes next has to come out of the forward.
+
+**Inside the forward, the GPU is idle about half the time — and that does not
+change with batch width.** Profiling a decode forward at three widths, same
+context:
+
+| | B=1 | B=8 | B=32 |
+|---|---:|---:|---:|
+| forward wall / step | 12.80 ms | 13.60 ms | 13.55 ms |
+| GPU busy / step | 6.19 ms | 6.88 ms | 7.97 ms |
+| GPU idle / step | **6.61 ms (52%)** | **6.72 ms (49%)** | **5.58 ms (41%)** |
+| kernel launches / step | 693 | 725 | 725 |
+| wall per launch | 18.5 µs | 18.8 µs | 18.7 µs |
+
+Read the last row first. The step costs about 18.7 µs per launch whatever the
+kernels are doing, and 32x the tokens buys only 1.29x the GPU time — which is
+also why throughput scales with batch while the step does not move. This is a
+launch-bound loop.
+
+**Capturing the forward and replaying it prices the fix exactly.** Same forward,
+same inputs, interleaved and repeated in one process:
+
+| | B=1 | B=8 | B=32 |
+|---|---:|---:|---:|
+| `decode()` step, eager | 12.39 ms | 12.96 ms | 13.20 ms |
+| its forward, eager | 11.18 ms | 11.67 ms | 11.67 ms |
+| its forward, replayed | 5.84 ms | 6.41 ms | 7.28 ms |
+| **step if launches were free** | **1.76x** | **1.68x** | **1.50x** |
+
+Two independent methods agreeing — the profiler's idle share and the replay
+delta — is the standard this file asks for, and they do. Replay also comes in
+just under profiled GPU-busy time, as it should, since profiling inflates kernel
+durations slightly.
+
+And replay is not just fast, it is correct against changing inputs: refilling
+static buffers from live engine state over six steps, with per-sequence contexts
+of 207-215 and a 512-slot KV bucket 2.4x wider than the real context, matches
+eager **bit for bit** — max logit difference 0, same argmax every step. The
+padding is invisible because `context_lens` bounds the paged kernel's loop, which
+also retires the fp32-only parity caveat §3.2 recorded for the dense path.
+
+**Where that leaves the engine against the roofline.** Llama-3.2-1B in bf16 is
+~2.47 GB of weights to read per decode step; an A40 at 696 GB/s puts the floor at
+**3.55 ms**:
+
+| | step | vs roofline |
+|---|---:|---:|
+| roofline | 3.55 ms | 1.00x |
+| vLLM ITL | 5.20 ms | 1.47x |
+| liteinfer, GPU busy only (B=32) | 7.97 ms | 2.25x |
+| liteinfer, replayed forward (B=32) | 7.28 ms | 2.05x |
+| liteinfer, actual step (B=32) | 13.20 ms | 3.72x |
+
+liteinfer's *kernels* are already within ~1.4x of vLLM's entire step. The 2.58x
+ITL gap is host dispatch, and it is the one line in this table that a single
+change removes. What survives it is the 2.05x — 725 launches is ~45 kernels per
+layer where a Llama layer needs about ten — and that is §3.1, which should be
+sized after graphs land rather than against a step where a launch costs 18.7 µs.
+
+**Two measurement traps caught on the way, both the same trap as §2.7's.** Timed
+sequentially, the second of two configurations came out ~25% slower whichever one
+it was: clock drift over a run, wide enough here to invert the comparison, so
+everything above is interleaved with per-configuration minima. And the bare
+forward first measured *slower than the whole step containing it* — because
+`decode()` is decorated `@torch.inference_mode()` and a hand-written call is not,
+so it was paying autograd bookkeeping the engine never pays. That one read the
+launch overhead 15 points high before it was found.
+
 ---
 
 ## Certification
