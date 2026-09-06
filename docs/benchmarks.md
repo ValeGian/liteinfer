@@ -140,7 +140,8 @@ takes that trade deliberately, and this is where the bill arrives.
 | `liteinfer-paged-b4` | 4 | 252.9 | 1.0 | 202.4 | 3.79× | 0.35× |
 | `liteinfer-continuous` | 32 | 1,638.8 | 6.4 | 31.2 | 6.48×† | 0.37× |
 | `liteinfer-sdpa` | 32 | 1,744.8 | 6.8 | 29.3 | 1.06× | 0.39× |
-| `liteinfer-paged-attn` | 32 | **1,930.0** | 7.5 | 26.5 | **1.11×** | 0.43× |
+| `liteinfer-paged-attn` | 32 | 1,930.0 | 7.5 | 26.5 | **1.11×** | 0.43× |
+| `liteinfer-graphs` | 32 | **3,111.7** | 12.2 | 16.5 | **1.61×** | 0.70× |
 | `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
 | `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
 | `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
@@ -164,7 +165,8 @@ not be parallelised.
 | `liteinfer-paged-b4` | 19.0 ms | 20.9 ms | 15.0 ms | 15.0 ms | 3,832.2 ms | 1.02× |
 | `liteinfer-continuous` | 19.0 ms | 21.0 ms | 14.9 ms | 14.9 ms | 3,807.6 ms | 1.01× |
 | `liteinfer-sdpa` | **14.0 ms** | 15.9 ms | 13.9 ms | 14.0 ms | 3,546.6 ms | **1.07×** |
-| `liteinfer-paged-attn` | 14.5 ms | 16.2 ms | **13.4 ms** | 13.5 ms | **3,431.3 ms** | 1.03× |
+| `liteinfer-paged-attn` | 14.5 ms | 16.2 ms | 13.4 ms | 13.5 ms | 3,431.3 ms | 1.03× |
+| `liteinfer-graphs` | 14.9 ms | 16.6 ms | **6.6 ms** | **6.6 ms** | **1,698.3 ms** | **2.03×** |
 | `vllm` | 22.7 ms | 27.4 ms | 5.2 ms | 5.2 ms | 1,354.8 ms | — |
 | `vllm-b4` | 22.6 ms | 27.0 ms | 5.2 ms | 5.2 ms | 1,353.9 ms | — |
 | `vllm-continuous` | 23.2 ms | 32.2 ms | 5.2 ms | 5.2 ms | 1,356.2 ms | — |
@@ -500,8 +502,10 @@ Inside the forward pass, one decode step at B=32 now profiles as 13.96 ms wall
 against a 3.56 ms weight-read floor: 11.02 ms of GPU work spread over **822
 kernel launches**, and 2.93 ms — a fifth of the step — with the GPU idle waiting
 for Python to issue the next one. That idle fifth is what §3.2's CUDA graphs
-recover. It was a quarter before the transfers were fixed, and unchanged by the
-sampling fix, because sampling sits outside the forward pass.
+went on to recover — see *The step was 40-50% launch overhead* below, where the
+same measurement at 725 launches priced it and the capture collected it. It was a
+quarter before the transfers were fixed, and unchanged by the sampling fix,
+because sampling sits outside the forward pass.
 
 ### One ULP decides a token, and that is why parity is claimed in fp32
 
@@ -654,6 +658,156 @@ from the section above still holds, with a corollary: **measure the component to
 find the target, measure the engine to size it — and compute the ceiling before
 writing the kernel.**
 
+### The step was 40-50% launch overhead, at every batch width (§3.2)
+
+Asked where the next general win is, the engine's own instrumentation answers
+first. `TimeBreakdown` has recorded the loop's stages since §6.4 and nothing had
+read it. At B=32, ISL 128 / OSL 256, 64 prompts:
+
+| stage | share of loop |
+|---|---:|
+| forward | **93.0%** |
+| sample | 3.6% |
+| unattributed | 1.8% |
+| deliver | 1.3% |
+| schedule | 0.4% |
+
+So the five PRs that went after sampling, detokenisation and per-step transfers
+have finished that job: everything outside the forward is 7% of the loop. Whatever
+comes next has to come out of the forward.
+
+**Inside the forward, the GPU is idle about half the time — and that does not
+change with batch width.** Profiling a decode forward at three widths, same
+context:
+
+| | B=1 | B=8 | B=32 |
+|---|---:|---:|---:|
+| forward wall / step | 12.80 ms | 13.60 ms | 13.55 ms |
+| GPU busy / step | 6.19 ms | 6.88 ms | 7.97 ms |
+| GPU idle / step | **6.61 ms (52%)** | **6.72 ms (49%)** | **5.58 ms (41%)** |
+| kernel launches / step | 693 | 725 | 725 |
+| wall per launch | 18.5 µs | 18.8 µs | 18.7 µs |
+
+Read the last row first. The step costs about 18.7 µs per launch whatever the
+kernels are doing, and 32x the tokens buys only 1.29x the GPU time — which is
+also why throughput scales with batch while the step does not move. This is a
+launch-bound loop.
+
+**Capturing the forward and replaying it prices the fix exactly.** Same forward,
+same inputs, interleaved and repeated in one process:
+
+| | B=1 | B=8 | B=32 |
+|---|---:|---:|---:|
+| `decode()` step, eager | 12.39 ms | 12.96 ms | 13.20 ms |
+| its forward, eager | 11.18 ms | 11.67 ms | 11.67 ms |
+| its forward, replayed | 5.84 ms | 6.41 ms | 7.28 ms |
+| **step if launches were free** | **1.76x** | **1.68x** | **1.50x** |
+
+Two independent methods agreeing — the profiler's idle share and the replay
+delta — is the standard this file asks for, and they do. Replay also comes in
+just under profiled GPU-busy time, as it should, since profiling inflates kernel
+durations slightly.
+
+And replay is not just fast, it is correct against changing inputs: refilling
+static buffers from live engine state over six steps, with per-sequence contexts
+of 207-215 and a 512-slot KV bucket 2.4x wider than the real context, matches
+eager **bit for bit** — max logit difference 0, same argmax every step. The
+padding is invisible because `context_lens` bounds the paged kernel's loop, which
+also retires the fp32-only parity caveat §3.2 recorded for the dense path.
+
+**Where that leaves the engine against the roofline.** Llama-3.2-1B in bf16 is
+~2.47 GB of weights to read per decode step; an A40 at 696 GB/s puts the floor at
+**3.55 ms**:
+
+| | step | vs roofline |
+|---|---:|---:|
+| roofline | 3.55 ms | 1.00x |
+| vLLM ITL | 5.20 ms | 1.47x |
+| liteinfer, GPU busy only (B=32) | 7.97 ms | 2.25x |
+| liteinfer, replayed forward (B=32) | 7.28 ms | 2.05x |
+| liteinfer, actual step (B=32) | 13.20 ms | 3.72x |
+
+liteinfer's *kernels* are already within ~1.4x of vLLM's entire step. The 2.58x
+ITL gap is host dispatch, and it is the one line in this table that a single
+change removes. What survives it is the 2.05x — 725 launches is ~45 kernels per
+layer where a Llama layer needs about ten — and that is §3.1, which should be
+sized after graphs land rather than against a step where a launch costs 18.7 µs.
+
+**Two measurement traps caught on the way, both the same trap as §2.7's.** Timed
+sequentially, the second of two configurations came out ~25% slower whichever one
+it was: clock drift over a run, wide enough here to invert the comparison, so
+everything above is interleaved with per-configuration minima. And the bare
+forward first measured *slower than the whole step containing it* — because
+`decode()` is decorated `@torch.inference_mode()` and a hand-written call is not,
+so it was paying autograd bookkeeping the engine never pays. That one read the
+launch overhead 15 points high before it was found.
+
+#### What it actually paid
+
+Built as `liteinfer-graphs` and measured against `liteinfer-paged-attn`, whose
+stored rows are the same engine with capture pinned off:
+
+| throughput | paged-attn | graphs | |
+|---|---:|---:|---:|
+| 128 / 256 | 1,930.0 | **3,111.7** | **1.61×** |
+| 128 / 1024 | 1,921.9 | **2,959.1** | **1.54×** |
+| 1024 / 1024 | 1,783.6 | **2,356.2** | 1.32× |
+| 1024 / 256 | 1,542.0 | **1,990.8** | 1.29× |
+| 2048 / 128 | 820.1 | **908.2** | 1.11× |
+
+| latency, B=1 | paged-attn | graphs | |
+|---|---:|---:|---:|
+| ITL p50, ISL 128 / OSL 256 | 13.4 ms | **6.6 ms** | **2.03×** |
+| e2e p50 | 3,431.3 ms | **1,698.3 ms** | 2.02× |
+| ITL p50, ISL 3584 / OSL 128 | 13.8 ms | **7.9 ms** | 1.75× |
+| TTFT p50 | 14.5 ms | 14.9 ms | — |
+
+The gap to vLLM closes from **0.43× to 0.70×** on throughput and from **2.58× to
+1.27×** on the decode step. It is the largest single change the project has
+measured, and it is general: every batch width, every context, both modes.
+
+**What it cost.** TTFT does not move, because prefill is not captured — its
+shapes follow the prompt, and there is one prefill per request against hundreds
+of decodes. ISL 2048 / OSL 128 is the weakest row at 1.11×, barely past the
+variance floor, for the same reason: it is the shape with the most prefill and
+the fewest decode steps to spread a fixed saving over. The first step at each
+batch width pays three warm-up forwards and a capture. And a very wide engine
+would accumulate graphs, so `_MAX_CAPTURES` bounds them at 64 — untouched at the
+default `max_num_seqs` of 32, where a draining batch captures all 32 widths and
+**reserved memory went down** 2.1 GiB, the eager path's transient allocations
+having been larger than the graph pool that replaced them.
+
+**The component estimate read *low* this time, which is new.** The ceiling above
+predicted 1.76× at B=1 and the engine gave 2.03×. Every previous disagreement in
+this file went the other way, by 30-60%. The reason is the shape: the ceiling was
+measured at 765 tokens of context and the benchmark's is 128-384, so there is
+less GPU work under the same fixed overhead and a larger share of the step to
+remove. An overhead-removal estimate scales with how little work the step
+contains — which is the mirror image of §2.3's rule about removing a copy.
+
+**Where the engine now sits against the roofline.** Reading ~2.47 GB of bf16
+weights per step on an A40 at 696 GB/s is a 3.55 ms floor:
+
+| | step | vs roofline |
+|---|---:|---:|
+| roofline | 3.55 ms | 1.00× |
+| vLLM ITL | 5.20 ms | 1.47× |
+| liteinfer ITL, after §3.2 | 6.60 ms | 1.86× |
+| liteinfer ITL, before | 13.40 ms | 3.77× |
+
+What is left is arithmetic, not overhead: ~725 launches is about 45 kernels per
+layer where a Llama layer needs ten, and the elementwise work among them costs
+far more in launches than in GPU time. That is §3.1, and it can now be sized
+against a step where a launch is nearly free rather than one where it cost
+18.7 µs.
+
+**And it unblocks §2.7 with a caveat worth writing down.** Split-K decode was
+reverted because it added one launch per layer to a step that paid per launch;
+inside a capture that cost is gone, and its GPU win was up to 7.15× per layer.
+But `num_splits` is a *scalar* kernel argument, and a graph bakes those in while
+the split count this engine chooses varies with context — so §2.7 after §3.2 has
+to pin one count per capture rather than choose per step.
+
 ---
 
 ## Certification
@@ -687,11 +841,11 @@ Ordered by cost, largest first.
 
 | Gap | Measured | Root cause | Roadmap |
 |---|---|---|---|
-| ~3x slower than vLLM per decode step, at every batch width | ITL 13.7 ms vs 5.2 ms; ~25% of memory bandwidth vs vLLM's 68% | No CUDA graphs, no fused attention | [§3.1](roadmap.md#31-torchcompile-of-the-forward-path), [§3.2](roadmap.md#32-cuda-graph-capture-for-decode), [§3.3](roadmap.md#33-flash--sdpa-attention) |
+| 1.3x slower than vLLM per decode step | ITL 6.6 ms vs 5.2 ms; 1.86x the memory roofline vs vLLM's 1.47x | Unfused elementwise work — ~45 kernels per layer where ten would do | [§3.1](roadmap.md#31-fuse-the-forwards-elementwise-work) |
 | Decode is single-request-slow at narrow batches | paged attention is 7.73x per layer at B=32 but 2.27x at B=1 | One program per (sequence, KV head) leaves an 84-SM GPU idle at B=1 | [§2.7](roadmap.md#27-split-the-key-loop-when-the-batch-is-narrow) |
 | Prefill still gathers, pads and expands | not isolated; `_repeat_kv` and the prefill mask are unchanged | §2.3 addressed decode only | [§3.5](roadmap.md#35-broadcast-the-grouped-query-heads-instead-of-expanding-them), [§3.6](roadmap.md#36-pack-the-batch-instead-of-padding-it) |
 | Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Two-pass step when prefill and decode coexist | [§1.3](roadmap.md#13-chunked-prefill--single-pass-mixed-batching) |
-| KV-cache benefit unquantified across shapes | 1.21x at ISL 128 / OSL 256 only | Single measured shape; the crossover is sequence-length dependent | [§8.3](roadmap.md#83-sequence-length-sweep-workload) |
+| KV-cache benefit unquantified across shapes | 1.21x at ISL 128 / OSL 256 only | Single measured shape, and not re-measurable: the no-cache and DynamicCache configs are `historical`, so the number is frozen at the engine of the day they were deleted | — |
 | No prefix-cache benefit | not measured | Prefix caching not implemented | [§2.2](roadmap.md#22-prefix-sharing) |
 
 See [`docs/roadmap.md`](roadmap.md) for the full backlog.

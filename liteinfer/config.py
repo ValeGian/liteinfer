@@ -34,6 +34,13 @@ class EngineConfig:
     # dies holding work it never ran.
     max_waiting_seqs: int = 1024
 
+    # Replay the decode forward from a CUDA graph instead of launching it kernel
+    # by kernel. None captures wherever the preconditions hold (CUDA, and the
+    # paged attention kernel, whose bounds are a tensor a capture cannot freeze);
+    # True asks for it and fails rather than downgrading. See
+    # `engine/cuda_graphs.py`.
+    enable_cuda_graphs: bool | None = None
+
     collect_stats: bool = True
 
     # KV block pool.
