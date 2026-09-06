@@ -196,7 +196,7 @@ listed.
   Follow-up to §2.3.
 - **Blocked on.** §3.2. The kernel win is real and the engine cannot spend it
   until the decode forward stops paying per launch — see below.
-- **PRs.** _none yet_
+- **PRs.** [#34](https://github.com/ValeGian/liteinfer/pull/34) — built, measured, reverted.
 - **Why.** The paged kernel runs one program per (sequence, KV head), which is
   256 programs at B=32 and **8** at B=1 — on an A40's 84 SMs, a single-request
   decode leaves most of the GPU idle. Measured per layer at 8 KV heads, 32 query
@@ -254,8 +254,8 @@ listed.
   launches, and nothing has measured graphs there. That is a bigger prize than
   the one §3.2's entry currently claims, and it is measured on the wrong batch
   width.
-- **The implementation is in the history of the branch that filed this
-  measurement** (`perf/split-k-decode`), as §3.2's is. Roughly 400 lines: two
+- **The implementation is in the history of the PR that filed this measurement**
+  ([#34](https://github.com/ValeGian/liteinfer/pull/34)), as §3.2's is. Roughly 400 lines: two
   grids sharing one online-softmax device function, a combine kernel, a chooser
   fitted to the sweep, and 14 tests including a split-count sweep against the
   dense reference. `docs/benchmarks.md` carries the analysis and the two
