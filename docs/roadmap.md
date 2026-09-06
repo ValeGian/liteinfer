@@ -146,6 +146,47 @@ listed.
   a slot table, so mixing prefill and decode in one pass is a question of giving
   it more than one query per sequence.
 
+### 1.4 Spend the batch width the flat step already pays for
+- **Status.** `planned` — **2.19x measured, and the largest general win now on
+  the board.**
+- **PRs.** _none yet_
+- **Why.** §3.2 left the decode step nearly flat in batch width, and a flat step
+  is throughput waiting to be collected: the same weights are read once per step
+  whatever the batch, so every extra sequence is nearly free. Measured on the
+  captured step at 256 tokens of context:
+
+  | `max_num_seqs` | step | decode tok/s |
+  |---:|---:|---:|
+  | 32 | 7.63 ms | 4,196 |
+  | 64 | 8.93 ms | 7,165 |
+  | 128 | 11.25 ms | 11,381 |
+  | 256 | 17.30 ms | 14,797 |
+
+  Eight times the batch for 2.3x the step. Through the harness at ISL 128 /
+  OSL 256 that is **3,111.7 → 6,820.6 tok/s, 2.19x**, wall 16.5 → 7.5 s — and
+  liteinfer at 128 is then 1.53x vLLM's *32-wide* number, though that comparison
+  is a batch width rather than an engine and belongs nowhere near the report.
+- **Which is why this is not just a bigger default.** `max_num_seqs=128` is
+  already reachable by any caller; what is missing is the engine being safe at it.
+  Two things have to land first:
+  - **§2.6.** The pool is sized to `max_num_seqs` x `max_model_len` or to a
+    fraction of whatever is free, whichever is smaller. At 128 x 4096 that is
+    17.2 GiB, which fits an A40 and does not fit a 24 GiB card — where #20's
+    WARNING fires and the pool is quietly too small for the concurrency the
+    config claims. Profiling the forward at full width, which is what §2.6 is,
+    is what makes a wide default honest on hardware it was not measured on.
+  - **The capture ladder.** `DecodeGraphs` records one graph per exact batch
+    width and `_MAX_CAPTURES` bounds that at 64, which never binds at 32 and
+    binds immediately at 128. A wide engine wants vLLM's approach instead: a
+    ladder of captured widths with each batch padded up to the next one, padded
+    rows given a context length of 1 against the null block and their logits
+    discarded. That is the piece §3.2 deliberately skipped because it was not
+    needed at 32.
+- **Then measure against vLLM at matched width**, which means a `vllm-b128` row
+  as well; the point is not the 2.19x against our own narrower self.
+- **Parity test.** Greedy output unchanged at 128 concurrent sequences, and the
+  pool neither exhausted nor sized below what the config promises.
+
 ---
 
 ## 2. KV cache implementations
@@ -172,7 +213,8 @@ listed.
   parity test against fp16/bf16.
 
 ### 2.6 KV pool sizing from a measured activation budget
-- **Status.** `planned`
+- **Status.** `planned` — **now gates §1.4, which is worth 2.19x**, so this is
+  the cheapest thing standing in front of the largest one.
 - **PRs.** follow-up to [#20](https://github.com/ValeGian/liteinfer/pull/20)
 - **Why.** #20 sized the pool as `min(affordable, reachable)`, which stops it
   hoarding VRAM it can never address. `affordable` is still a guess: a fraction
@@ -272,14 +314,51 @@ listed.
 ## 3. Performance optimizations
 
 ### 3.1 Fuse the forward's elementwise work
-- **Status.** `planned` — **the next general win, and §3.2 is what makes it
-  sizeable.** With a launch nearly free, what is left of the step is arithmetic:
-  ITL is 1.86x the 3.55 ms memory roofline against vLLM's 1.47x, and ~725
-  launches is about 45 kernels per layer where a Llama layer needs ten.
-- **Blocked on.** the pool write, not the gather. Measured at **0.06x** before
-  §2.3; §2.3 removed half the reason. Re-measure inside a captured forward: the
-  17.9% of GPU time that elementwise work costs is now the part worth having,
-  where before it was dwarfed by the launches around it.
+- **Status.** `planned` — **ceiling measured at ~1.12x and not built.** It was
+  next in line after §3.2 and the profile disagreed; §1.4 is worth 2.19x for less
+  work. Re-open it when the batch width has been spent.
+- **Blocked on.** nothing. What stops it is its own size.
+- **What the profile says, inside a captured forward.** `mm` is **79.8%** of the
+  GPU time at B=1 and 78.5% at B=32, over exactly 113 launches — 7 per layer plus
+  the head, which is already the minimum a Llama layer needs. Everything fusible
+  is the other fifth:
+
+  | op | ms / step (B=1) | share | calls | per layer |
+  |---|---:|---:|---:|---:|
+  | `mm` | 4.730 | 79.8% | 113 | 7.06 |
+  | `mul` | 0.316 | 5.3% | 149 | 9.31 |
+  | `copy_` | 0.158 | 2.7% | 75 | 4.69 |
+  | `add` | 0.150 | 2.5% | 98 | 6.12 |
+  | `_index_put_impl_` | 0.126 | 2.1% | 32 | 2.00 |
+  | `cat` | 0.109 | 1.8% | 33 | 2.06 |
+  | `mean` | 0.107 | 1.8% | 33 | 2.06 |
+  | `neg` | 0.072 | 1.2% | 32 | 2.00 |
+  | `rsqrt` | 0.049 | 0.8% | 33 | 2.06 |
+  | `pow` | 0.047 | 0.8% | 33 | 2.06 |
+  | `silu` | 0.038 | 0.6% | 16 | 1.00 |
+
+  Non-`mm` work totals **1.20 ms of 5.93**. Fusing RMSNorm (`pow`+`mean`+`rsqrt`+
+  two `mul` into one), RoPE (`neg`+`cat`+two `mul`+`add` into one) and SiLU·mul,
+  and merging the QKV projection, adds up to about **0.72 ms** — a 6.6 ms step
+  becoming 5.9, so **1.12x**, for three custom kernels with parity tests and a
+  change to how weights are loaded. Making *every* non-`mm` kernel free would be
+  1.22x, which is the hard ceiling.
+- **The one GEMM merge that pays, and the one that does not.** Measured on the
+  projections alone through a captured graph: merging q/k/v into one GEMM is
+  **1.16x at B=1 and 1.38x at B=32** (411 → 477 GB/s — three skinny GEMMs each
+  pay their own tail), while merging gate/up is **0.97-1.02x**, because at
+  2048x8192 each one already saturates. So the QKV merge is worth having and the
+  MLP merge is not, which is not what "fuse the projections" would have assumed.
+- **Why the elementwise work costs what it does.** 475 elementwise launches per
+  step at ~1.8 us each, and at B=1 each one touches 2,048 elements — far too
+  little to be bandwidth-bound. That is a per-kernel floor, so fusion helps by
+  removing kernel *instances*, not by moving fewer bytes. It is also why the
+  saving barely changes between B=1 and B=32.
+- **`torch.compile` is still the wrong tool for it.** Measured at **0.06x** before
+  §2.3 because inductor functionalises the in-place pool write into a copy of the
+  whole pool; excluding the cache mutation recovered 1.02x and then recompiled
+  once per `layer_idx`. If this is built, build it as three Triton kernels against
+  a dense reference — the shape `models/paged_decode.py` already established.
 - **PRs.** _none yet_
 - **What it measured.** `torch.compile` on the decode forward is 206.66 ms
   against eager's 12.87 ms at a fixed shape — and it is *not* recompiling.

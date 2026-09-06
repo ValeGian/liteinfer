@@ -808,6 +808,79 @@ But `num_splits` is a *scalar* kernel argument, and a graph bakes those in while
 the split count this engine chooses varies with context — so §2.7 after §3.2 has
 to pin one count per capture rather than choose per step.
 
+### What §3.2 left behind, and it is not fusion (§3.1)
+
+§3.1 was next in line — with a launch nearly free, the step is arithmetic — so it
+was profiled before it was built. Inside a captured forward at B=1, 455 tokens of
+context:
+
+| op | ms / step | share | calls | per layer |
+|---|---:|---:|---:|---:|
+| `mm` | 4.730 | **79.8%** | 113 | 7.06 |
+| `mul` | 0.316 | 5.3% | 149 | 9.31 |
+| `copy_` | 0.158 | 2.7% | 75 | 4.69 |
+| `add` | 0.150 | 2.5% | 98 | 6.12 |
+| `_index_put_impl_` | 0.126 | 2.1% | 32 | 2.00 |
+| `cat` | 0.109 | 1.8% | 33 | 2.06 |
+| `mean` | 0.107 | 1.8% | 33 | 2.06 |
+| `neg` | 0.072 | 1.2% | 32 | 2.00 |
+| `rsqrt` | 0.049 | 0.8% | 33 | 2.06 |
+| `pow` | 0.047 | 0.8% | 33 | 2.06 |
+| `silu` | 0.038 | 0.6% | 16 | 1.00 |
+
+The matmuls are 79.8% of it over exactly **113 launches — 7 per layer plus the
+head**, which is already the fewest a Llama layer can be written with. Everything
+fusible is the other 1.20 ms of 5.93, and fusing RMSNorm, RoPE and SiLU·mul while
+merging the QKV projection comes to about 0.72 ms: a 6.6 ms step becoming 5.9,
+**1.12x**, for three custom kernels with parity tests and a change to weight
+loading. Making every non-`mm` kernel free would be 1.22x. That is the ceiling,
+and by this file's own standard — an effect under ~1.1x is not an effect — 1.12x
+is barely one.
+
+Two details worth keeping from the attempt that did not happen. **Only one of the
+two obvious GEMM merges pays:** measured on the projections alone through a
+captured graph, merging q/k/v is 1.16x at B=1 and **1.38x at B=32** (411 → 477
+GB/s, three skinny GEMMs each paying their own tail), while merging gate/up is
+0.97-1.02x because at 2048×8192 each already saturates. "Fuse the projections"
+would have done both. And **the elementwise cost is kernel count, not bytes**: 475
+launches at ~1.8 µs each, touching 2,048 elements apiece at B=1, which is far too
+little to be bandwidth-bound. That is a per-kernel floor, which is why the saving
+hardly moves between B=1 and B=32.
+
+### The flat step is throughput nobody is collecting (§1.4)
+
+The same measurement that priced §3.2 said something else in passing: the step is
+nearly flat in batch width. Flat means the weights are read once per step no
+matter how many sequences share it, so every extra sequence is nearly free.
+Measured on the captured step at 256 tokens of context:
+
+| `max_num_seqs` | step | decode tok/s | |
+|---:|---:|---:|---:|
+| 32 | 7.63 ms | 4,196 | — |
+| 64 | 8.93 ms | 7,165 | 1.71× |
+| 128 | 11.25 ms | 11,381 | **2.71×** |
+| 256 | 17.30 ms | 14,797 | 3.53× |
+
+Eight times the batch for 2.3× the step. Through the harness at ISL 128 / OSL 256,
+`max_num_seqs=128` measures **6,820.6 tok/s against 3,111.7 — 2.19×** — with wall
+time 16.5 → 7.5 s.
+
+So the next general win is roughly twice what fusing the forward could ever be,
+and it is a batch width rather than a kernel. It is not merely a bigger default,
+though: `max_num_seqs=128` is reachable by any caller today, and what is missing
+is the engine being *safe* at it. The pool is sized to `max_num_seqs` ×
+`max_model_len` or to a fraction of free memory, whichever is smaller — 17.2 GiB
+at 128 × 4096, which fits an A40 and does not fit a 24 GiB card, where the pool
+goes quietly under what the config promises. And `DecodeGraphs` records one graph
+per exact batch width with a cap of 64, which never binds at 32 and binds
+immediately at 128. Those are §2.6 and a capture ladder, filed as §1.4's
+prerequisites.
+
+The number above is deliberately **not** in the results table. Comparing a
+128-wide row to a 32-wide one measures the batch width, which is the one
+comparison this file refuses to make against vLLM and should not make against
+itself either. It belongs in the table when there is a `vllm-b128` beside it.
+
 ---
 
 ## Certification
