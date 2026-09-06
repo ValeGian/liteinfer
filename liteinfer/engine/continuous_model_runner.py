@@ -32,6 +32,10 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _GIB = 1 << 30
 
+# Stand-in device size for CPU runs, which exist to test the sizing logic rather
+# than to serve anything. A constant keeps those tests independent of the host.
+_CPU_NOMINAL_TOTAL_BYTES = 1 << 30
+
 
 def _head_dim(hf_config: PretrainedConfig) -> int:
     """Head dimension, which most configs state and the rest imply."""
@@ -251,28 +255,54 @@ class ContinuousModelRunner:
             self._log_pool(self.config.num_gpu_blocks, bytes_per_block, "set by num_gpu_blocks")
             return self.config.num_gpu_blocks
 
-        budget = (
-            torch.cuda.mem_get_info(self.device)[0] if self.device.type == "cuda" else 1 << 30
-        )
-        affordable = int(budget * self.config.kv_cache_memory_fraction) // bytes_per_block
+        affordable = self._affordable_blocks(bytes_per_block)
         reachable = math.ceil(
             self.config.max_num_seqs * self.config.max_model_len / self.config.block_size
         )
 
         if affordable < reachable:
+            # Naming the concurrency it can actually serve is the part a caller can
+            # act on: `max_num_seqs` is otherwise a promise the pool cannot keep.
+            servable = affordable * self.config.block_size // self.config.max_model_len
             _LOGGER.warning(
-                "KV pool holds %d blocks but this config could need %d: "
-                "%d concurrent sequences of %d tokens may exhaust it. "
-                "Lower max_num_seqs or max_model_len, or raise kv_cache_memory_fraction.",
-                affordable, reachable, self.config.max_num_seqs, self.config.max_model_len,
+                "KV pool holds %d blocks but this config could need %d: at "
+                "max_model_len=%d it can serve %d concurrent sequences, not "
+                "max_num_seqs=%d. Lower max_num_seqs or max_model_len, or raise "
+                "gpu_memory_utilization.",
+                affordable, reachable, self.config.max_model_len, servable,
+                self.config.max_num_seqs,
             )
             num_blocks = max(1, affordable)
-            reason = "limited by free memory"
+            reason = "limited by the memory budget"
         else:
             num_blocks = max(1, reachable)
             reason = f"sized for {self.config.max_num_seqs} x {self.config.max_model_len} tokens"
         self._log_pool(num_blocks, bytes_per_block, reason)
         return num_blocks
+
+    def _affordable_blocks(self, bytes_per_block: int) -> int:
+        """Blocks the memory budget allows, given the weights already resident.
+
+        `mem_get_info`'s *free* figure was the obvious budget and the wrong one:
+        the same config on the same GPU sized differently depending on what else
+        happened to be resident a second earlier, which made a benchmark's pool a
+        property of the machine's history rather than of the run. Total memory is
+        a device constant and the weights are deterministic, so this answer is
+        reproducible across loads.
+
+        What it still does not measure is the forward pass. `memory_allocated`
+        counts tensors torch allocated, so the CUDA context and cuBLAS workspaces
+        fall outside it, and the activations have not been allocated yet at all —
+        the fraction is what covers both. Replacing it with a profiled figure is
+        the rest of §2.6, and needs the worst-case forward to be bounded first.
+        """
+        if self.device.type == "cuda":
+            total = torch.cuda.get_device_properties(self.device).total_memory
+            resident = torch.cuda.memory_allocated(self.device)
+        else:
+            total, resident = _CPU_NOMINAL_TOTAL_BYTES, 0
+        budget = int(total * self.config.gpu_memory_utilization) - resident
+        return max(0, budget) // bytes_per_block
 
     def _log_pool(self, num_blocks: int, bytes_per_block: int, reason: str) -> None:
         _LOGGER.info(

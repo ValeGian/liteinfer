@@ -168,13 +168,18 @@ listed.
   is a batch width rather than an engine and belongs nowhere near the report.
 - **Which is why this is not just a bigger default.** `max_num_seqs=128` is
   already reachable by any caller; what is missing is the engine being safe at it.
-  Two things have to land first:
-  - **§2.6.** The pool is sized to `max_num_seqs` x `max_model_len` or to a
-    fraction of whatever is free, whichever is smaller. At 128 x 4096 that is
-    17.2 GiB, which fits an A40 and does not fit a 24 GiB card — where #20's
-    WARNING fires and the pool is quietly too small for the concurrency the
-    config claims. Profiling the forward at full width, which is what §2.6 is,
-    is what makes a wide default honest on hardware it was not measured on.
+  Three things have to land first:
+  - **§3.7, and this one is hard rather than untidy.** Prefill's LM head runs
+    over every position, so its logits tensor is `batch x prompt_len x vocab`. At
+    `max_num_seqs=128` and a 2,048-token prompt that is **62.6 GiB**, which does
+    not fit an A40 at all: §1.4 would not be slow at long prompts, it would not
+    run. §3.7 deletes the tensor rather than budgeting for it.
+  - **§2.6.** The pool is sized to `max_num_seqs` x `max_model_len` or to the
+    memory budget, whichever is smaller. At 128 x 4096 that is 17.2 GiB, which
+    fits an A40 and does not fit a 24 GiB card — where the WARNING fires and the
+    pool is quietly too small for the concurrency the config claims. Step one has
+    landed, so that outcome is now predictable rather than a property of the
+    machine's history; the profiled budget is what would make it correct.
   - **The capture ladder.** `DecodeGraphs` records one graph per exact batch
     width and `_MAX_CAPTURES` bounds that at 64, which never binds at 32 and
     binds immediately at 128. A wide engine wants vLLM's approach instead: a
@@ -213,8 +218,9 @@ listed.
   parity test against fp16/bf16.
 
 ### 2.6 KV pool sizing from a measured activation budget
-- **Status.** `planned` — **now gates §1.4, which is worth 2.19x**, so this is
-  the cheapest thing standing in front of the largest one.
+- **Status.** `in-progress` — step one landed (the budget is a function of the
+  config and the device now); step two is blocked on §3.7, which is what makes
+  the worst-case forward small enough to profile.
 - **PRs.** follow-up to [#20](https://github.com/ValeGian/liteinfer/pull/20)
 - **Why.** #20 sized the pool as `min(affordable, reachable)`, which stops it
   hoarding VRAM it can never address. `affordable` is still a guess: a fraction
@@ -229,9 +235,29 @@ listed.
   load, record peak allocation, and give the pool what is left — vLLM's
   approach. The WARNING #20 added stays useful either way; it names which of
   the two constraints bound the pool.
+- **Step one, landed.** `kv_cache_memory_fraction` becomes
+  `EngineConfig.gpu_memory_utilization` and applies to the device's **total**
+  memory less the weights already resident, which is vLLM's meaning for the same
+  name. The bug it fixes is sharper than "not reproducible": torch's caching
+  allocator keeps freed blocks, so CUDA's *free* figure stays low after an
+  allocation is released — and the pool lost **19% of its blocks (72,516 →
+  58,589) to 8 GiB that no longer existed**. Sized from total, the same two
+  measurements agree exactly. The default config is unaffected because
+  `reachable` binds there: 8,192 blocks / 4.00 GiB before and after, so no stored
+  benchmark result moves. The WARNING now also names the concurrency the pool can
+  actually serve, since `max_num_seqs` is otherwise a promise it cannot keep.
+- **Step two is blocked, and the blocker is worth more than the step.** Profiling
+  "one worst-case forward at `max_num_seqs` × `max_model_len`" assumes that
+  forward fits, and it does not: at 32 × 4,096 the prefill's logits tensor alone
+  is **31 GiB**, because the LM head runs over every position (§3.7). Bound that
+  and the worst case becomes profilable; until then the profile run is the thing
+  most likely to run out of memory. Two ways to bound it: §3.7 removes the
+  logits, and §1.3's chunk size caps the prefill tokens per pass — which is what
+  makes vLLM's own profile run a fixed size.
 - **Parity test.** Pool size is identical across two loads separated by an
-  unrelated allocation; profiled size leaves a forward pass at full width
-  headroom to complete.
+  unrelated allocation — landed as a GPU test that allocates and frees 2 GiB
+  between two sizings; profiled size leaves a forward pass at full width headroom
+  to complete.
 
 ### 2.7 Split the key loop when the batch is narrow
 - **Status.** `planned` — built, measured at **0.94x** in the engine, and reverted.
@@ -438,6 +464,35 @@ listed.
   §3.5 turned out to be reachable without it, on a different backend.
 - **Parity test.** Greedy output unchanged on a variable-length batch, which is
   the case padding exists to serve.
+
+### 3.7 Compute prefill logits only where they are read
+- **Status.** `planned` — **the engine's largest allocation, and 96% of it is
+  never read.** Gates §1.4 and §2.6's second step.
+- **PRs.** _none yet_
+- **Why.** `LlamaForCausalLM.forward` applies the LM head to every position and
+  `prefill` then returns `logits[:, -1, :]`. Measured at batch 8, 2,048-token
+  prompts:
+
+  | | |
+  |---|---:|
+  | prefill peak allocation over baseline | 4.05 GiB |
+  | the logits tensor inside it | **3.91 GiB — 96%** |
+  | rows of it that are read | 8 of 16,384 (**0.05%**) |
+  | LM head flops | 8.61 TFLOP, 0.05% useful |
+
+  So the prefill's peak memory *is* this tensor, and it grows with
+  `batch x prompt_len`: 15.6 GiB at 32 x 2,048, 31 GiB at 32 x 4,096, 62.6 GiB at
+  128 x 2,048. That is why long prompts are the weak shape, and it is where the
+  surplus §2.1 freed from the pool was actually going. The head is also about a
+  fifth of prefill's arithmetic, so dropping all but the last row is a throughput
+  win at prefill-heavy shapes on top of being a capability fix.
+- **Scope.** `forward` takes the positions whose logits are wanted — `None`
+  meaning all of them, which is the path the `transformers` parity tests compare
+  — and the head runs on that slice only. `prefill` asks for one position per
+  sequence; decode already passes one token per sequence and is unaffected. vLLM
+  does the same thing under the name `logits_indices`.
+- **Parity test.** `tests/e2e/test_llama_parity.py` stays bit-exact, which pins
+  the `None` path; sliced prefill logits equal the same rows of an unsliced pass.
 
 ---
 

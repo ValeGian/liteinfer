@@ -881,6 +881,94 @@ The number above is deliberately **not** in the results table. Comparing a
 comparison this file refuses to make against vLLM and should not make against
 itself either. It belongs in the table when there is a `vllm-b128` beside it.
 
+### The pool is sized from the device now, not from the machine's history (§2.6)
+
+The block pool took a fraction of *free* VRAM, which made its size depend on
+what else happened to be resident. The sharper version of that bug is that it
+depends on what was resident a moment **earlier**: torch's caching allocator
+keeps freed blocks, so CUDA's free figure stays low after an allocation is
+released.
+
+| blocks a memory-bound pool would take | from free VRAM | from total VRAM |
+|---|---:|---:|
+| weights only | 72,516 | 72,208 |
+| after 8 GiB allocated **and freed** | 58,589 | 72,208 |
+| | **−19%** | unchanged |
+
+`gpu_memory_utilization` now applies to total memory less the weights already
+resident — vLLM's meaning for the same name — so the size is a function of the
+config and the device. The default config is unaffected, because
+`max_num_seqs × max_model_len` binds it there: 8,192 blocks / 4.00 GiB before and
+after, so no stored result moves.
+
+**The second half of §2.6 is blocked, and the blocker is the bigger find.** The
+plan was to replace the fraction with a profiled figure: run the worst-case
+forward at `max_num_seqs × max_model_len` and give the pool what is left. That
+assumes the worst-case forward fits, and it does not — see below.
+
+### Prefill's largest allocation is logits nobody reads (§3.7)
+
+`LlamaForCausalLM.forward` applies the LM head to every position; `prefill`
+returns `logits[:, -1, :]`. Measured at batch 8 with 2,048-token prompts:
+
+| | |
+|---|---:|
+| prefill peak allocation over baseline | 4.05 GiB |
+| the logits tensor inside it | **3.91 GiB — 96% of the peak** |
+| rows of it that are read | 8 of 16,384 — **0.05%** |
+| LM head flops | 8.61 TFLOP, 0.05% useful |
+
+The prefill's peak memory *is* this tensor, and it scales with
+`batch × prompt_len`: 15.6 GiB at 32 × 2,048, 31 GiB at 32 × 4,096, and **62.6 GiB
+at 128 × 2,048**, which does not fit an A40 at all.
+
+Three things follow. It is where the surplus §2.1 freed from the pool was
+actually going, and a large part of why *Long prompts are liteinfer's weak shape*
+above. It blocks §2.6's profile run, since the thing to be profiled is dominated
+by a tensor that should not exist. And it blocks §1.4 outright: raising
+concurrency to 128 would not be slow at long prompts, it would fail to run.
+
+The head is also roughly a fifth of prefill's arithmetic, so this is a throughput
+win at prefill-heavy shapes as well as a capability fix. Filed as §3.7, scoped at
+about five lines.
+
+### Would capturing prefill help? Only where prefill is small (§3.2 follow-up)
+
+vLLM graphs prefill, so the question is fair. It does it through **piecewise**
+capture: the inductor graph is split at the attention ops, attention runs outside
+the graph, and every other piece is captured — which works for any shape,
+including mixed prefill/decode batches. Full-forward graphs are reserved for
+uniform decode batches, which is exactly what `DecodeGraphs` is, and what vLLM
+calls `FULL_DECODE_ONLY`.
+
+Whether liteinfer wants the piecewise version depends on how much of a prefill is
+waiting rather than working:
+
+| prompt length | prefill wall | GPU busy | GPU idle |
+|---:|---:|---:|---:|
+| 128 | 12.92 ms | 8.08 ms | **4.84 ms (37%)** |
+| 512 | 20.11 ms | 18.83 ms | 1.28 ms (6%) |
+| 2048 | 80.60 ms | 79.83 ms | 0.77 ms (1%) |
+
+A liteinfer prefill is the whole prompt in one pass, so it is large and
+GPU-bound as soon as the prompt is non-trivial — the idle share collapses by 512
+tokens. That is *why* the value looks low here, and it is a property of this
+engine rather than of the technique: vLLM's prefills are chunked to
+`max_num_batched_tokens`, so most of its forwards are small mixed batches where
+the launch overhead dominates and piecewise capture pays. Two consequences worth
+recording:
+
+- Capturing prefill on its own would buy about 1.6x on TTFT at ISL 128 and
+  nothing past 512, at the cost of one capture per (prompt-length bucket × batch
+  width) — and unlike decode's slot-table padding, padding a prompt wastes real
+  compute.
+- **§1.3 changes the arithmetic and partly undoes §3.2.** Chunked prefill merges
+  prefill and decode into one pass, and a mixed pass is not a uniform decode
+  batch, so `DecodeGraphs` would not cover it. At OSL 256 with 32 slots that is
+  roughly one step in eight, so the loss is modest — but §1.3 should land with a
+  plan for capturing mixed batches, which is the point at which piecewise stops
+  being low-value here.
+
 ---
 
 ## Certification
