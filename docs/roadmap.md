@@ -54,6 +54,11 @@ single-request ITL; both belong in the write-up.
 `docs/benchmarks.md`, headline numbers in `README.md`, a milestone entry with
 its PR link, and the roadmap item flipped to `landed`.
 
+Check what the headline numbers still refer to while you are there. Every entry
+in a sequence of five re-ran `throughput` and none re-ran `latency`, and the
+README ended up quoting a config that had been deleted two milestones earlier —
+a number does not stop being published when the code behind it is removed.
+
 **6. Does it replace, or does it join?** Two questions, in this order.
 
 *Does it cover the whole domain of the thing it beats?* Continuous batching

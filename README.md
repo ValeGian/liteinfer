@@ -151,20 +151,21 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 
 | | liteinfer | vLLM | |
 |---|---:|---:|---|
-| Decode step (ITL p50) | 13.7 ms | 5.2 ms | 2.6× behind |
-| Throughput, B=4 | 282 tok/s | 724 tok/s | 2.6× behind |
-| Throughput, B=32 | 1,268 tok/s | 4,467 tok/s | 3.5× behind |
-| Batching gain, B=1 → B=4 | 3.84× | 3.84× | on par |
-| Time to first token (p50) | 15.7 ms | 22.7 ms | 1.4× ahead\* |
+| Throughput, B=32 | 1,733 tok/s | 4,467 tok/s | 2.6× behind |
+| Decode step (ITL p50) | 13.9 ms | 5.2 ms | 2.7× behind |
+| Time to first token (p50) | 14.0 ms | 23.2 ms | 1.7× ahead\* |
+| Long prompts (ISL 2048) | runs | runs | eager attention cannot |
 
 \* At this prompt length TTFT is mostly fixed per-call API overhead rather than
 prefill compute, so read it as offline round-trip latency, not prefill speed.
 
-Batching is competitive at both tiers; what remains is a roughly flat ~3× per-step
-decode constant at every batch width — no CUDA graphs, no varlen packing.
-Attention is fused (SDPA), which bought prompt length rather than speed: at
-ISL 2048 the eager kernel asks for 16 GiB in one allocation and dies, while the
-fused one runs.
+Every row is the engine as it ships — one execution path, continuous batching
+over a paged KV cache with fused attention. What remains is a roughly flat
+~2.7× per-step decode constant at every batch width: no CUDA graphs, no varlen
+packing, and a paged cache that still gathers its KV into a contiguous tensor
+every step. Those three are measured and queued, not guessed —
+[`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including two
+optimisations that were built, measured and reverted.
 Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:
 [`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).
 
