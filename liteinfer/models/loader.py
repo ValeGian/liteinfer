@@ -108,13 +108,10 @@ def load_hf_model(config: EngineConfig, model_dir: Path) -> tuple[nn.Module, Pre
     model_cls = _DISPATCH[architecture]
     device = config.resolved_device()
 
-    # The kernel is chosen here because this is the first point where all three
-    # inputs to the choice exist: the requested name, the device, and the
-    # model's head dimension. Layers read it back off `hf_config`, and so does
-    # the runner, so the decision is made once.
-    hf_config._attn_implementation = select_implementation(
-        config.attn_implementation, device, head_dim_of(hf_config)
-    )
+    # Chosen here because this is where the model is told which kernel to use.
+    # Layers read it back off `hf_config`, and so does the runner, so the
+    # decision is made once.
+    hf_config._attn_implementation = select_implementation(config.attn_implementation, device)
     _LOGGER.info("attention kernel: %s", hf_config._attn_implementation)
 
     # Initialize on the target device so non-persistent buffers (e.g.

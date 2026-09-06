@@ -308,7 +308,7 @@ listed.
   4x copy of K and V, 0.74 GiB of writes per decode step. §2.3's kernel reads
   each KV head once and broadcasts over its query group in-register, so on the
   paged path that copy is gone. `_repeat_kv` still runs in **prefill**, and on
-  the dense decode path that CPU and unsupported head dimensions still use — so
+  the dense decode path that CPU and Triton-less installs still use — so
   the item is not closed, it is re-scoped to prefill, where the copy is made once
   per prompt rather than once per token and is worth much less.
 - **What it measured on its own.** Only cuDNN broadcasts KV heads under an

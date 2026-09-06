@@ -4,8 +4,8 @@
 The three entries differ in what they keep in memory and in where they read
 K and V from. `EngineConfig.attn_implementation=None` — the default — means
 "the fastest one that runs here", which `select_implementation` resolves once
-per engine from the device and the model's head dimension. Naming one asks for
-it specifically, and is refused rather than downgraded when it cannot run.
+per engine from the device. Naming one asks for it specifically, and is refused
+rather than downgraded when it cannot run.
 
 `eager` writes the full `[batch, heads, queries, keys]` score matrix out and
 reads it back; `sdpa` hands the whole operation to PyTorch, which tiles it and
@@ -184,14 +184,14 @@ def validate_name(name: str | None) -> None:
         resolve(name)
 
 
-def unsupported_reason(name: str, device: torch.device, head_dim: int) -> str | None:
-    """Why this kernel cannot serve this device and model, or `None` if it can.
+def unsupported_reason(name: str, device: torch.device) -> str | None:
+    """Why this kernel cannot run here, or `None` if it can.
 
-    Only the paged kernel has preconditions: it is Triton, so it needs CUDA, the
-    package installed, and a power-of-two head dimension (see
-    `models/paged_decode.supports_head_dim`). The Triton check comes before that
-    import for a reason — on a CPU-only install the module cannot be imported at
-    all.
+    Only the paged kernel has preconditions, and both are about where the code
+    can execute rather than what it is asked to compute: it is a Triton kernel,
+    so it needs CUDA and the package installed. Any head dimension and any
+    query-head grouping are served, by padding those axes to a tile Triton can
+    index (see `models/paged_decode`).
     """
     if name != PAGED_IMPLEMENTATION:
         return None
@@ -199,15 +199,10 @@ def unsupported_reason(name: str, device: torch.device, head_dim: int) -> str | 
         return f"it is a CUDA kernel and the device is {device}"
     if importlib.util.find_spec("triton") is None:
         return "Triton is not installed"
-
-    from liteinfer.models.paged_decode import supports_head_dim
-
-    if not supports_head_dim(head_dim):
-        return f"it tiles the head dimension in powers of two and this model's is {head_dim}"
     return None
 
 
-def select_implementation(requested: str | None, device: torch.device, head_dim: int) -> str:
+def select_implementation(requested: str | None, device: torch.device) -> str:
     """Resolve a kernel name, choosing one when the caller did not.
 
     An explicit request that cannot run is an error rather than a silent
@@ -215,10 +210,10 @@ def select_implementation(requested: str | None, device: torch.device, head_dim:
     that kernel, or hear why it could not.
     """
     if requested is None:
-        blocked = unsupported_reason(PAGED_IMPLEMENTATION, device, head_dim)
+        blocked = unsupported_reason(PAGED_IMPLEMENTATION, device)
         return UNIVERSAL_IMPLEMENTATION if blocked else PAGED_IMPLEMENTATION
 
-    blocked = unsupported_reason(requested, device, head_dim)
+    blocked = unsupported_reason(requested, device)
     if blocked is not None:
         raise ValueError(
             f"attn_implementation={requested!r} cannot run here: {blocked}. "

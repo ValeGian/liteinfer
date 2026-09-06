@@ -131,8 +131,6 @@ def test_unknown_kernel_is_rejected_at_config_time():
 # Choosing a kernel: the fastest that runs here, or the one that was asked for
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_HEAD_DIM = 64
-
 # Three of these tests assert what happens when the paged kernel *can* run, which
 # is only true where Triton is installed. That is the precondition itself, so it
 # is the condition to skip on rather than CUDA.
@@ -144,38 +142,33 @@ _needs_triton = pytest.mark.skipif(
 
 @_needs_triton
 def test_the_choice_is_paged_where_its_preconditions_hold():
-    assert select_implementation(None, torch.device("cuda"), _SUPPORTED_HEAD_DIM) == "paged"
+    assert select_implementation(None, torch.device("cuda")) == "paged"
 
 
 def test_the_choice_falls_back_off_cuda():
-    assert select_implementation(None, torch.device("cpu"), _SUPPORTED_HEAD_DIM) == "sdpa"
-
-
-def test_the_choice_falls_back_on_a_head_dim_the_paged_kernel_cannot_tile():
-    assert select_implementation(None, torch.device("cuda"), 96) == "sdpa"
+    assert select_implementation(None, torch.device("cpu")) == "sdpa"
 
 
 @_needs_triton
 @pytest.mark.parametrize("name", sorted(IMPLEMENTATIONS))
 def test_a_named_kernel_that_can_run_is_returned_unchanged(name):
-    assert select_implementation(name, torch.device("cuda"), _SUPPORTED_HEAD_DIM) == name
+    assert select_implementation(name, torch.device("cuda")) == name
 
 
 def test_a_named_kernel_that_cannot_run_is_refused_rather_than_downgraded():
     """A silent downgrade would make a benchmark row measure a kernel it did not name."""
     with pytest.raises(ValueError, match="cannot run here"):
-        select_implementation("paged", torch.device("cpu"), _SUPPORTED_HEAD_DIM)
+        select_implementation("paged", torch.device("cpu"))
 
 
-@_needs_triton
 def test_the_reason_a_kernel_cannot_run_names_the_precondition_that_failed():
-    reason = unsupported_reason("paged", torch.device("cuda"), 96)
+    reason = unsupported_reason("paged", torch.device("cpu"))
 
-    assert reason is not None and "96" in reason
+    assert reason is not None and "CUDA" in reason
 
 
 def test_the_universal_kernel_has_no_preconditions():
-    assert unsupported_reason("sdpa", torch.device("cpu"), 96) is None
+    assert unsupported_reason("sdpa", torch.device("cpu")) is None
 
 
 @pytest.mark.gpu

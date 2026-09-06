@@ -44,11 +44,13 @@ import triton.language as tl
 # {32, 64, 128} on an A40; the tile has to be at least 16 for `tl.dot`.
 _BLOCK_KV = 64
 
-# `tl.dot` needs at least 16 rows. Models have far fewer query heads per KV head
-# than that (4 for Llama-3.2, 8 for Llama-3-70B), so the query tile is padded up
-# and the extra rows are masked off at the store. They cost tensor-core flops on
-# a kernel that is bound by KV bandwidth, which is the cheap thing to waste.
-_MIN_QUERY_ROWS = 16
+# `tl.dot` needs tiles of at least 16 and `tl.arange` needs a power-of-two
+# length. Neither the query-head group (4 for Llama-3.2, 8 for Llama-3-70B) nor
+# every model's head dimension (96 for Phi-3-mini, 80 for Phi-2) is such a
+# number, so both axes are padded up to a legal tile. Padding costs tensor-core
+# flops on a kernel bound by KV bandwidth, which is the cheap thing to waste;
+# where an axis is already legal the padded and real extents coincide.
+_MIN_TILE = 16
 
 
 @triton.jit
@@ -72,6 +74,7 @@ def _paged_decode_kernel(
     QUERY_ROWS: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_TILE: tl.constexpr,
 ):
     """One program per (sequence, KV head). Folds the sequence's slots into a running softmax.
 
@@ -87,20 +90,26 @@ def _paged_decode_kernel(
     # sequence's real tokens are its *last* `context_len` columns.
     pad = max_context - context_len
 
-    dims = tl.arange(0, HEAD_DIM)
+    dims = tl.arange(0, HEAD_DIM_TILE)
+    is_real_dim = dims < HEAD_DIM
     query_rows = tl.arange(0, QUERY_ROWS)
     is_real_head = query_rows < NUM_GROUPS
     head_offsets = kv_head * NUM_GROUPS + query_rows
 
+    # Zeroing the query's padded lanes is what makes the padding arithmetically
+    # free: a zero contributes nothing to the score dot however much rubbish sits
+    # opposite it in K, and the masked store below drops the padded outputs. Every
+    # other mask on these two axes is therefore about memory, not about answers.
+    is_real_element = is_real_head[:, None] & is_real_dim[None, :]
     query = tl.load(
         query_ptr + seq * query_stride_seq + head_offsets[:, None] * query_stride_head + dims[None, :],
-        mask=is_real_head[:, None],
+        mask=is_real_element,
         other=0.0,
     )
 
     running_max = tl.full([QUERY_ROWS], float("-inf"), dtype=tl.float32)
     running_sum = tl.zeros([QUERY_ROWS], dtype=tl.float32)
-    accumulator = tl.zeros([QUERY_ROWS, HEAD_DIM], dtype=tl.float32)
+    accumulator = tl.zeros([QUERY_ROWS, HEAD_DIM_TILE], dtype=tl.float32)
 
     for start in range(0, context_len, BLOCK_KV):
         offsets = start + tl.arange(0, BLOCK_KV)
@@ -111,8 +120,13 @@ def _paged_decode_kernel(
             other=0,
         )
         pool_offsets = slots[:, None] * pool_stride_slot + kv_head * pool_stride_head + dims[None, :]
-        keys = tl.load(key_pool_ptr + pool_offsets, mask=is_real_key[:, None], other=0.0)
-        values = tl.load(value_pool_ptr + pool_offsets, mask=is_real_key[:, None], other=0.0)
+        # `is_real_dim` here is a bounds guard, not a correctness one: the last KV
+        # head of the last slot is the end of the allocation, so a padded lane
+        # would read past it. The values it would load could not reach the output
+        # either way, which is why no test can distinguish this mask being wrong.
+        is_addressable = is_real_key[:, None] & is_real_dim[None, :]
+        keys = tl.load(key_pool_ptr + pool_offsets, mask=is_addressable, other=0.0)
+        values = tl.load(value_pool_ptr + pool_offsets, mask=is_addressable, other=0.0)
 
         scores = tl.dot(query, tl.trans(keys), input_precision="ieee") * scaling
         scores = tl.where(is_real_key[None, :], scores, float("-inf"))
@@ -131,18 +145,15 @@ def _paged_decode_kernel(
     tl.store(
         out_ptr + seq * out_stride_seq + head_offsets[:, None] * out_stride_head + dims[None, :],
         (accumulator / running_sum[:, None]).to(out_ptr.dtype.element_ty),
-        mask=is_real_head[:, None],
+        mask=is_real_element,
     )
 
 
-def supports_head_dim(head_dim: int) -> bool:
-    """Whether this kernel can serve a model with this head dimension.
-
-    Triton indexes with `tl.arange`, whose length must be a power of two, and the
-    head dimension is one of those lengths. Llama's 64 and 128 qualify; a model
-    with 96 does not, and has to run on a dense kernel instead.
-    """
-    return head_dim > 0 and head_dim & (head_dim - 1) == 0
+def _tile(extent: int) -> int:
+    """The smallest tile Triton can index that covers `extent`."""
+    # `next_power_of_2` is annotated as returning a Triton `constexpr`; it is an
+    # int here, and the kernel wants it as one.
+    return max(_MIN_TILE, int(triton.next_power_of_2(extent)))
 
 
 def paged_decode(
@@ -156,6 +167,9 @@ def paged_decode(
     block_kv: int = _BLOCK_KV,
 ) -> torch.Tensor:
     """Attend one query per sequence over the KV each sequence's slots address.
+
+    Any head dimension and any query-head grouping are served: an axis Triton
+    cannot index directly is padded to a tile and masked.
 
     Args:
         query: ``[batch, num_heads, head_dim]`` — the decode token's queries.
@@ -171,8 +185,6 @@ def paged_decode(
         ``[batch, num_heads, head_dim]``, same dtype as ``query``.
     """
     batch, num_heads, head_dim = query.shape
-    if not supports_head_dim(head_dim):
-        raise ValueError(f"paged decode needs a power-of-two head_dim, got {head_dim}")
     if key_pool.stride() != value_pool.stride():
         raise ValueError("key and value pools must be laid out identically")
 
@@ -195,8 +207,9 @@ def paged_decode(
         scaling,
         slot_table.shape[1],
         NUM_GROUPS=num_kv_groups,
-        QUERY_ROWS=max(_MIN_QUERY_ROWS, triton.next_power_of_2(num_kv_groups)),
+        QUERY_ROWS=_tile(num_kv_groups),
         BLOCK_KV=block_kv,
         HEAD_DIM=head_dim,
+        HEAD_DIM_TILE=_tile(head_dim),
     )
     return out

@@ -22,10 +22,10 @@ class EngineConfig:
 
     seed: int = 42
 
-    # Attention kernel, or None for the fastest one this device and model can
-    # run — "paged" on CUDA with a power-of-two head dimension, "sdpa"
-    # otherwise. Naming one asks for it specifically and fails rather than
-    # downgrading. See `models/attention.py`.
+    # Attention kernel, or None for the fastest one this device can run —
+    # "paged" on CUDA with Triton installed, "sdpa" otherwise. Naming one asks
+    # for it specifically and fails rather than downgrading. See
+    # `models/attention.py`.
     attn_implementation: str | None = None
 
     # How many requests may sit queued but not yet running. `max_num_seqs` caps

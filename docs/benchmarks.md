@@ -95,10 +95,9 @@ refuses to run them.
 | `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
 
 `liteinfer-paged-attn` is the engine as it ships on CUDA: `EngineConfig()`
-resolves its attention kernel from the device and the model, and picks the paged
-one wherever its preconditions hold. `liteinfer-sdpa` is what that choice falls
-back to — off CUDA, without Triton, or on a model whose head dimension the
-Triton kernel cannot tile — so both rows describe shipping configurations rather
+resolves its attention kernel from the device and picks the paged one wherever it
+can run. `liteinfer-sdpa` is what that choice falls back to — off CUDA, or
+without a Triton install — so both rows describe shipping configurations rather
 than one being an experiment. Every row above them is a design that was measured
 and then removed, kept so the progression still renders.
 

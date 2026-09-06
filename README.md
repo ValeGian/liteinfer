@@ -72,7 +72,7 @@ async def main():
 asyncio.run(main())
 ```
 
-The attention kernel is chosen for the device and the model unless you name
+The attention kernel is chosen for the device unless you name
 one — on CUDA that is `paged`, a Triton kernel that reads the KV pool in place
 instead of gathering it, so the decode step stops growing with context. Pass
 `attn_implementation="sdpa"` or `"eager"` to override; naming a kernel that
@@ -116,7 +116,7 @@ One engine: continuous batching over a paged KV cache.
   reference, but caps the prompt length that fits in memory. `paged` is the fast
   decode path: a Triton kernel that reads the KV pool through the slot table
   instead of gathering it, so the decode step stops growing with context. The
-  engine picks between them from the device and the model's head dimension.
+  engine picks between them from the device.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
 without touching the engine. `stats` records a `StepMetrics` per forward pass.

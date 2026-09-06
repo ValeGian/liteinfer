@@ -13,7 +13,7 @@ import torch
 
 from liteinfer.engine.attention_mask import build_continuous_decode_mask
 from liteinfer.models.attention import DenseKV, eager_attention
-from liteinfer.models.paged_decode import paged_decode, supports_head_dim
+from liteinfer.models.paged_decode import paged_decode
 
 pytestmark = pytest.mark.gpu
 
@@ -32,6 +32,7 @@ class _PagedBatch:
         dtype: torch.dtype,
         num_heads: int = NUM_HEADS,
         num_kv_heads: int = NUM_KV_HEADS,
+        head_dim: int = HEAD_DIM,
         seed: int = 0,
     ) -> None:
         device = torch.device("cuda")
@@ -44,9 +45,10 @@ class _PagedBatch:
         self.device = device
         self.context_lens = context_lens
         self.num_kv_groups = num_heads // num_kv_heads
-        self.key_pool = randn(NUM_SLOTS, num_kv_heads, HEAD_DIM)
-        self.value_pool = randn(NUM_SLOTS, num_kv_heads, HEAD_DIM)
-        self.query = randn(len(context_lens), num_heads, HEAD_DIM)
+        self.scaling = head_dim**-0.5
+        self.key_pool = randn(NUM_SLOTS, num_kv_heads, head_dim)
+        self.value_pool = randn(NUM_SLOTS, num_kv_heads, head_dim)
+        self.query = randn(len(context_lens), num_heads, head_dim)
 
         # Right-aligned, exactly as `cache.block_pool.slot_table` builds it:
         # a sequence's real tokens are its last `context_len` columns, and the
@@ -66,7 +68,7 @@ class _PagedBatch:
             self.value_pool,
             self.slot_table,
             context_lens,
-            SCALING,
+            self.scaling,
             self.num_kv_groups,
         )
 
@@ -76,7 +78,7 @@ class _PagedBatch:
         values = self.value_pool[self.slot_table].permute(0, 2, 1, 3)
         mask = build_continuous_decode_mask(self.context_lens, self.dtype, self.device)
         out = eager_attention(
-            self.query.unsqueeze(2), DenseKV(keys, values), mask, SCALING, self.num_kv_groups
+            self.query.unsqueeze(2), DenseKV(keys, values), mask, self.scaling, self.num_kv_groups
         )
         return out.squeeze(2)
 
@@ -132,24 +134,29 @@ def test_paged_decode_never_reads_a_slot_outside_the_context():
     torch.testing.assert_close(batch.paged(), with_null_padding, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    ("head_dim", "is_supported"), [(64, True), (128, True), (96, False), (0, False)]
-)
-def test_supported_head_dims_are_the_powers_of_two(head_dim, is_supported):
-    """The rule the engine consults at load, before it accepts any request."""
-    assert supports_head_dim(head_dim) is is_supported
+@pytest.mark.parametrize("head_dim", [96, 80, 48, 24])
+def test_paged_decode_matches_the_dense_kernel_on_a_head_dim_triton_cannot_index(head_dim):
+    """`tl.arange` needs a power-of-two length, so these head dimensions are padded.
+
+    96 is Phi-3-mini's and 80 is Phi-2's, so this is the case a second
+    architecture brings rather than a hypothetical. What the padding must not do
+    is leak into the answer, which is what these shapes check.
+    """
+    batch = _PagedBatch([70, 5], torch.float32, head_dim=head_dim)
+
+    torch.testing.assert_close(batch.paged(), batch.dense(), rtol=1e-5, atol=1e-5)
 
 
-def test_paged_decode_rejects_a_head_dim_it_cannot_tile():
-    """Triton indexes in powers of two; an odd head_dim has to fail loudly, not silently pad."""
+def test_paged_decode_rejects_pools_that_are_not_laid_out_alike():
+    """One set of strides addresses both pools, so differing layouts would read garbage."""
     batch = _PagedBatch([4], torch.float32)
     context_lens = torch.tensor([4], dtype=torch.int32, device=batch.device)
 
-    with pytest.raises(ValueError, match="power-of-two head_dim"):
+    with pytest.raises(ValueError, match="laid out identically"):
         paged_decode(
-            batch.query[:, :, :12],
-            batch.key_pool[:, :, :12],
-            batch.value_pool[:, :, :12],
+            batch.query,
+            batch.key_pool,
+            batch.value_pool.transpose(1, 2),
             batch.slot_table,
             context_lens,
             SCALING,
