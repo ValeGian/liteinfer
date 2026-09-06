@@ -141,7 +141,7 @@ takes that trade deliberately, and this is where the bill arrives.
 | `liteinfer-continuous` | 32 | 1,638.8 | 6.4 | 31.2 | 6.48×† | 0.37× |
 | `liteinfer-sdpa` | 32 | 1,744.8 | 6.8 | 29.3 | 1.06× | 0.39× |
 | `liteinfer-paged-attn` | 32 | 1,930.0 | 7.5 | 26.5 | **1.11×** | 0.43× |
-| `liteinfer-graphs` | 32 | **3,111.7** | 12.2 | 16.5 | **1.61×** | 0.70× |
+| `liteinfer-graphs` | 32 | **3,115.6** | 12.2 | 16.4 | **1.61×** | 0.70× |
 | `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
 | `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
 | `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
@@ -166,7 +166,7 @@ not be parallelised.
 | `liteinfer-continuous` | 19.0 ms | 21.0 ms | 14.9 ms | 14.9 ms | 3,807.6 ms | 1.01× |
 | `liteinfer-sdpa` | **14.0 ms** | 15.9 ms | 13.9 ms | 14.0 ms | 3,546.6 ms | **1.07×** |
 | `liteinfer-paged-attn` | 14.5 ms | 16.2 ms | 13.4 ms | 13.5 ms | 3,431.3 ms | 1.03× |
-| `liteinfer-graphs` | 14.9 ms | 16.6 ms | **6.6 ms** | **6.6 ms** | **1,698.3 ms** | **2.03×** |
+| `liteinfer-graphs` | 14.7 ms | 16.2 ms | **6.6 ms** | **6.6 ms** | **1,700.9 ms** | **2.03×** |
 | `vllm` | 22.7 ms | 27.4 ms | 5.2 ms | 5.2 ms | 1,354.8 ms | — |
 | `vllm-b4` | 22.6 ms | 27.0 ms | 5.2 ms | 5.2 ms | 1,353.9 ms | — |
 | `vllm-continuous` | 23.2 ms | 32.2 ms | 5.2 ms | 5.2 ms | 1,356.2 ms | — |
@@ -897,14 +897,43 @@ released.
 
 `gpu_memory_utilization` now applies to total memory less the weights already
 resident — vLLM's meaning for the same name — so the size is a function of the
-config and the device. The default config is unaffected, because
+config and the device. The benchmark config is unaffected, because
 `max_num_seqs × max_model_len` binds it there: 8,192 blocks / 4.00 GiB before and
 after, so no stored result moves.
 
-**The second half of §2.6 is blocked, and the blocker is the bigger find.** The
-plan was to replace the fraction with a profiled figure: run the worst-case
-forward at `max_num_seqs × max_model_len` and give the pool what is left. That
-assumes the worst-case forward fits, and it does not — see below.
+It is a behaviour change elsewhere, though, and worth stating plainly: loading
+weights leaves enough allocator residue that CUDA's free figure reads well below
+`total − weights`. At Llama-3-8B's defaults the old formula produced **5,752
+blocks (11.24 GiB) where the config asks for 8,192 (16.00 GiB)** — the engine was
+quietly taking *less* than it was told whenever loading was untidy. It now takes
+what it was told, which is the point, and which means a process holding something
+else large has to say so. The 8B parity test co-loads a second copy of the same
+model as its reference and had been fitting on that accident; it now asks for the
+one short sequence it decodes.
+
+**The second half replaces the fraction with a measurement, and §3.7 is what made
+it possible.** The pool now subtracts a profiled figure: one prefill at
+`max_num_seqs × max_model_len`, which is not hypothetical because `schedule()`
+admits and prefills that many at once. On Llama-3.2-1B at 32 × 4,096 that is
+**9.04 GiB** — and **32.82 GiB** with the LM head left unsliced, which a 44 GiB
+card has nowhere to put beside weights and a pool. The roadmap had this step
+blocked on "bounding the worst case" without knowing what was making it large.
+
+The profile needs no pool, which is the trick that lets it run before the thing it
+is sizing exists: `ProfilePayload` returns the K/V the pass just computed, exactly
+as the prefill payload does after storing it, so the forward has the same shapes
+and the same peak while writing nowhere.
+
+**A test caught the first forward measuring itself.** Unwarmed, a 2-sequence
+config profiled **8.49 MiB where a 32-sequence one profiled 5.77** — the first
+forward in a process allocates cuBLAS workspaces that every later one reuses, and
+they landed inside the measurement, so the first engine loaded in any process
+would have been handed the smallest pool. One throwaway 16-token pass fixes it,
+after which the figures scale exactly 2× per doubling of the batch:
+
+| `max_num_seqs` | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|
+| profiled (MiB) | 0.361 | 0.721 | 1.442 | 2.883 | 5.766 |
 
 ### Prefill's largest allocation is logits nobody reads (§3.7)
 
@@ -928,9 +957,27 @@ above. It blocks §2.6's profile run, since the thing to be profiled is dominate
 by a tensor that should not exist. And it blocks §1.4 outright: raising
 concurrency to 128 would not be slow at long prompts, it would fail to run.
 
-The head is also roughly a fifth of prefill's arithmetic, so this is a throughput
-win at prefill-heavy shapes as well as a capability fix. Filed as §3.7, scoped at
-about five lines.
+#### What it paid, and what it did not
+
+`forward` now takes a `logits_positions` slice — `None` still computes every
+position, which is what the `transformers` parity tests compare — and every caller
+in the engine passes `LAST_POSITION`. The logits come back bit-identical and the
+prefill peak goes **3.98 → 1.01 GiB**.
+
+| | before | after | |
+|---|---:|---:|---:|
+| TTFT p50, ISL 3584 | 162.5 ms | **147.2 ms** | **1.10×** |
+| throughput, 2048 / 128 | 908.2 | **979.0** | 1.08× |
+| throughput, 1024 / 256 | 1,990.8 | 2,069.3 | 1.04× |
+| throughput, 1024 / 1024 | 2,356.2 | 2,376.1 | 1.01× |
+| throughput, 128 / 256 | 3,111.7 | 3,115.6 | 1.00× |
+| ITL p50 | 6.6 ms | 6.6 ms | — |
+
+So it is a capability fix with a small bonus, not a throughput win: the head is
+about a fifth of prefill's arithmetic, and prefill is only part of a run. The
+prediction written here before it was built — "a throughput win at prefill-heavy
+shapes" — was optimistic by roughly half, which is worth leaving on the record
+next to the memory figure that was not.
 
 ### Would capturing prefill help? Only where prefill is small (§3.2 follow-up)
 

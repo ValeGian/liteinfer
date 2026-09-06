@@ -160,10 +160,10 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 
 | | liteinfer | vLLM | |
 |---|---:|---:|---|
-| Throughput, B=32 | **3,112 tok/s** | 4,467 tok/s | 1.4× behind |
-| Throughput, ISL 1024 / OSL 1024 | **2,356 tok/s** | 3,241 tok/s | 1.4× behind |
+| Throughput, B=32 | **3,116 tok/s** | 4,467 tok/s | 1.4× behind |
+| Throughput, ISL 1024 / OSL 1024 | **2,376 tok/s** | 3,241 tok/s | 1.4× behind |
 | Decode step (ITL p50) | **6.6 ms** | 5.2 ms | 1.3× behind |
-| Time to first token (p50) | 14.9 ms | 23.2 ms | 1.6× ahead\* |
+| Time to first token (p50) | 14.7 ms | 23.2 ms | 1.6× ahead\* |
 | Long prompts (ISL 2048) | runs | runs | eager attention cannot |
 
 \* At this prompt length TTFT is mostly fixed per-call API overhead rather than

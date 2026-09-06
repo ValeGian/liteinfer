@@ -111,3 +111,19 @@ def test_gathering_payload_returns_a_dense_kv():
     payload = cache.make_decode_payload(cache.slot_table_for(request_ids))
 
     assert isinstance(payload.update(*_decode_token(len(request_ids)), _LAYER), DenseKV)
+
+
+def test_the_profile_payload_hands_back_what_it_was_given():
+    """It measures a forward's memory, so it must not need a pool to write into.
+
+    Prefill attention reads the K/V the pass just computed, which is what the real
+    prefill payload returns after storing it — so returning them untouched gives a
+    forward with the same shapes and the same activation peak.
+    """
+    from liteinfer.cache.continuous_kv_cache import ProfilePayload
+
+    key_states, value_states = _decode_token(2)
+
+    kv = ProfilePayload().update(key_states, value_states, _LAYER)
+
+    assert kv.keys is key_states

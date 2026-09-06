@@ -115,3 +115,20 @@ def test_the_size_ignores_memory_that_was_freed_but_is_still_cached() -> None:
     del ballast  # freed, but the allocator holds the block
 
     assert _blocks(runner) == before
+
+
+def test_a_measured_activation_budget_leaves_the_pool_less() -> None:
+    """The point of profiling: what the forward needs is not the pool's to take."""
+    runner = _runner(max_num_seqs=32, max_model_len=10**7)
+    unmeasured = _blocks(runner)
+
+    runner._forward_bytes = 1 << 28  # 256 MiB the forward will want
+
+    assert _blocks(runner) < unmeasured
+
+
+def test_a_cpu_engine_profiles_nothing() -> None:
+    """CPU runs exist to test the sizing arithmetic, and have no device to measure."""
+    runner = _runner(max_num_seqs=4, max_model_len=64)
+
+    assert runner._profile_forward_bytes() == 0

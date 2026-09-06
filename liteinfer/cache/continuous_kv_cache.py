@@ -54,6 +54,26 @@ class KVPayload(Protocol):
         ...
 
 
+class ProfilePayload:
+    """What a forward is handed when it is being measured rather than served.
+
+    Returns this pass's K/V untouched, which is exactly what the prefill payload
+    returns *after* storing them — so the forward has the same shapes and the same
+    activation peak while needing no pool to write into. That is what lets the
+    measurement happen before the pool is sized, which is the whole point: the
+    pool gets what the forward turns out not to need.
+
+    Correct only for prefill, where attention reads the K/V the pass just
+    computed. A decode pass reads history it did not compute, so measuring one
+    means giving it a real cache.
+    """
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
+    ) -> DenseKV:
+        return DenseKV(key_states, value_states)
+
+
 class ContinuousKVCache:
     """Per-sequence block-allocated KV cache for continuous batching."""
 

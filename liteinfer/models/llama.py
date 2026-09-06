@@ -261,12 +261,28 @@ class LlamaForCausalLM(nn.Module):
         position_ids: torch.LongTensor,
         past_key_values: Cache,
         attention_mask: torch.Tensor,
+        logits_positions: slice | None = None,
     ) -> CausalLMOutput:
+        """Run the model and project the selected positions to vocabulary logits.
+
+        `logits_positions` says which positions need logits; `None` computes them
+        all, which is what a language model is expected to do and what the
+        `transformers` parity tests compare against.
+
+        Passing `models.LAST_POSITION` instead is not a micro-optimisation. The head's
+        output is `batch x positions x vocab`, which at batch 8 and a 2,048-token
+        prompt is 3.91 GiB — **96% of the whole prefill's peak allocation** — and
+        an inference pass reads one row of it per sequence. Slicing the hidden
+        states first is what keeps the rest from being computed and stored at all.
+        """
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
         )
-        logits = self.lm_head(outputs.logits)
+        hidden_states = outputs.logits
+        if logits_positions is not None:
+            hidden_states = hidden_states[:, logits_positions, :]
+        logits = self.lm_head(hidden_states)
         return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)

@@ -44,6 +44,7 @@ import logging
 import torch
 
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
+from liteinfer.models import LAST_POSITION
 from liteinfer.models.attention import reads_paged_kv
 
 _LOGGER = logging.getLogger(__name__)
@@ -211,6 +212,7 @@ class DecodeGraphs:
             position_ids=self._position_ids[:batch_size],
             past_key_values=payload,
             attention_mask=None,
+            logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]
 
