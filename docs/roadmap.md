@@ -363,23 +363,6 @@ listed.
 
 ## 5. Engine ergonomics
 
-### 5.5 Backpressure on admission
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** `max_num_seqs` caps how many sequences run, not how many are
-  accepted. `AsyncLLMEngine._pending` and `ContinuousScheduler.waiting` are both
-  unbounded, so a caller that submits faster than the engine drains grows two
-  Python lists without limit until the process dies — and it dies holding
-  admitted work that never ran. Every production serving stack rejects or blocks
-  instead; that liteinfer does not is a gap, not a simplification.
-- **Scope.** `EngineConfig.max_waiting_seqs`, enforced in `add_request`. Decide
-  the failure mode explicitly: `await` on a bounded `asyncio.Queue` gives the
-  caller backpressure, raising gives it a fast 429-shaped answer. Prefer
-  raising — it is visible, and a hung `add_request` is the bug this item
-  exists to avoid.
-- **Parity test.** Submitting `max_waiting_seqs + 1` requests raises on the
-  last one and leaves the first ones running.
-
 ### 5.6 Request cancellation
 - **Status.** `planned`
 - **PRs.** _none yet_

@@ -73,10 +73,16 @@ class AsyncLLM:
             prompts = [prompts]
         params = sampling_params or SamplingParams()
 
+        # The batch API owns the whole list, so it paces itself against the
+        # queue cap rather than tripping it: at most `max_waiting_seqs` requests
+        # are outstanding at once, however long the list is.
+        slots = asyncio.Semaphore(self.engine.config.max_waiting_seqs)
+
         async def _collect(prompt: str, req_id: str) -> RequestOutput:
             final: StreamEvent | None = None
-            async for event in self.engine.generate_stream(req_id, prompt, params):
-                final = event
+            async with slots:
+                async for event in self.engine.generate_stream(req_id, prompt, params):
+                    final = event
             assert final is not None
             return RequestOutput(
                 request_id=req_id,

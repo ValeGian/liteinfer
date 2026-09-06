@@ -55,6 +55,15 @@ _RequestQueue = asyncio.Queue[StreamEvent | Exception | None]
 
 _IDLE_POLL_S = 0.05
 
+
+class EngineOverloaded(RuntimeError):
+    """The waiting queue is full. The request was not accepted; retry later.
+
+    Its own type so a caller can tell "come back later" apart from "this
+    request is malformed", which is the difference between retrying and giving
+    up.
+    """
+
 _FINISH_REASONS: dict[SequenceStatus, str] = {
     SequenceStatus.FINISHED_STOPPED: "stop",
     SequenceStatus.FINISHED_LENGTH: "length",
@@ -107,10 +116,16 @@ class AsyncLLMEngine:
         """
         if self._loop_task is None or self._loop_task.done():
             raise RuntimeError("engine loop is not running; call start() first")
+        if self.num_waiting >= self.config.max_waiting_seqs:
+            raise EngineOverloaded(
+                f"{self.num_waiting} requests already waiting "
+                f"(max_waiting_seqs={self.config.max_waiting_seqs}); retry later"
+            )
 
         queue: _RequestQueue = asyncio.Queue()
         self._request_queues[request_id] = queue
-        await self._pending.put((request_id, prompt, sampling_params))
+        # Enqueued without awaiting, so the check above and this cannot interleave.
+        self._pending.put_nowait((request_id, prompt, sampling_params))
 
         while True:
             item = await queue.get()
@@ -119,6 +134,11 @@ class AsyncLLMEngine:
             if isinstance(item, Exception):
                 raise item
             yield item
+
+    @property
+    def num_waiting(self) -> int:
+        """Requests accepted but not yet running, wherever they are queued."""
+        return self._pending.qsize() + len(self.scheduler.waiting)
 
     # ------------------------------------------------------------------
     # Background loop

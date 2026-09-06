@@ -4,6 +4,16 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 06-09-2026 — §5.5 Backpressure on admission
+
+- **PRs.** [#31](https://github.com/ValeGian/liteinfer/pull/31)
+- **What.** `max_num_seqs` caps what runs; nothing capped what was accepted. `_pending` and `scheduler.waiting` were both unbounded, so a caller submitting faster than the engine drains grew two Python lists until the process died — holding admitted work it never ran. `EngineConfig.max_waiting_seqs` (default 1024) now bounds them, and `generate_stream` raises `EngineOverloaded` past it.
+- **Why raising rather than blocking.** A bounded queue that makes submission wait turns an overload into a hang, which is harder to see than a refusal and impossible to tell from a slow engine. `EngineOverloaded` is its own type so a caller can distinguish "come back later" from "this request is malformed" — the difference between retrying and giving up.
+- **The batch API paces itself.** `generate` owns the whole prompt list and submits it with `asyncio.gather`, so a naive cap would have made `llm.generate(2000_prompts)` fail where it used to work. It now keeps at most `max_waiting_seqs` requests outstanding, so a list of any length still runs and the caller that can see the whole list never trips the cap. Measured at 1,744.8 tok/s against a 1,732.8 baseline — no cost.
+- **What the test had to work around.** The obvious test — submit past the cap, expect a raise — passed for the wrong reason at first: awaiting a stream's first event waits for a *token*, by which point the request has already left the queue for the running set. It now submits more requests than can run or wait, with outputs long enough that none finishes while the rest arrive, and asserts one is refused.
+
+---
+
 ## 06-09-2026 — The measured record, refreshed
 
 - **PRs.** [#30](https://github.com/ValeGian/liteinfer/pull/30)
