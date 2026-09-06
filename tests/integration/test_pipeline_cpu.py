@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from liteinfer import AsyncLLM
+from liteinfer import AsyncLLM, EngineOverloaded
 from liteinfer.sampling.params import SamplingParams
 from tests.integration import tiny_llama
 
@@ -354,3 +354,63 @@ def test_text_grows_monotonically_while_streaming(tiny_llama_dir: Path) -> None:
 
     texts = _run(_run_test())
     assert all(later.startswith(earlier) for earlier, later in itertools.pairwise(texts))
+
+
+# ---------------------------------------------------------------------------
+# Admission backpressure (§5.5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_full_waiting_queue_refuses_the_next_request(tiny_llama_dir: Path) -> None:
+    """Past the cap the engine says no, rather than queueing without limit.
+
+    Only one sequence can run, so submissions past the second have nowhere to
+    wait. The requests generate for long enough that none of them finishes and
+    frees a slot while the rest are still arriving.
+    """
+
+    async def _drain(llm, request_id):
+        params = SamplingParams(max_tokens=256, temperature=0.0)
+        async for _ in llm.engine.generate_stream(request_id, "tok2 tok3", params):
+            pass
+
+    async def _run_test():
+        llm = AsyncLLM(
+            str(tiny_llama_dir), device="cpu", dtype=torch.float32,  # type: ignore[arg-type]
+            max_num_seqs=1, max_waiting_seqs=2,
+        )
+        async with llm:
+            outcomes = await asyncio.gather(
+                *(_drain(llm, f"r{i}") for i in range(6)), return_exceptions=True
+            )
+        return outcomes
+
+    outcomes = _run(_run_test())
+    assert any(isinstance(o, EngineOverloaded) for o in outcomes)
+
+
+def test_the_batch_api_paces_itself_against_the_cap(tiny_llama_dir: Path) -> None:
+    """`generate` owns the whole list, so a list longer than the cap must still work."""
+
+    async def _run_test():
+        llm = AsyncLLM(
+            str(tiny_llama_dir), device="cpu", dtype=torch.float32,  # type: ignore[arg-type]
+            max_num_seqs=2, max_waiting_seqs=2,
+        )
+        async with llm:
+            return await llm.generate(
+                ["tok2", "tok3", "tok4", "tok5", "tok6", "tok7"],
+                SamplingParams(max_tokens=2, temperature=0.0),
+            )
+
+    assert len(_run(_run_test())) == 6
+
+
+def test_num_waiting_counts_both_queues(tiny_llama_dir: Path) -> None:
+    """A request is waiting whether it sits in `_pending` or in the scheduler."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return llm.engine.num_waiting
+
+    assert _run(_run_test()) == 0
