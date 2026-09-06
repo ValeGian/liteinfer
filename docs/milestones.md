@@ -4,6 +4,17 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 06-09-2026 — §1.4 The batch width a flat step already pays for
+
+- **PRs.** [#36](https://github.com/ValeGian/liteinfer/pull/36)
+- **What.** §3.2 left the decode step nearly flat in batch width — the same weights are read once per step however many sequences share it — so every extra sequence is close to free. `max_num_seqs=128` measures **6,949.0 tok/s against 3,115.6 at 32, 2.23x**, with wall time 16.4 → 7.4 s.
+- **And it does not close the gap to vLLM; it widens it.** At matched width vLLM goes 4,466.6 → 11,097.5, which is 2.48x over the same widening, so the ratio moves **0.70x → 0.63x**. That is the finding worth having, and it is invisible if a wide engine is only compared to its own narrower self — which is why `liteinfer-graphs-b128` carries no `baseline` and `vllm-b128` was added beside it. The benchmark matrix gained a `max_model_len` knob so a row can state the context budget it claims.
+- **Where the difference goes, measured rather than guessed.** The loop's forward share falls from 88.7% at 32 sequences to 81.5% at 128, because everything around the forward is per-sequence while the forward is not: sampling alone goes 6.0% → 11.3%. At 128 that is 18.5% of the loop. Filed as §1.5, worth about 1.23x and a gap of ~0.77x.
+- **The capture ladder this was supposed to need turned out not to exist.** §3.2 bounded captures at 64 on the assumption that graphs cost memory, and said a wider engine would want vLLM's pad-to-a-ladder. Measured, **128 graphs cost +0.54 GiB against 32 graphs at +0.63 GiB** — flat, because every graph after the first shares the first one's memory pool. What actually bounds them is capture *time*, about 60 ms each, paid once and only for widths a run visits; a full batch visits one or two plus a short tail as it drains. So the cap is now 128 on a measured basis and there are still no padded rows.
+- **A wide engine has to state a context budget it can serve, and now says so at load.** At `max_num_seqs=128` with `max_model_len=4096` the profile run §2.6 added does not fit, warns, names the fix, and falls back to an unmeasured pool; at `max_model_len=1024` it profiles 8.28 GiB and fits. Before §2.6 that was a crash under load rather than a warning at load.
+
+---
+
 ## 06-09-2026 — §3.7 The LM head stops computing logits nobody reads, and §2.6 measures what the forward needs
 
 - **PRs.** [#36](https://github.com/ValeGian/liteinfer/pull/36)

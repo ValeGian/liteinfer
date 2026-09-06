@@ -150,49 +150,34 @@ listed.
   in eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
   batches, which is what §3.8 exists to be.
 
-### 1.4 Spend the batch width the flat step already pays for
-- **Status.** `planned` — **2.19x measured, and the largest general win now on
-  the board.**
+### 1.5 The loop's per-sequence work is the wide-batch tax
+- **Status.** `planned` — **the deficit §1.4 exposed, and worth ~1.23x at 128
+  concurrent sequences.**
 - **PRs.** _none yet_
-- **Why.** §3.2 left the decode step nearly flat in batch width, and a flat step
-  is throughput waiting to be collected: the same weights are read once per step
-  whatever the batch, so every extra sequence is nearly free. Measured on the
-  captured step at 256 tokens of context:
+- **Why.** §3.2 made the forward nearly flat in batch width, which is what §1.4
+  spends. Everything the loop does *around* the forward is not flat — it is per
+  sequence — so widening the batch grows its share:
 
-  | `max_num_seqs` | step | decode tok/s |
-  |---:|---:|---:|
-  | 32 | 7.63 ms | 4,196 |
-  | 64 | 8.93 ms | 7,165 |
-  | 128 | 11.25 ms | 11,381 |
-  | 256 | 17.30 ms | 14,797 |
+  | stage | B=32 | B=128 |
+  |---|---:|---:|
+  | forward | 88.7% | **81.5%** |
+  | sample | 6.0% | **11.3%** |
+  | deliver | 2.0% | 4.2% |
+  | schedule + unattributed | 3.4% | 3.0% |
 
-  Eight times the batch for 2.3x the step. Through the harness at ISL 128 /
-  OSL 256 that is **3,111.7 → 6,820.6 tok/s, 2.19x**, wall 16.5 → 7.5 s — and
-  liteinfer at 128 is then 1.53x vLLM's *32-wide* number, though that comparison
-  is a batch width rather than an engine and belongs nowhere near the report.
-- **Which is why this is not just a bigger default.** `max_num_seqs=128` is
-  already reachable by any caller; what is missing is the engine being safe at it.
-  Two of the three prerequisites have landed; one is left:
-  - **§3.7, landed.** Prefill's LM head no longer runs over every position, so the
-    logits tensor that would have been **62.6 GiB** at 128 sequences x 2,048
-    tokens is gone. Without it §1.4 would not have been slow at long prompts, it
-    would not have run.
-  - **§2.6, landed.** The pool is sized from the device and from a *measured*
-    activation budget, so raising concurrency now demands memory honestly instead
-    of discovering the shortfall under load. The widest prefill at 128 x 4,096 is
-    what to profile before setting the default: at 32 x 4,096 it is 9.04 GiB, and
-    it scales with the batch.
-  - **The capture ladder, still open.** `DecodeGraphs` records one graph per exact
-    batch width and `_MAX_CAPTURES` bounds that at 64, which never binds at 32 and
-    binds immediately at 128. A wide engine wants vLLM's approach instead: a
-    ladder of captured widths with each batch padded up to the next one, padded
-    rows given a context length of 1 against the null block and their logits
-    discarded. That is the piece §3.2 deliberately skipped because it was not
-    needed at 32.
-- **Then measure against vLLM at matched width**, which means a `vllm-b128` row
-  as well; the point is not the 2.19x against our own narrower self.
-- **Parity test.** Greedy output unchanged at 128 concurrent sequences, and the
-  pool neither exhausted nor sized below what the config promises.
+  At 128 sequences that is **18.5% of the loop** against 11.3% at 32. It is also
+  the reason §1.4's 2.23x is smaller than vLLM's 2.48x over the same widening, so
+  the gap goes from 0.70x to 0.63x rather than closing. Removing it entirely would
+  put throughput near 8,550 tok/s and the gap at ~0.77x.
+- **Scope.** Sampling is the largest and doubles its share, which is where to
+  start — greedy rows are already taken in one kernel (§26), so what is left is
+  the per-row stochastic loop and whatever still crosses the device boundary once
+  per sequence. `deliver` builds one `StreamEvent` per sequence and detokenises
+  into it; that is per-sequence by nature, but not necessarily per-sequence
+  *Python*. Measure each against the stage timings above rather than in isolation
+  — `TimeBreakdown` already reports them, and this is the item it was built for.
+- **Parity test.** Identical greedy output and identical stream events at 128
+  concurrent sequences.
 
 ---
 

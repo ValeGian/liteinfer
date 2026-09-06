@@ -46,6 +46,7 @@ class LiteInferAdapter:
         self._llm = LLM(
             model=self._model,
             max_num_seqs=self._config.max_num_seqs,
+            max_model_len=self._config.max_model_len,
             attn_implementation=self._config.attn_implementation,
             enable_cuda_graphs=self._config.enable_cuda_graphs,
         )
@@ -79,6 +80,7 @@ class VLLMAdapter:
             model=self._model,
             dtype="bfloat16",
             max_num_seqs=self._config.max_num_seqs,
+            max_model_len=self._config.max_model_len,
             gpu_memory_utilization=GPU_MEMORY_FRACTION,
             disable_log_stats=True,
         )

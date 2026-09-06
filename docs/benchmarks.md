@@ -142,9 +142,11 @@ takes that trade deliberately, and this is where the bill arrives.
 | `liteinfer-sdpa` | 32 | 1,744.8 | 6.8 | 29.3 | 1.06× | 0.39× |
 | `liteinfer-paged-attn` | 32 | 1,930.0 | 7.5 | 26.5 | **1.11×** | 0.43× |
 | `liteinfer-graphs` | 32 | **3,115.6** | 12.2 | 16.4 | **1.61×** | 0.70× |
+| `liteinfer-graphs-b128` | 128 | **6,949.0** | 27.1 | 7.4 | — | 0.63× |
 | `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
 | `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
 | `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
+| `vllm-b128` | 128 | 11,097.5 | 43.3 | 4.6 | — | — |
 
 † against a removed config, so it measures two engines two milestones apart. The
 two rows above it are same-session and measure only their own code.
@@ -865,10 +867,40 @@ Eight times the batch for 2.3× the step. Through the harness at ISL 128 / OSL 2
 `max_num_seqs=128` measures **6,820.6 tok/s against 3,111.7 — 2.19×** — with wall
 time 16.5 → 7.5 s.
 
-So the next general win is roughly twice what fusing the forward could ever be,
-and it is a batch width rather than a kernel. It is not merely a bigger default,
-though: `max_num_seqs=128` is reachable by any caller today, and what is missing
-is the engine being *safe* at it. The pool is sized to `max_num_seqs` ×
+#### What it paid, and the deficit it exposed
+
+Measured through the harness at ISL 128 / OSL 256, against vLLM at the **same**
+width — which is the only comparison worth making, and the reason the wide row
+carries no `baseline`:
+
+| | B=32 | B=128 | |
+|---|---:|---:|---:|
+| liteinfer | 3,115.6 | **6,949.0** | 2.23× |
+| vLLM | 4,466.6 | **11,097.5** | 2.48× |
+| gap | 0.70× | **0.63×** | |
+
+So the win is real — 2.23×, wall 16.4 → 7.4 s — and it does **not** close the gap;
+it widens it, because vLLM gains more from the same width. That is the finding
+worth having, and it is invisible if you only compare a wide engine to your own
+narrower self.
+
+Where it goes is measurable, and it is not the forward. The loop's stages by
+width:
+
+| stage | B=32 | B=128 |
+|---|---:|---:|
+| forward | 88.7% | **81.5%** |
+| sample | 6.0% | **11.3%** |
+| deliver | 2.0% | 4.2% |
+| schedule + unattributed | 3.4% | 3.0% |
+
+The forward is nearly flat in batch width — that is what §1.4 spends — but the
+per-sequence work around it is not, and at 128 sequences it is **18.5% of the
+loop** against 11.3% at 32. Removing it entirely would put throughput near 8,550
+tok/s and the gap at ~0.77×. Filed as §1.5.
+
+It is also not merely a bigger default: `max_num_seqs=128` is reachable by any
+caller today, and what was missing is the engine being *safe* at it. The pool is sized to `max_num_seqs` ×
 `max_model_len` or to a fraction of free memory, whichever is smaller — 17.2 GiB
 at 128 × 4096, which fits an A40 and does not fit a 24 GiB card, where the pool
 goes quietly under what the config promises. And `DecodeGraphs` records one graph
