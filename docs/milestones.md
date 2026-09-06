@@ -6,7 +6,7 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ## 06-09-2026 — §2.3 Decode reads the KV pool where it lies
 
-- **PRs.** _none yet_
+- **PRs.** [#33](https://github.com/ValeGian/liteinfer/pull/33)
 - **What.** Decode copied every sequence's whole KV history out of the block pool into a contiguous `[B, heads, max_total, head_dim]` tensor — per layer, per step — and then ran a general attention kernel over it. `attn_implementation="paged"` replaces that with a Triton kernel that takes the slot table and reads the pool in place. The copy does not happen, the grouped-query heads are never expanded, and the padding is never touched, because the kernel takes each sequence's context length instead of a mask over the batch's longest.
 - **Measured, both kernels in one session, same datasets.**
 
