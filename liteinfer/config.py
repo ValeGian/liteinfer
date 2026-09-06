@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from liteinfer.models.attention import validate_name
+from liteinfer.models.attention import resolve
 
 
 @dataclass
@@ -52,7 +52,8 @@ class EngineConfig:
             raise ValueError("max_waiting_seqs must be >= 1")
         if not 0 < self.kv_cache_memory_fraction <= 1:
             raise ValueError("kv_cache_memory_fraction must be in (0, 1]")
-        validate_name(self.attn_implementation)  # raises on an unknown kernel name
+        if self.attn_implementation is not None:
+            resolve(self.attn_implementation)  # raises on an unknown kernel name
 
     def resolved_device(self) -> torch.device:
         """Return the concrete `torch.device` after resolving ``"auto"``."""

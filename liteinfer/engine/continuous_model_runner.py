@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -21,11 +22,21 @@ from liteinfer.engine.attention_mask import builders_for
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.attention import reads_paged_kv
-from liteinfer.models.loader import head_dim_of, load_hf_model
+from liteinfer.models.loader import load_hf_model
 from liteinfer.tokenizer import Tokenizer
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 _LOGGER = logging.getLogger(__name__)
 _GIB = 1 << 30
+
+
+def _head_dim(hf_config: PretrainedConfig) -> int:
+    """Head dimension, which most configs state and the rest imply."""
+    return getattr(
+        hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
+    )
 
 
 class ContinuousModelRunner:
@@ -174,7 +185,7 @@ class ContinuousModelRunner:
     def _create_block_pool(self) -> BlockPool:
         num_layers: int = self.hf_config.num_hidden_layers
         num_kv_heads: int = self.hf_config.num_key_value_heads
-        head_dim = head_dim_of(self.hf_config)
+        head_dim = _head_dim(self.hf_config)
         num_blocks = self._compute_num_blocks(num_layers, num_kv_heads, head_dim)
         return BlockPool(
             num_blocks=num_blocks,

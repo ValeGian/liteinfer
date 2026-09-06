@@ -178,12 +178,6 @@ def resolve(name: str):
     return IMPLEMENTATIONS[name]
 
 
-def validate_name(name: str | None) -> None:
-    """Reject an unknown kernel name at config time. `None` means "choose for me"."""
-    if name is not None:
-        resolve(name)
-
-
 def unsupported_reason(name: str, device: torch.device) -> str | None:
     """Why this kernel cannot run here, or `None` if it can.
 

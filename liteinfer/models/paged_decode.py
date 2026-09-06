@@ -41,7 +41,9 @@ import triton
 import triton.language as tl
 
 # Tokens folded into the running softmax per iteration. 64 was the best of
-# {32, 64, 128} on an A40; the tile has to be at least 16 for `tl.dot`.
+# {16, 32, 64, 128} on an A40; the tile has to be at least 16 for `tl.dot`, and
+# the answer must not depend on it — `block_kv` stays a parameter so the sweep
+# that chose 64 is re-runnable, and the tests sweep the same values.
 _BLOCK_KV = 64
 
 # `tl.dot` needs tiles of at least 16 and `tl.arange` needs a power-of-two

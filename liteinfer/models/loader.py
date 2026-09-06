@@ -28,13 +28,6 @@ _DISPATCH: dict[str, type[nn.Module]] = {
 }
 
 
-def head_dim_of(hf_config: PretrainedConfig) -> int:
-    """Head dimension, which most configs state and the rest imply."""
-    return getattr(
-        hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
-    )
-
-
 def _read_architecture(model_dir: Path) -> str:
     config_path = model_dir / "config.json"
     if not config_path.is_file():

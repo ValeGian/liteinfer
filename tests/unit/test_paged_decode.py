@@ -60,7 +60,7 @@ class _PagedBatch:
                 1, NUM_SLOTS, (context_len,), generator=generator, device=device
             )
 
-    def paged(self) -> torch.Tensor:
+    def paged(self, **kwargs) -> torch.Tensor:
         context_lens = torch.tensor(self.context_lens, dtype=torch.int32, device=self.device)
         return paged_decode(
             self.query,
@@ -70,6 +70,7 @@ class _PagedBatch:
             context_lens,
             self.scaling,
             self.num_kv_groups,
+            **kwargs,
         )
 
     def dense(self) -> torch.Tensor:
@@ -96,11 +97,22 @@ def test_paged_decode_matches_the_dense_kernel_in_bfloat16_to_within_rounding():
     torch.testing.assert_close(batch.paged(), batch.dense(), rtol=0, atol=2**-6)
 
 
-def test_paged_decode_matches_the_dense_kernel_across_several_key_tiles():
-    """A context longer than one BLOCK_KV exercises the online-softmax rescaling."""
-    batch = _PagedBatch([200, 65, 64, 63], torch.float32)
+@pytest.mark.parametrize("block_kv", [16, 32, 64, 128])
+def test_paged_decode_matches_the_dense_kernel_across_several_key_tiles(block_kv):
+    """The answer must not depend on how many keys are folded in at a time.
 
-    torch.testing.assert_close(batch.paged(), batch.dense(), rtol=1e-5, atol=1e-5)
+    Splitting the key axis is where the kernel does its only stateful arithmetic:
+    each tile can raise the running maximum, and the accumulator and the
+    denominator both have to be rescaled when it does. A tile size that divides
+    the context evenly hides a boundary bug, so the contexts here straddle every
+    one of these sizes — and the sweep is what picked 64 as the default, so it is
+    also what keeps that choice re-runnable.
+    """
+    batch = _PagedBatch([200, 65, 64, 63, 17, 1], torch.float32)
+
+    torch.testing.assert_close(
+        batch.paged(block_kv=block_kv), batch.dense(), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_paged_decode_matches_the_dense_kernel_when_the_group_is_not_a_power_of_two():
