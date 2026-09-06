@@ -194,8 +194,13 @@ listed.
 ### 2.7 Split the key loop when the batch is narrow
 - **Status.** `planned` — built, measured at **0.94x** in the engine, and reverted.
   Follow-up to §2.3.
-- **Blocked on.** §3.2. The kernel win is real and the engine cannot spend it
-  until the decode forward stops paying per launch — see below.
+- **Unblocked by §3.2**, which landed. Split-K lost only because it added one
+  launch per layer to a step that paid 18.7 us per launch; inside a capture that
+  cost is gone and its GPU win — up to 7.15x per layer — is what is left. One
+  caveat the second attempt has to carry: `num_splits` is a **scalar** kernel
+  argument, and a graph bakes scalars in while the chooser varies the count with
+  context. So it must be pinned per capture rather than chosen per step, which is
+  the one thing the reverted implementation does not already do.
 - **PRs.** [#34](https://github.com/ValeGian/liteinfer/pull/34) — built, measured, reverted.
 - **Why.** The paged kernel runs one program per (sequence, KV head), which is
   256 programs at B=32 and **8** at B=1 — on an A40's 84 SMs, a single-request
@@ -255,7 +260,7 @@ listed.
   the one §3.2's entry currently claims, and it is measured on the wrong batch
   width.
 - **The implementation is in the history of the PR that filed this measurement**
-  ([#34](https://github.com/ValeGian/liteinfer/pull/34)), as §3.2's is. Roughly 400 lines: two
+  ([#34](https://github.com/ValeGian/liteinfer/pull/34)). Roughly 400 lines: two
   grids sharing one online-softmax device function, a combine kernel, a chooser
   fitted to the sweep, and 14 tests including a split-count sweep against the
   dense reference. `docs/benchmarks.md` carries the analysis and the two
@@ -266,10 +271,15 @@ listed.
 
 ## 3. Performance optimizations
 
-### 3.1 `torch.compile` of the forward path
-- **Status.** `planned`
+### 3.1 Fuse the forward's elementwise work
+- **Status.** `planned` — **the next general win, and §3.2 is what makes it
+  sizeable.** With a launch nearly free, what is left of the step is arithmetic:
+  ITL is 1.86x the 3.55 ms memory roofline against vLLM's 1.47x, and ~725
+  launches is about 45 kernels per layer where a Llama layer needs ten.
 - **Blocked on.** the pool write, not the gather. Measured at **0.06x** before
-  §2.3; §2.3 removed half the reason.
+  §2.3; §2.3 removed half the reason. Re-measure inside a captured forward: the
+  17.9% of GPU time that elementwise work costs is now the part worth having,
+  where before it was dwarfed by the launches around it.
 - **PRs.** _none yet_
 - **What it measured.** `torch.compile` on the decode forward is 206.66 ms
   against eager's 12.87 ms at a fixed shape — and it is *not* recompiling.
@@ -290,8 +300,9 @@ listed.
   the most fusible: profiled at B=32, `elementwise_kernel` accounts for
   **17.9% + 2.6% across ~143 launches per step** — RoPE, residual adds, norms
   and the mask fills — against 30.1% for the projection GEMMs that actually do
-  the model's arithmetic. Fusion removes both the time and the launches, so this
-  overlaps §3.2; do §3.2 first and re-measure before sizing this one.
+  the model's arithmetic. §3.2 has since collected the launch half of that, which
+  is what makes the remaining half the thing worth measuring: re-profile inside a
+  captured forward before sizing this.
 - **Scope.** Wrap the `ContinuousModelRunner` forward passes in `torch.compile`,
   gated by `EngineConfig.enable_torch_compile`. First call pays
   compile cost; subsequent calls run the compiled graph.
@@ -299,103 +310,6 @@ listed.
   cache. Use `torch._dynamo` shape specialization or pad to bucket
   sizes.
 - **Parity test.** Compiled vs eager: identical greedy outputs.
-
-### 3.2 CUDA graph capture for decode
-- **Status.** `planned` — **the largest general win on the board, and its ceiling
-  is now measured rather than estimated: 1.50x at B=32, 1.76x at B=1.**
-- **Blocked on.** nothing, as of §2.3. Built, measured at 1.06x against the
-  gathering decode, and reverted — see below. The 1.06x is not what this is worth
-  now; the section *Re-measured after §2.3* says why.
-- **Why it looked compelling.** A decode step issues **822 kernels** to do 10.34 ms
-  of GPU work in a 13.96 ms step; the gaps between launches are idle time, and a
-  graph replays the whole sequence as one submission.
-- **What it actually measured.** The saving is real but small, and the padding a
-  graph forces costs more than it saves at most bucket sizes. A graph fixes
-  every shape, so the KV length has to be rounded up to a bucket:
-
-  | KV bucket | throughput | vs no graphs |
-  |---:|---:|---:|
-  | none | 1,809 tok/s | — |
-  | 256 | 1,759 | 0.97x |
-  | **64** | **1,912** | **1.06x** |
-  | 32 | 1,840 | 1.02x |
-  | 16 | 1,679 | 0.93x |
-
-  Large buckets waste attention and gather work on padding; small ones spend the
-  gain on captures. The best point is 1.06x — and the same no-graph
-  configuration measured 1,809 and 1,932 tok/s on two consecutive runs, so the
-  effect is smaller than the noise. Replaying the forward in isolation saves
-  0.858 ms of 12.85 ms, which is the whole prize.
-- **Why it was blocked, and what unblocked it.** The cost was the *gather*.
-  liteinfer copied the whole KV history into a contiguous tensor every decode
-  step, so padding the KV length padded a copy — real bytes, per layer, per
-  step. §2.3's kernel reads the pool in place and never gathers, so padding the
-  KV length now costs a few masked-off loads inside one kernel. That is why vLLM
-  captures graphs profitably; liteinfer now can.
-- **The one shape the paged kernel still exposes.** Its per-sequence context
-  length is read from a tensor, so it is invisible to a capture — but the slot
-  table's *width* is a scalar kernel argument, and a captured graph bakes those
-  in. Capture wants that width bucketed, which is a far cheaper thing to pad
-  than a gather: it changes how many slots the kernel skips, not how many bytes
-  move.
-- **Scope, when it comes back.** Static buffers written in place, one capture per
-  (batch width, KV bucket), padded rows attending to nothing and discarded.
-  Roughly 150 lines; the implementation is in the history of the PR that filed
-  this measurement.
-- **Prerequisite already landed.** The slot table and block allocation used to be
-  computed on the first layer, inside the forward pass. They now happen in
-  `decode()` before it, so the forward contains no host-side work — which any
-  capture requires, and which §2.3 wanted anyway.
-- **Re-measured after §2.3, and the number is completely different.** Two
-  independent methods, same conclusion. Profiling a decode forward: GPU busy is
-  6.19 / 6.88 / 7.97 ms at B=1 / 8 / 32 inside a wall of 12.8 / 13.6 / 13.6 ms, so
-  the GPU is **41-52% idle at every batch width**, across 693-725 launches, at a
-  flat **18.7 us of wall per launch**. Capturing the same forward and timing
-  replay agrees:
-
-  | | B=1 | B=8 | B=32 |
-  |---|---:|---:|---:|
-  | `decode()` step, eager | 12.39 ms | 12.96 ms | 13.20 ms |
-  | its forward, eager | 11.18 ms | 11.67 ms | 11.67 ms |
-  | its forward, replayed | **5.84 ms** | **6.41 ms** | **7.28 ms** |
-  | launch overhead | 48% of it | 45% | 38% |
-  | **step if launches were free** | **1.76x** | **1.68x** | **1.50x** |
-
-  Which is a general win: every batch width, every context, both modes. Projected
-  onto the stored rows it takes ITL p50 13.4 → ~7.6 ms (the gap to vLLM's 5.2 ms
-  closing from 2.58x to ~1.46x) and B=32 throughput 1,930 → ~2,900 tok/s.
-- **Why the first attempt read 1.06x.** It was measured before §2.3. A graph
-  fixes every shape, so the KV length must be bucketed — and back then padding the
-  KV length padded a *gather*, real bytes per layer per step. §2.3 deleted the
-  gather, so the same padding now costs a few masked loads inside one kernel.
-  §2.3 also cut the step's GPU work, which raised the share of it that is host
-  dispatch. Both changes push the same way.
-- **Feasibility is checked, not assumed.** The forward captures on today's code
-  first try — §29 having moved the host-side work out of it is what makes that
-  true. Replaying it against static buffers refilled from live engine state over
-  six steps, with per-sequence contexts of 207-215 and a 512-slot KV bucket 2.4x
-  wider than the real context, is **bit-identical to eager**: max logit difference
-  0, same argmax every step.
-- **That also retires the parity worry recorded below.** The bf16 divergence this
-  entry feared came from the dense path summing over a padded key axis in a
-  different order. The paged kernel never reads the padding — `context_lens`
-  bounds its loop — so the bucket is invisible to the answer and the fp32-only
-  parity claim is no longer necessary on this path.
-- **What it leaves for §3.1.** Replay is 7.28 ms at B=32 against a memory
-  roofline of **3.55 ms** (1.24B bf16 weights, A40 at 696 GB/s), so 2.05x. vLLM's
-  whole step is 5.2 ms, 1.47x roofline. After graphs the remaining gap is GPU work
-  — 725 launches is ~45 kernels per layer where a Llama layer needs ~10 — and that
-  is §3.1's target. Size §3.1 after this lands, not before: it is currently sized
-  against a step where a launch costs 18.7 us, and graphs change that.
-- **It gates §2.7.** Split-K makes the decode kernel up to 7.15x faster on the
-  GPU and the engine 0.94x slower, because it adds one launch per layer to a step
-  that is paying per launch. A capture removes that cost, which turns §2.7's GPU
-  column into step time — so §3.2 lands first and §2.7's measurement is the
-  estimate of what it is worth at B=1.
-- **Parity test.** Graphed output is token-identical to eager in fp32. In bf16 it
-  diverges around token 11, because attention then sums over a padded key axis
-  in a different order — the same class of difference as §3.3, and the reason
-  the parity claim has to be made in fp32.
 
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`
