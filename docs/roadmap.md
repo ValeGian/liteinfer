@@ -192,7 +192,10 @@ listed.
   headroom to complete.
 
 ### 2.7 Split the key loop when the batch is narrow
-- **Status.** `planned` — follow-up to §2.3.
+- **Status.** `planned` — built, measured at **0.94x** in the engine, and reverted.
+  Follow-up to §2.3.
+- **Blocked on.** §3.2. The kernel win is real and the engine cannot spend it
+  until the decode forward stops paying per launch — see below.
 - **PRs.** _none yet_
 - **Why.** The paged kernel runs one program per (sequence, KV head), which is
   256 programs at B=32 and **8** at B=1 — on an A40's 84 SMs, a single-request
@@ -203,6 +206,60 @@ listed.
 - **Scope.** A `num_splits` chosen from batch width and context so the grid
   always covers the device, partial `[batch, heads, splits, head_dim]` output
   plus its log-sum-exp, and a combine step.
+- **What it bought on the GPU.** All of it. Per layer, unsplit against a chooser
+  fitted to a sweep of `num_splits` over batch width and context, timed through a
+  captured CUDA graph:
+
+  | context | B=1 | B=2 | B=4 | B=8 | B≥12 |
+  |---:|---:|---:|---:|---:|---:|
+  | 128 | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x |
+  | 256 | **1.42x** | 1.35x | 1.14x | 0.94x | 1.00x |
+  | 512 | **2.24x** | 1.92x | 1.52x | 1.13x | 1.00x |
+  | 1024 | **3.45x** | 2.77x | 1.95x | 1.12x | 1.00x |
+  | 4096 | **7.15x** | 3.44x | 1.76x | 1.06x | 1.00x |
+
+  The 1.00x entries are the unsplit pass, chosen: from B=12 up the grid already
+  holds two programs per SM, and below four key tiles there is less sequential
+  work than the combine pass costs to add. Profiled in the engine the saving
+  survives — GPU kernel time per decode step falls **7.35 → 6.31 ms** at B=1 and
+  3,645 tokens of context, the 1.04 ms the component number predicts.
+- **And the engine got slower anyway, at every shape.** The same profile counts
+  **695 → 711 kernel launches** per step: one extra per layer. That is what the
+  step actually costs, because at B=1 only 7.35 ms of a 12.8 ms step is GPU work
+  and the rest is host. Measured, `liteinfer-paged-attn` against the same engine
+  with splitting enabled:
+
+  | latency, B=1 | ISL 128 / OSL 256 | ISL 3584 / OSL 128 |
+  |---|---:|---:|
+  | ITL p50, unsplit | 13.4 ms | 13.8 ms |
+  | ITL p50, split | **14.2 ms** | **14.3 ms** |
+  | | 0.94x | 0.97x |
+  | e2e p50 | 3,431.6 → 3,629.8 ms | 1,921.6 → 1,986.7 ms |
+
+  ISL 3584 is the most favourable shape reachable under `max_model_len` 4096 — the
+  context where the kernel is 7x faster — and it still loses 3%. `decode()` timed
+  directly agrees: 12.83/13.51 ms unsplit against 13.99/14.24 ms split, and the
+  same ordering when the split run goes first, so it is not run-order bias.
+  Throughput is untouched by construction: at B=32 the chooser returns 1 and the
+  pass is byte-identical.
+- **Why it is §3.2 that unblocks it.** The extra launch is only expensive because
+  the forward pays host cost per launch — `paged_decode` costs 74 us of host time
+  per call against 11.8 us of GPU work, and Triton's own dispatch is most of that.
+  A captured graph replays the launches with no host work between them, which is
+  exactly the condition under which the GPU column above becomes the step. So the
+  order is §3.2 first, then this: the component measurement here is the estimate
+  of what §3.2 would then be worth at B=1.
+- **What it says about §3.2's own number.** §3.2 measured 1.06x at B=32, where a
+  step has real GPU work in it. At B=1 the same step is 43% idle across ~700
+  launches, and nothing has measured graphs there. That is a bigger prize than
+  the one §3.2's entry currently claims, and it is measured on the wrong batch
+  width.
+- **The implementation is in the history of the branch that filed this
+  measurement** (`perf/split-k-decode`), as §3.2's is. Roughly 400 lines: two
+  grids sharing one online-softmax device function, a combine kernel, a chooser
+  fitted to the sweep, and 14 tests including a split-count sweep against the
+  dense reference. `docs/benchmarks.md` carries the analysis and the two
+  measurement traps that nearly set the policy from noise.
 - **Measure it in `latency` mode**, which is the only mode that runs at B=1.
 
 ---
@@ -287,6 +344,17 @@ listed.
   computed on the first layer, inside the forward pass. They now happen in
   `decode()` before it, so the forward contains no host-side work — which any
   capture requires, and which §2.3 wanted anyway.
+- **It was measured on the wrong batch width, and §2.7 found out.** The 1.06x
+  above is B=32, where a decode step has real GPU work in it. At **B=1** the same
+  step is 7.35 ms of GPU time inside 12.8 ms of wall clock — **43% idle across
+  ~700 launches** — and `paged_decode` alone costs 74 us of host time per call
+  against 11.8 us of kernel. Nothing has measured graphs there. Re-measure at B=1
+  before sizing this from the 1.06x.
+- **It gates §2.7.** Split-K makes the decode kernel up to 7.15x faster on the
+  GPU and the engine 0.94x slower, because it adds one launch per layer to a step
+  that is paying per launch. A capture removes that cost, which turns §2.7's GPU
+  column into step time — so §3.2 lands first and §2.7's measurement is the
+  estimate of what it is worth at B=1.
 - **Parity test.** Graphed output is token-identical to eager in fp32. In bf16 it
   diverges around token 11, because attention then sums over a padded key axis
   in a different order — the same class of difference as §3.3, and the reason

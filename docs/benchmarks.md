@@ -569,6 +569,91 @@ overhead that partly overlapped with real work. So the discount is not a propert
 of component benchmarks in general — it is a property of measuring something that
 was never entirely on the critical path.
 
+### A 7x faster kernel that made the engine slower (§2.7)
+
+§2.3 left the paged kernel running one program per (sequence, KV head) — 8
+programs at B=1, on 84 SMs. §2.7 cut each sequence's keys into slices, gave each
+its own program, and combined the partial softmaxes weighted by their
+log-sum-exp. It was built, measured, and reverted. Both halves of that are worth
+keeping.
+
+**On the GPU it did exactly what it was supposed to.** Per layer at Llama-3.2-1B's
+decode shapes (32 query heads, 8 KV heads, head_dim 64, bf16), unsplit against a
+`num_splits` chooser fitted to a sweep over batch width and context. Timed through
+a captured CUDA graph, five repeats of 500 replays, best repeat kept:
+
+| context | B=1 | B=2 | B=4 | B=8 | B=12 | B=32 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x |
+| 256 | **1.42x** | 1.35x | 1.14x | 0.94x | 1.00x | 1.00x |
+| 384 | **1.81x** | 1.58x | 1.24x | 1.04x | 1.00x | 1.00x |
+| 512 | **2.24x** | 1.92x | 1.52x | 1.13x | 1.00x | 1.00x |
+| 1024 | **3.45x** | 2.77x | 1.95x | 1.12x | 1.00x | 1.00x |
+| 2048 | **5.18x** | 3.66x | 1.87x | 1.05x | 1.00x | 1.00x |
+| 4096 | **7.15x** | 3.44x | 1.76x | 1.06x | 1.00x | 1.00x |
+
+The 1.00x entries are the unsplit pass, chosen: from B=12 up the grid already
+holds two programs per SM, and below four key tiles the context holds less
+sequential work than the combine pass costs to add. And the saving is not an
+artefact of the microbenchmark — profiled inside the engine, GPU kernel time per
+decode step falls **7.35 → 6.31 ms** at B=1 and 3,645 tokens, which is the 1.04 ms
+the per-layer numbers predict.
+
+**In the engine it lost, at every shape measured.** The same profile counts
+**695 → 711 kernel launches** per step — one extra per layer:
+
+| latency, B=1 | ISL 128 / OSL 256 | ISL 3584 / OSL 128 |
+|---|---:|---:|
+| ITL p50, unsplit | 13.4 ms | 13.8 ms |
+| ITL p50, split-K | **14.2 ms** | **14.3 ms** |
+| | 0.94x | 0.97x |
+| e2e p50 | 3,431.6 → 3,629.8 ms | 1,921.6 → 1,986.7 ms |
+| TTFT p50 | 14.5 → 14.5 ms | 164.1 → 162.6 ms |
+
+ISL 3584 is the most favourable shape `max_model_len` 4096 allows — the context
+where the kernel is 7x faster — and it still loses 3%. `decode()` timed directly
+agrees, 12.83/13.51 ms against 13.99/14.24 ms, and keeps that ordering when the
+split run goes first, so it is not run-order bias. TTFT does not move because
+prefill delegates to `sdpa`.
+
+**Why a 1.04 ms GPU saving loses to 16 extra launches.** Because at B=1 the GPU is
+not the constraint. Of a 12.8 ms decode step, **7.35 ms is GPU kernel time and the
+rest is host** — 43% idle across ~700 launches — and `paged_decode` costs **74 us of
+host time per call against 11.8 us of kernel**, most of it Triton's own dispatch.
+Removing GPU work from the idle side of that ledger buys nothing; adding a launch
+to the busy side costs immediately.
+
+That is a precondition, not a verdict, and it has a name: **§3.2**. A captured
+graph replays the launches with no host work between them, which is the exact
+condition under which the GPU column above becomes step time. So the order is
+§3.2 first. It also means §3.2's own 1.06x is measured on the wrong batch width:
+that number is B=32, where a step has real GPU work in it, and nobody has
+measured graphs at B=1 where the step is 43% idle.
+
+**Two measurement traps, both of which nearly shipped the wrong answer.**
+
+*Timing a Triton kernel from Python measures Python.* The first attempt at the
+table above launched the kernel in a loop and reported ~70 us per call at *every*
+batch width and context, with split-K uniformly 0.43x-0.83x — the arithmetic
+inverted, because the CPU cannot enqueue faster than that and the GPU idles
+waiting. Under a captured graph the same shapes are 4.7-490 us and ordered as
+shown. The irony is that the bogus measurement was reporting the real problem:
+74 us of host time per call is why this item is blocked.
+
+*At single-digit microseconds a single mean is noise.* The second attempt used one
+mean per shape and read a 1.42x win as **0.88x**, and a policy fitted to that would
+have disabled splitting exactly where it helps most. Five repeats and a minimum
+fixed it. Anything measured near the kernel's ~4.7 us floor needs repeats before
+it is allowed to decide anything.
+
+**And the cheapest check was the one not done first.** Sixteen layers times a
+per-layer time, over a step time already stored in `benchmarks/results/`, sizes
+this item in one line of arithmetic — and the profile that says 43% of the step is
+idle takes three minutes. Both were run after the kernel was written. The rule
+from the section above still holds, with a corollary: **measure the component to
+find the target, measure the engine to size it — and compute the ceiling before
+writing the kernel.**
+
 ---
 
 ## Certification

@@ -13,7 +13,7 @@ import torch
 
 from liteinfer.engine.attention_mask import build_continuous_decode_mask
 from liteinfer.models.attention import DenseKV, eager_attention
-from liteinfer.models.paged_decode import _MAX_SPLITS, _choose_num_splits, paged_decode
+from liteinfer.models.paged_decode import paged_decode
 
 pytestmark = pytest.mark.gpu
 
@@ -174,105 +174,3 @@ def test_paged_decode_rejects_pools_that_are_not_laid_out_alike():
             SCALING,
             KV_GROUPS,
         )
-
-
-@pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 8, 32])
-def test_paged_decode_matches_the_dense_kernel_across_several_split_counts(num_splits):
-    """The answer must not depend on how many programs share the key loop.
-
-    Splitting is where the kernel's stateful arithmetic becomes distributed: each
-    program runs its own online softmax over a slice and the combine pass has to
-    put them back on a common scale. The contexts here straddle the slice
-    boundaries every one of these counts produces, and 32 splits over 200 keys
-    makes each slice shorter than `BLOCK_KV`, which is the other boundary.
-    """
-    batch = _PagedBatch([200, 65, 64, 63, 17, 1], torch.float32)
-
-    torch.testing.assert_close(
-        batch.paged(num_splits=num_splits), batch.dense(), rtol=1e-5, atol=1e-5
-    )
-
-
-def test_paged_decode_is_unchanged_by_splitting_the_key_loop():
-    """Split and unsplit are the same attention, stated against each other.
-
-    The dense comparison above pins both to a third answer; this pins them to
-    each other, which is the property the split count being a free parameter
-    rests on.
-    """
-    batch = _PagedBatch([300, 129, 7], torch.float32)
-
-    torch.testing.assert_close(
-        batch.paged(num_splits=11), batch.paged(num_splits=1), rtol=1e-5, atol=1e-5
-    )
-
-
-def test_paged_decode_ignores_splits_that_fall_past_a_short_context():
-    """One split count serves the batch, so its shortest sequence runs out of keys.
-
-    A context of 3 cut 8 ways leaves five programs with nothing to fold. They
-    must contribute no weight rather than a NaN, which is what the `-inf`
-    log-sum-exp and the guarded denominator are for.
-    """
-    batch = _PagedBatch([200, 3], torch.float32)
-
-    torch.testing.assert_close(
-        batch.paged(num_splits=8), batch.dense(), rtol=1e-5, atol=1e-5
-    )
-
-
-def test_paged_decode_splits_match_the_dense_kernel_in_bfloat16_to_within_rounding():
-    """bf16 is the engine's working precision, and the combine adds a rounding step."""
-    batch = _PagedBatch([300, 129, 7], torch.bfloat16)
-
-    torch.testing.assert_close(batch.paged(num_splits=11), batch.dense(), rtol=0, atol=2**-6)
-
-
-def test_paged_decode_rejects_fewer_than_one_split():
-    """A split count below one is a caller error, not something to round up."""
-    batch = _PagedBatch([4], torch.float32)
-
-    with pytest.raises(ValueError, match="num_splits must be >= 1"):
-        batch.paged(num_splits=0)
-
-
-def _splits_for(batch: int, num_kv_heads: int, max_context: int) -> int:
-    return _choose_num_splits(
-        batch=batch,
-        num_kv_heads=num_kv_heads,
-        max_context=max_context,
-        block_kv=64,
-        device_index=0,
-    )
-
-
-def test_a_batch_that_already_covers_the_device_is_not_split():
-    """Splitting is overhead once the grid fills the SMs, so a wide batch takes one pass."""
-    assert _splits_for(batch=256, num_kv_heads=8, max_context=1024) == 1
-
-
-def test_a_single_sequence_splits_its_key_loop():
-    """One program per KV head cannot fill any GPU, which is what this item exists for."""
-    assert _splits_for(batch=1, num_kv_heads=1, max_context=4096) > 1
-
-
-def test_the_split_count_never_exceeds_the_cap():
-    """The combine pass holds every split in registers, so the count stays bounded."""
-    assert _splits_for(batch=1, num_kv_heads=1, max_context=1 << 20) <= _MAX_SPLITS
-
-
-def test_a_context_with_too_little_to_cut_is_not_split():
-    """Under four key tiles the unsplit kernel is at its floor and the combine is pure cost."""
-    assert _splits_for(batch=1, num_kv_heads=1, max_context=128) == 1
-
-
-def test_no_split_is_finer_than_one_key_tile():
-    """A split holding less than a tile cannot cut sequential work off any other."""
-    assert _splits_for(batch=1, num_kv_heads=1, max_context=256) == 4
-
-
-def test_a_longer_context_is_cut_more_finely_than_a_short_one():
-    """Context is the sequential work a split exists to divide, so it sets the count."""
-    assert _splits_for(batch=1, num_kv_heads=8, max_context=4096) > _splits_for(
-        batch=1, num_kv_heads=8, max_context=256
-    )
