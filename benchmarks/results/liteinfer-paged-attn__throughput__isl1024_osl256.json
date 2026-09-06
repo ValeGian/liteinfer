@@ -1,12 +1,12 @@
 {
-  "config": "liteinfer-continuous",
+  "config": "liteinfer-paged-attn",
   "engine": "liteinfer",
-  "description": "Continuous batching, up to 32 concurrent sequences",
-  "baseline": "liteinfer-paged-b4",
+  "description": "Continuous batching, decode attention reads the KV pool in-kernel",
+  "baseline": "liteinfer-sdpa",
   "mode": "throughput",
   "model": "unsloth/Llama-3.2-1B-Instruct",
   "max_num_seqs": 32,
-  "timestamp": "2026-09-06T12:58:46+00:00",
+  "timestamp": "2026-09-06T12:58:03+00:00",
   "dataset": {
     "path": "benchmarks/datasets/isl1024_osl256_n200_unsloth_llama_3_2_1b_instruct.json",
     "target_isl": 1024,
@@ -15,12 +15,12 @@
     "sha256": "3cde2ae99bfcac4ea7d756022ac50586c0edfac70e04ebdc3b620a9635bf9b7e"
   },
   "summary": {
-    "output_tokens_per_s": 702.8923683917856,
-    "requests_per_s": 2.7456733140304124,
-    "wall_time_s": 72.8418777929619
+    "output_tokens_per_s": 1542.0134118310903,
+    "requests_per_s": 6.023489889965196,
+    "wall_time_s": 33.203342854976654
   },
   "raw": {
-    "wall_time_s": 72.8418777929619,
+    "wall_time_s": 33.203342854976654,
     "output_tokens": 51200
   }
 }

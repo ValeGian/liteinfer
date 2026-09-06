@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from liteinfer.models.attention import DEFAULT_IMPLEMENTATION, resolve
+from liteinfer.models.attention import resolve
 
 
 @dataclass
@@ -22,10 +22,11 @@ class EngineConfig:
 
     seed: int = 42
 
-    # Attention kernel. "sdpa" fuses the softmax and never materialises the
-    # score matrix; "eager" writes it out, which caps the prompt length that
-    # fits in memory. See `models/attention.py`.
-    attn_implementation: str = DEFAULT_IMPLEMENTATION
+    # Attention kernel, or None for the fastest one this device can run —
+    # "paged" on CUDA with Triton installed, "sdpa" otherwise. Naming one asks
+    # for it specifically and fails rather than downgrading. See
+    # `models/attention.py`.
+    attn_implementation: str | None = None
 
     # How many requests may sit queued but not yet running. `max_num_seqs` caps
     # what runs; without this nothing caps what is accepted, and a caller that
@@ -51,7 +52,8 @@ class EngineConfig:
             raise ValueError("max_waiting_seqs must be >= 1")
         if not 0 < self.kv_cache_memory_fraction <= 1:
             raise ValueError("kv_cache_memory_fraction must be in (0, 1]")
-        resolve(self.attn_implementation)  # raises on an unknown kernel name
+        if self.attn_implementation is not None:
+            resolve(self.attn_implementation)  # raises on an unknown kernel name
 
     def resolved_device(self) -> torch.device:
         """Return the concrete `torch.device` after resolving ``"auto"``."""

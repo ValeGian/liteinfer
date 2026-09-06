@@ -184,8 +184,9 @@ def as_text(results: list[dict]) -> str:
         for row in rows(members, mode):
             values = "".join(f"{row.value(k):>11,.1f}" for k, _, _ in columns)
             name = row.result["config"] + ("*" if _is_historical(row) else "")
+            base = (row.base or "-") + ("*" if _spans_two_engines(row) else "")
             lines.append(
-                f"{name:<27}{row.base or '-':<25}{values}"
+                f"{name:<27}{base:<25}{values}"
                 f"{_fmt(row.vs_base):>9}{_fmt(row.vs_root):>9}{_fmt(row.vs_vllm):>9}"
             )
     for mode in ("throughput", "latency"):
@@ -204,7 +205,10 @@ def as_text(results: list[dict]) -> str:
             lines.append(f"{name:<27}{cells}")
 
     if any(_is_historical(row) for members, mode in _groups(results) for row in rows(members, mode)):
-        lines.append("\n* measured before the code was removed; no longer runnable")
+        lines.append(
+            "\n* measured before the code was removed; no longer runnable."
+            "\n  A starred *baseline* means that delta spans two engines, not two configs."
+        )
     return "\n".join(lines)
 
 
@@ -215,6 +219,19 @@ def _groups(results: list[dict]):
 def _is_historical(row: Row) -> bool:
     config = CONFIGS.get(row.result["config"])
     return bool(config and config.historical)
+
+
+def _spans_two_engines(row: Row) -> bool:
+    """Whether this row's `vs base` compares engines of different ages.
+
+    A removed config's number is frozen at the day its code was deleted, so a
+    delta against it reads "the engine now against the engine then" rather than
+    "this config against that one". Runnable configs are re-measured together
+    and their deltas isolate the code that differs. The distinction changes what
+    a number means, so the reader is told which kind they are looking at.
+    """
+    base = CONFIGS.get(row.base or "")
+    return bool(base and base.historical)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +310,8 @@ def _table(members: list[dict], mode: str) -> str:
         lineage = f"improves on {row.base}" if row.base else "reference point"
         if _is_historical(row):
             lineage += " &middot; removed from the codebase"
+        if _spans_two_engines(row):
+            lineage += " &middot; which is no longer runnable, so this delta spans two engines"
         body.append(
             f'<tr class="{"ref" if result["engine"] == "vllm" else ""}">'
             f'<td class="name"><span class="label">{html.escape(result["config"])}</span>'

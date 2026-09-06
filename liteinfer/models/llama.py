@@ -15,7 +15,7 @@ from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from liteinfer.models.attention import resolve
+from liteinfer.models.attention import UNIVERSAL_IMPLEMENTATION, DenseKV, resolve
 
 
 @dataclass
@@ -117,13 +117,15 @@ class LlamaAttention(nn.Module):
     """Grouped-query causal self-attention.
 
     The kernel that computes the attention itself comes from
-    `models/attention.py`, chosen by `EngineConfig.attn_implementation`.
+    `models/attention.py`. `models/loader.py` picks it and records the name on
+    the config; a model built directly, without the loader, gets the kernel that
+    runs on any device, since nothing has checked what this one can do.
     """
 
     def __init__(self, config: LlamaConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.attention = resolve(config._attn_implementation)
+        self.attention = resolve(config._attn_implementation or UNIVERSAL_IMPLEMENTATION)
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -153,10 +155,15 @@ class LlamaAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
-        if past_key_values is not None:
-            k, v = past_key_values.update(k, v, self.layer_idx)
+        # The cache decides what the kernel reads: K and V as tensors, or the
+        # pool plus the addresses to walk it (see `cache/continuous_kv_cache.py`).
+        # `is not None` rather than truthiness: an empty Cache is falsy.
+        if past_key_values is None:
+            kv = DenseKV(k, v)
+        else:
+            kv = past_key_values.update(k, v, self.layer_idx)
 
-        attn_output = self.attention(q, k, v, attention_mask, self.scaling, self.num_kv_groups)
+        attn_output = self.attention(q, kv, attention_mask, self.scaling, self.num_kv_groups)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch, seq_len, -1)
         return self.o_proj(attn_output)
 

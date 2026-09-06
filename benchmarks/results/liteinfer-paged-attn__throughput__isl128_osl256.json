@@ -1,12 +1,12 @@
 {
-  "config": "liteinfer-sdpa",
+  "config": "liteinfer-paged-attn",
   "engine": "liteinfer",
-  "description": "Continuous batching, attention through PyTorch SDPA",
-  "baseline": "liteinfer-continuous",
+  "description": "Continuous batching, decode attention reads the KV pool in-kernel",
+  "baseline": "liteinfer-sdpa",
   "mode": "throughput",
   "model": "unsloth/Llama-3.2-1B-Instruct",
   "max_num_seqs": 32,
-  "timestamp": "2026-09-06T12:54:10+00:00",
+  "timestamp": "2026-09-06T12:54:07+00:00",
   "dataset": {
     "path": "benchmarks/datasets/isl128_osl256_n200_unsloth_llama_3_2_1b_instruct.json",
     "target_isl": 128,
@@ -15,12 +15,12 @@
     "sha256": "d97d71495aff03159e2deb9e9a6e918dc6698b03311bd955a7d6f8b306273cb8"
   },
   "summary": {
-    "output_tokens_per_s": 1744.755123748596,
-    "requests_per_s": 6.815449702142953,
-    "wall_time_s": 29.345092215575278
+    "output_tokens_per_s": 1929.956437511722,
+    "requests_per_s": 7.538892334030164,
+    "wall_time_s": 26.52909620385617
   },
   "raw": {
-    "wall_time_s": 29.345092215575278,
+    "wall_time_s": 26.52909620385617,
     "output_tokens": 51200
   }
 }

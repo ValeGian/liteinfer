@@ -64,7 +64,20 @@ def hf_model(model_dir):
 
 @pytest.fixture()
 def llm(model_dir):
-    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE)
+    """liteinfer with the same attention kernel `hf_model` uses.
+
+    The kernel has to be pinned on both sides, for the reason
+    `tests/e2e/test_llama_gpu.py::eager_llm` documents: this test isolates
+    liteinfer's *model* against the reference, and comparing two different
+    kernels in bf16 measures their summation order instead. Left unpinned it
+    would get whichever kernel the engine chooses for the device, which is how
+    it started failing — `paged` rounds two candidate logits onto the same bf16
+    value at token 11 of one prompt (20.125 against sdpa's 20.25 vs 20.125, one
+    ULP apart at that magnitude) and the argmax tie-break then takes the lower
+    token id. That the kernels agree is pinned separately, in fp32, in the 1B
+    file.
+    """
+    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, attn_implementation="eager")
     yield engine
     engine.close()
     del engine

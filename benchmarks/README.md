@@ -15,7 +15,7 @@ DS=benchmarks/datasets/isl128_osl256_n200_meta_llama_llama_3_2_1b_instruct.json
 
 # 2. Run. Throughput can spread over GPUs; latency must not (see Controls).
 bench run --all --dataset "$DS" --mode throughput -n 200 --gpus 0 1 2 3 4 5 6 7
-bench run --all --dataset "$DS" --mode latency    -n 50
+bench run --all --dataset "$DS" --mode latency    -n 200
 
 # 3. Report
 bench report --out docs/index.html
@@ -36,7 +36,7 @@ Missing datasets are generated as needed, and `bench report` grows a
 Run one config while iterating:
 
 ```bash
-bench run --config liteinfer-paged --dataset "$DS" --mode latency -n 20
+bench run --config liteinfer-paged-attn --dataset "$DS" --mode latency -n 20
 ```
 
 ## The two modes measure different things

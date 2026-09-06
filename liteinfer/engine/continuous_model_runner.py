@@ -11,20 +11,32 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import TYPE_CHECKING
 
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
+from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import builders_for
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
+from liteinfer.models.attention import reads_paged_kv
 from liteinfer.models.loader import load_hf_model
 from liteinfer.tokenizer import Tokenizer
 
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
 _LOGGER = logging.getLogger(__name__)
 _GIB = 1 << 30
+
+
+def _head_dim(hf_config: PretrainedConfig) -> int:
+    """Head dimension, which most configs state and the rest imply."""
+    return getattr(
+        hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
+    )
 
 
 class ContinuousModelRunner:
@@ -41,6 +53,19 @@ class ContinuousModelRunner:
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
         self._cache = ContinuousKVCache(self._create_block_pool())
+
+    @property
+    def attn_implementation(self) -> str:
+        """The kernel this engine resolved to, which may not be the one requested.
+
+        `EngineConfig.attn_implementation` can be `None` for "choose for me";
+        `load_hf_model` makes the choice and records it, because that is where
+        the device and the model's head dimension are both known. Reading it
+        back from there keeps one answer rather than two.
+        """
+        resolved = getattr(self.hf_config, "_attn_implementation", None)
+        assert isinstance(resolved, str), "load_model() records the resolved kernel"
+        return resolved
 
     def deregister_sequence(self, seq: Sequence) -> None:
         """Free paged KV blocks allocated for a finished sequence."""
@@ -93,12 +118,7 @@ class ContinuousModelRunner:
         # must contain no host-side work.
         self._cache.advance(request_ids)
         slots = self._cache.slot_table_for(request_ids)
-
-        # seq_total_len includes the current decode token (prompt + all output tokens).
-        seq_total_lens = [len(s.prompt_token_ids) + len(s.output_token_ids) for s in seqs]
-        _, build_decode = builders_for(type(self.model).__name__)
-        attention_mask = build_decode(seq_total_lens, self.config.dtype, self.device)
-        payload = self._cache.make_decode_payload(slots)
+        payload, attention_mask = self._build_decode_kv(request_ids, slots)
         out = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -110,6 +130,29 @@ class ContinuousModelRunner:
     # ------------------------------------------------------------------
     # Input builders
     # ------------------------------------------------------------------
+
+    def _build_decode_kv(
+        self, request_ids: list[str], slots: torch.Tensor
+    ) -> tuple[KVPayload, torch.Tensor | None]:
+        """Pair this step's KV payload with the mask its attention kernel needs.
+
+        The paged kernel stops each sequence at its own context length, so there
+        is no padding to hide and no mask to build. The dense kernels read a
+        gather padded out to the longest sequence in the batch, so there is.
+        """
+        assert self._cache is not None
+        if reads_paged_kv(self.attn_implementation):
+            context_lens = self._cache.context_lens_for(request_ids)
+            return self._cache.make_paged_decode_payload(slots, context_lens), None
+
+        # The cache's token counts already include this step's token, and they are
+        # what addressed the slots above — so the mask is built from the same source.
+        seq_total_lens = [self._cache.seq_total_len(rid) for rid in request_ids]
+        _, build_decode = builders_for(type(self.model).__name__)
+        return (
+            self._cache.make_decode_payload(slots),
+            build_decode(seq_total_lens, self.config.dtype, self.device),
+        )
 
     def _build_prefill_inputs(
         self,
@@ -142,11 +185,7 @@ class ContinuousModelRunner:
     def _create_block_pool(self) -> BlockPool:
         num_layers: int = self.hf_config.num_hidden_layers
         num_kv_heads: int = self.hf_config.num_key_value_heads
-        head_dim: int = getattr(
-            self.hf_config,
-            "head_dim",
-            self.hf_config.hidden_size // self.hf_config.num_attention_heads,
-        )
+        head_dim = _head_dim(self.hf_config)
         num_blocks = self._compute_num_blocks(num_layers, num_kv_heads, head_dim)
         return BlockPool(
             num_blocks=num_blocks,
