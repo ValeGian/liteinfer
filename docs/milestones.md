@@ -4,6 +4,16 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 06-09-2026 — The measured record, refreshed
+
+- **PRs.** [#30](https://github.com/ValeGian/liteinfer/pull/30)
+- **What.** `liteinfer-sdpa` had no latency results at all: every row in the latency table was dated before the five changes that followed, and the README quoted `liteinfer-eager` — a config **deleted in #17** — as the engine's decode step, alongside a throughput figure from before #22. The whole table described an engine that no longer exists. Latency is now measured on the shipping engine and both documents carry it.
+- **Measured.** ITL p50 14.9 → **13.9 ms**, TTFT p50 19.0 → **14.0 ms**, e2e p50 3,807.6 → **3,546.6 ms**. Against vLLM the gap is **2.6x on throughput and 2.7x on the decode step**, not the 3.5x the README claimed.
+- **The two numbers disagree, and both are right.** Throughput moved 1.37x over this sequence while the decode step moved 1.07x. Three of the five changes — incremental detokenisation, vectorised sampling, one transfer per step — cost work *per sequence in the batch*, so removing them shows up in aggregate throughput and barely in a single request's step time. Latency mode runs one request at a time and structurally cannot see them. Reporting either number alone would have told half the story.
+- **Why it went stale.** Every PR in the sequence re-ran `throughput`, because that is the mode the roadmap's table says a scheduling or memory change belongs in. None re-ran `latency`, and nothing checked whether the published numbers still referred to code that existed.
+
+---
+
 ## 05-09-2026 — No host-side work inside the forward pass
 
 - **PRs.** [#29](https://github.com/ValeGian/liteinfer/pull/29)

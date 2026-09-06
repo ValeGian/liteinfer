@@ -93,6 +93,8 @@ refuses to run them.
 | `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | **current** |
 | `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
 
+`liteinfer-sdpa` is the engine as it ships; every row above it is a design that
+was measured and then removed, kept so the progression still renders.
 `liteinfer-continuous` stays runnable rather than becoming `historical`. Note what
 that is not: the replacement rule, read literally, says delete the eager kernel —
 `sdpa` covers its whole domain and wins there. It is kept as a deliberate
@@ -120,6 +122,7 @@ vLLM at the **same batch width** — the only fair cross-engine comparison.
 | `liteinfer-native-eager-b4` | 4 | 277.6 | 1.1 | 184.4 | 3.82× | 0.38× |
 | `liteinfer-paged-b4` | 4 | 252.9 | 1.0 | 202.4 | 3.79× | 0.35× |
 | `liteinfer-continuous` | 32 | 1,268.3 | 5.0 | 40.4 | **5.01×** | 0.28× |
+| `liteinfer-sdpa` | 32 | **1,732.8** | 6.8 | 29.5 | **1.37×** | 0.39× |
 | `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
 | `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
 | `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
@@ -139,6 +142,7 @@ not be parallelised.
 | `liteinfer-native-eager-b4` | 14.9 ms | 16.7 ms | 13.9 ms | 13.9 ms | 3,561.1 ms | 0.99× |
 | `liteinfer-paged-b4` | 19.0 ms | 20.9 ms | 15.0 ms | 15.0 ms | 3,832.2 ms | 1.02× |
 | `liteinfer-continuous` | 19.0 ms | 21.0 ms | 14.9 ms | 14.9 ms | 3,807.6 ms | 1.01× |
+| `liteinfer-sdpa` | **14.0 ms** | 15.9 ms | **13.9 ms** | 14.0 ms | **3,546.6 ms** | **1.07×** |
 | `vllm` | 22.7 ms | 27.4 ms | 5.2 ms | 5.2 ms | 1,354.8 ms | — |
 | `vllm-b4` | 22.6 ms | 27.0 ms | 5.2 ms | 5.2 ms | 1,353.9 ms | — |
 | `vllm-continuous` | 23.2 ms | 32.2 ms | 5.2 ms | 5.2 ms | 1,356.2 ms | — |
@@ -297,6 +301,27 @@ explicit additive mask, and FlashAttention accepts only `is_causal`, so PyTorch
 falls to its **memory-efficient** backend, which does take a mask and tiles the
 same way. Probed on these tensors: flash unavailable, mem-efficient available,
 and forcing the math fallback instead costs +4,872 MiB against its +32 MiB.
+
+### What five changes bought, in one place
+
+`liteinfer-continuous` is the engine at the start of this sequence;
+`liteinfer-sdpa` is where it ships. Same harness, same dataset, same shape.
+
+| | before | after | |
+|---|---:|---:|---:|
+| Throughput, ISL 128 / OSL 256 | 1,268.3 tok/s | **1,732.8** | 1.37× |
+| Throughput, ISL 128 / OSL 1024 | 942.3 | **1,230.4** | 1.31× |
+| Decode step, ITL p50 | 14.9 ms | **13.9 ms** | 1.07× |
+| Time to first token, p50 | 19.0 ms | **14.0 ms** | 1.36× |
+| Longest prompt that runs | ISL 1024 | **ISL 2048** | — |
+
+The ITL row is the one worth reading twice. Throughput moved 1.37x while the
+decode step moved 1.07x, and both are correct: three of the five changes —
+incremental detokenisation, vectorised sampling, one transfer per step — cost
+work *per sequence in the batch*, so removing them shows up in aggregate
+throughput and barely in a single request's step time. Latency mode runs one
+request at a time and cannot see them. A benchmark that reported only one of
+these two numbers would have told half the story either way.
 
 ---
 
