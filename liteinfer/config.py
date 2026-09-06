@@ -34,6 +34,12 @@ class EngineConfig:
     # dies holding work it never ran.
     max_waiting_seqs: int = 1024
 
+    # How many programs share one sequence's decode key loop under the paged
+    # kernel, or None to choose from the batch width and the device. Splitting
+    # buys parallelism a narrow batch cannot; pinning it is what lets a
+    # benchmark row keep measuring one shape. See `models/paged_decode.py`.
+    paged_decode_splits: int | None = None
+
     collect_stats: bool = True
 
     # KV block pool.
@@ -52,6 +58,8 @@ class EngineConfig:
             raise ValueError("max_waiting_seqs must be >= 1")
         if not 0 < self.kv_cache_memory_fraction <= 1:
             raise ValueError("kv_cache_memory_fraction must be in (0, 1]")
+        if self.paged_decode_splits is not None and self.paged_decode_splits < 1:
+            raise ValueError("paged_decode_splits must be >= 1")
         if self.attn_implementation is not None:
             resolve(self.attn_implementation)  # raises on an unknown kernel name
 

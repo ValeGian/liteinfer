@@ -22,6 +22,9 @@ class BenchmarkConfig:
     attn_implementation: str = "eager"
     """Pinned per row rather than inherited from `EngineConfig`: a stored result
     has to keep meaning the same thing after the engine default moves on."""
+    paged_decode_splits: int | None = None
+    """Programs sharing one sequence's decode key loop, or None for the kernel's
+    own choice. Pinned for the same reason as the kernel above."""
     baseline: str | None = None
     historical: bool = False
     """Measured before the code was removed. Kept so the report still shows the
@@ -105,8 +108,18 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         engine="liteinfer",
         max_num_seqs=32,
         attn_implementation="paged",
+        paged_decode_splits=1,
         baseline="liteinfer-sdpa",
         description="Continuous batching, decode attention reads the KV pool in-kernel",
+    ),
+    # --- liteinfer: split-K decode attention (§2.7) ---
+    BenchmarkConfig(
+        name="liteinfer-paged-split",
+        engine="liteinfer",
+        max_num_seqs=32,
+        attn_implementation="paged",
+        baseline="liteinfer-paged-attn",
+        description="Paged decode, key loop split across programs when the batch is narrow",
     ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(

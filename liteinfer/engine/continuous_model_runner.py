@@ -143,7 +143,10 @@ class ContinuousModelRunner:
         assert self._cache is not None
         if reads_paged_kv(self.attn_implementation):
             context_lens = self._cache.context_lens_for(request_ids)
-            return self._cache.make_paged_decode_payload(slots, context_lens), None
+            payload = self._cache.make_paged_decode_payload(
+                slots, context_lens, self.config.paged_decode_splits
+            )
+            return payload, None
 
         # The cache's token counts already include this step's token, and they are
         # what addressed the slots above — so the mask is built from the same source.

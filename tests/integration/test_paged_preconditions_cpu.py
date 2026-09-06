@@ -52,3 +52,9 @@ def test_asking_for_paged_where_it_cannot_run_is_refused(tiny_llama_dir: Path) -
 
     with pytest.raises(ValueError, match="cannot run here"):
         runner.load_model()
+
+
+def test_a_split_count_below_one_is_refused(tiny_llama_dir: Path) -> None:
+    """There is no grid with fewer than one program per sequence to round up to."""
+    with pytest.raises(ValueError, match="paged_decode_splits must be >= 1"):
+        _runner(tiny_llama_dir, paged_decode_splits=0)

@@ -47,6 +47,7 @@ class LiteInferAdapter:
             model=self._model,
             max_num_seqs=self._config.max_num_seqs,
             attn_implementation=self._config.attn_implementation,
+            paged_decode_splits=self._config.paged_decode_splits,
         )
         return self
 
