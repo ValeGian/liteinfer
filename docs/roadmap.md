@@ -159,23 +159,56 @@ listed.
 - **Parity test.** Identical greedy output to non-shared paged cache
   on a workload designed to share prefixes.
 
-### 2.3 Paged KV cache performance (fused kernel)
-- **Status.** `planned`
-- **PRs.** _none yet_
-- **Why.** Paged gathers non-contiguous KV blocks into a contiguous buffer before
-  attention. That gather is now measured rather than inferred: profiled at B=32
-  it is `vectorized_gather_kernel` at **0.652 ms, 5.9% of GPU time** per decode
-  step. Worth having, and smaller than this item used to claim — the ~8-10%
-  figure it carried was measured at B=1 before the flat-slot rewrite, and is no
-  longer the number to plan against. A fused paged-attention kernel reads the
-  block table inside the CUDA kernel and removes the copy entirely, the same
-  approach as vLLM's PagedAttention.
-- **Scope.** Custom CUDA/Triton kernel for block-table attention;
-  `ContinuousModelRunner` switches to it for the decode pass.
-- **Pre-req.** §3.3 (SDPA / FlashAttention switch) provides the entry point to
-  swap in a custom attention backend.
-- **Parity test.** Paged greedy output identical to eager; benchmark shows
-  paged >= eager tok/s at B=1.
+### 2.3 Paged attention that reads the block table in-kernel
+- **Status.** `planned` — **the keystone. Everything else in §3 is waiting on it.**
+- **PRs.** _none yet_ — prototype and measurements in `benchmarks/paged_attention_probe.py`
+- **Why.** Decode gathers every sequence's whole KV history into a contiguous
+  tensor, per layer, per step, and then runs a general attention kernel over it.
+  A kernel that walks the block table itself never gathers, never expands the
+  grouped-query heads, and is shaped for `q_len == 1`. A ~60-line Triton
+  prototype, B=32, 8 KV heads, 32 query heads, 190 tokens of context:
+
+  | per layer | |
+  |---|---:|
+  | gather + memory-efficient attention *(today)* | 0.2961 ms |
+  | **Triton paged decode** | **0.0497 ms** |
+  | | **5.96x** |
+
+  Output matches to 3.9e-03 in bf16, about two ULP. Per decode step that is
+  4.738 ms of measured-in-isolation work falling to 0.795 ms. Isolated figures
+  have read 30-60% high all through this roadmap, so **expect roughly 1.25x in
+  the engine, not 6x** — and measure it there before claiming anything.
+- **An earlier estimate here was wrong.** This item was sized at a 1.038x
+  ceiling on the theory that a fused kernel could at best match the existing
+  attention and save only the gather. It does not match it; it beats it, because
+  the existing path expands 8 KV heads to 32 and hands a general kernel a padded
+  key axis, while the paged kernel reads each KV head once and broadcasts over
+  its query group in-register. That also makes §3.5 unnecessary rather than
+  blocked: there is no `_repeat_kv` left to remove.
+- **What it unblocks, and why they are all stuck without it.** Three separate
+  optimisations were built and measured this cycle, and the paged cache is why
+  each failed:
+
+  | item | measured | what the cache did to it |
+  |---|---|---|
+  | §3.2 CUDA graphs | 1.06x | a graph fixes the shape, so the *gather* has to be padded — real bytes per layer per step |
+  | §3.5 cuDNN broadcast KV | 0.64x | the KV length changes every step, so cuDNN re-plans; 36 ms per call |
+  | §3.1 `torch.compile` | 0.06x | inductor functionalises the in-place pool write into a **copy of the whole pool**, 182 ms of a 206 ms forward |
+
+  Remove the gather and the in-graph pool mutation and all three change
+  character: there is nothing left for bucketing to inflate, and nothing for
+  inductor to functionalise.
+- **Scope, and the design question to settle first.** The kernel is the easy
+  part. The open question is how a query reaches the block table without
+  putting attention inside the cache or the cache inside the model:
+  `_DecodePayload.update` currently scatters *and* gathers, returning `(k, v)`
+  to `LlamaAttention`, which is exactly the contract a paged kernel does not
+  want. Options are a third `attn_implementation` that takes the pool and slots
+  instead of `(k, v)`, or a payload that answers a query directly. Pick one
+  deliberately — `models/llama.py` is the file this codebase most expects to be
+  readable.
+- **Parity test.** Greedy output identical to `sdpa` in fp32, bf16 agreement to
+  ULP on real rows, and a decode benchmark rather than a kernel benchmark.
 
 ### 2.5 Quantized cache (KV-cache fp8 / int8)
 - **Status.** `planned`
@@ -212,7 +245,17 @@ listed.
 
 ### 3.1 `torch.compile` of the forward path
 - **Status.** `planned`
+- **Blocked on.** §2.3. Measured at **0.06x** as the code stands.
 - **PRs.** _none yet_
+- **What it measured.** `torch.compile` on the decode forward is 206.66 ms
+  against eager's 12.87 ms at a fixed shape — and it is *not* recompiling.
+  Inductor functionalises the paged cache's in-place write to a multi-GB pool
+  into a copy of the whole pool: four generated kernels at 43-52 ms each,
+  182 ms of the 206. Excluding the cache mutation from the compiled region
+  recovers it to 12.61 ms, which is **1.02x** — neutral, not a win, and it then
+  recompiles once per `layer_idx` because that is a static int attribute.
+  So the fusion this item wants is worth nothing until the cache stops being
+  compiled with it.
 - **Why.** Elementwise work is the second-largest slice of decode GPU time and
   the most fusible: profiled at B=32, `elementwise_kernel` accounts for
   **17.9% + 2.6% across ~143 launches per step** — RoPE, residual adds, norms
@@ -280,38 +323,17 @@ listed.
   attention layers all-reduce.
 
 ### 3.5 Broadcast the grouped-query heads instead of expanding them
-- **Status.** `planned`
-- **Blocked on.** A decode shape that stops changing every step. See below.
-- **Why it is worth wanting.** `_repeat_kv` materialises a 4x copy of K and V so
-  8 KV heads line up with 32 query heads: **0.74 GiB of writes per decode step**
-  at 32 sequences, about 15% of GPU time, on top of making the attention kernel
-  read four times the KV it needs. `scaled_dot_product_attention(...,
-  enable_gqa=True)` broadcasts the heads inside the kernel instead. On a fixed
-  shape the pair is worth 4.7x on the attention call — 0.223 ms to 0.047 ms.
-- **Why it does not work.** Only the cuDNN backend will broadcast heads under an
-  additive mask (memory-efficient refuses mismatched head counts, flash refuses
-  the mask, and the default dispatch then falls to maths, which materialises the
-  score matrix and undoes §3.3). And cuDNN builds an execution plan per shape.
-  Decode grows the KV length by one every step, so every step is a new shape:
-
-  | attention call, B=32 | `_repeat_kv` + memory-efficient | cuDNN + `enable_gqa` |
-  |---|---:|---:|
-  | fixed shape | 0.223 ms | **0.047 ms** |
-  | shape grows by 1 each call | 0.293 ms | **36.177 ms** |
-  | padded to 64-token buckets | 0.345 ms | 0.352 ms |
-
-  Shipped into the engine it measured **0.64x** at ISL 128 / OSL 256 and 0.84x
-  at OSL 1024 — a large regression, reverted. Bucketing the KV length cuts 128
-  distinct shapes to 3 and brings cuDNN back to *parity*, not to a win: three
-  plan searches amortised over a run still cost about what the copy did.
-- **What would unblock it.** An attention shape that is genuinely constant over
-  many steps, so the plan cost amortises to nothing — which is what §3.2's
-  capture at padded widths would create. The two belong together: §3.2 makes the
-  shape static, and a static shape is what makes this worth doing.
-- **Parity test.** Unchanged output against `eager_attention`, peak memory no
-  worse than the expanded-head path, **and a decode benchmark rather than a
-  kernel benchmark** — a fixed-shape microbenchmark reports this change as a
-  4.7x win when in the engine it is a 1.6x loss.
+- **Status.** `planned` — **likely superseded by §2.3.**
+- **Why it may not be needed.** This item exists to stop `_repeat_kv`
+  materialising a 4x copy of K and V, 0.74 GiB of writes per decode step. §2.3's
+  paged kernel reads each KV head once and broadcasts over its query group
+  in-register, so there is no expansion left to remove. Keep the item open only
+  until §2.3 lands and the profile confirms the copy is gone.
+- **What it measured on its own.** Only cuDNN broadcasts KV heads under an
+  additive mask, and cuDNN builds a plan per shape while decode changes shape
+  every step: 0.223 ms fixed-shape, **36.177 ms** when the shape grows by one
+  each call. In the engine, **0.64x** — reverted. Bucketing the KV length to 64
+  cuts 128 distinct shapes to 3 and reaches parity, not a win.
 
 ### 3.6 Pack the batch instead of padding it
 - **Status.** `planned`
