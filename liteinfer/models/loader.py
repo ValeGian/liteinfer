@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,15 +14,25 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from liteinfer.config import EngineConfig
+from liteinfer.models.attention import select_implementation
 from liteinfer.models.llama import LlamaForCausalLM
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+_LOGGER = logging.getLogger(__name__)
+
 # Architecture name (from `config.json["architectures"][0]`) → liteinfer class.
 _DISPATCH: dict[str, type[nn.Module]] = {
     "LlamaForCausalLM": LlamaForCausalLM,
 }
+
+
+def head_dim_of(hf_config: PretrainedConfig) -> int:
+    """Head dimension, which most configs state and the rest imply."""
+    return getattr(
+        hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
+    )
 
 
 def _read_architecture(model_dir: Path) -> str:
@@ -94,10 +105,17 @@ def load_hf_model(config: EngineConfig, model_dir: Path) -> tuple[nn.Module, Pre
         raise ValueError(f"unsupported architecture {architecture!r}; known: {sorted(_DISPATCH)}")
 
     hf_config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
-    hf_config._attn_implementation = config.attn_implementation
-
     model_cls = _DISPATCH[architecture]
     device = config.resolved_device()
+
+    # The kernel is chosen here because this is the first point where all three
+    # inputs to the choice exist: the requested name, the device, and the
+    # model's head dimension. Layers read it back off `hf_config`, and so does
+    # the runner, so the decision is made once.
+    hf_config._attn_implementation = select_implementation(
+        config.attn_implementation, device, head_dim_of(hf_config)
+    )
+    _LOGGER.info("attention kernel: %s", hf_config._attn_implementation)
 
     # Initialize on the target device so non-persistent buffers (e.g.
     # RoPE `inv_freq`) are computed correctly. Meta+`to_empty` would

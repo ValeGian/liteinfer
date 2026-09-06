@@ -5,29 +5,53 @@ time, which is what the scheduler's slot-filling policy requires.
 
 Payload protocol
 ----------------
-``make_prefill_payload`` and ``make_decode_payload`` return lightweight objects
-that implement the same ``update(k, v, layer_idx)`` interface understood by the
-model's attention layers. Payloads hold a reference to this cache; they are
-ephemeral (created per forward pass) and must not outlive the forward call.
+The payload factories return lightweight objects that implement the same
+``update(k, v, layer_idx)`` interface understood by the model's attention
+layers: store this pass's K/V, then hand back the K/V the attention kernel
+should read, as a ``DenseKV`` or a ``PagedKV``. Payloads hold a reference to
+this cache; they are ephemeral (created per forward pass) and must not outlive
+the forward call.
 
 Prefill payload
     Stores the real (non-padded) prompt K/V into pre-allocated blocks and
-    returns the original (left-padded) tensors unchanged so the prefill
+    returns the original (left-padded) tensors unchanged, so the prefill
     attention computation is unmodified.
 
 Decode payload
     Appends one new token per sequence, then gathers and left-pads the full
     accumulated K/V to ``[B, num_kv_heads, max_total_len, head_dim]`` — the
-    shape expected by the continuous-decode attention mask.
+    shape the dense kernels and the continuous-decode attention mask expect.
+
+Paged decode payload
+    Appends the same token and then returns nothing but addresses: the layer's
+    flat pool storage plus the slot table and context lengths the fused paged
+    kernel walks. The gather never happens, which is the whole point — see
+    ``models/paged_decode.py``.
 """
 
 from __future__ import annotations
 
 import math
+from typing import Protocol
 
 import torch
 
 from liteinfer.cache.block_pool import BlockPool, slot_table
+from liteinfer.models.attention import DenseKV, PagedKV
+
+
+class KVPayload(Protocol):
+    """What one forward pass is handed in place of a KV cache.
+
+    The model calls ``update`` once per layer and passes the result to its
+    attention kernel, so this one method is the whole contract between the cache
+    and the model.
+    """
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
+    ) -> DenseKV | PagedKV:
+        ...
 
 
 class ContinuousKVCache:
@@ -83,6 +107,17 @@ class ContinuousKVCache:
         """
         return _DecodePayload(self, slots)
 
+    def make_paged_decode_payload(
+        self, slots: torch.Tensor, context_lens: torch.Tensor
+    ) -> _PagedDecodePayload:
+        """Return a payload that hands the pool's addresses to the paged kernel.
+
+        Same slot table as ``make_decode_payload``; the difference is that the
+        K/V never leave the pool, so the kernel also needs to know where each
+        sequence's history ends.
+        """
+        return _PagedDecodePayload(self, slots, context_lens)
+
     def advance(self, request_ids: list[str]) -> None:
         """Account for the token about to be decoded, allocating a block if needed."""
         for request_id in request_ids:
@@ -102,6 +137,18 @@ class ContinuousKVCache:
             self._pool.block_size,
             self._pool.device,
         )
+
+    def context_lens_for(self, request_ids: list[str]) -> torch.Tensor:
+        """Cached-token count per sequence, as ``[B]`` on the pool's device."""
+        return torch.tensor(
+            [self._token_counts[rid] for rid in request_ids],
+            dtype=torch.int32,
+            device=self._pool.device,
+        )
+
+    def layer_storage(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """This layer's flat key/value stores, for a kernel that addresses them itself."""
+        return self._pool.slots(layer_idx)
 
     def scatter(
         self, layer_idx: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -136,8 +183,8 @@ class _PrefillPayload:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Store real prompt tokens in blocks; return original tensors unchanged."""
+    ) -> DenseKV:
+        """Store real prompt tokens in blocks; return the original tensors unchanged."""
         if layer_idx == 0:
             for req_id, prompt_len in zip(self._request_ids, self._prompt_lens, strict=True):
                 self._cache._token_counts[req_id] = prompt_len
@@ -146,10 +193,7 @@ class _PrefillPayload:
         # Prompts arrive left-padded and the slot table is right-aligned, so the
         # two line up column for column; padding lands in the null block.
         self._cache.scatter(layer_idx, self._slots, key_states, value_states)
-        return key_states, value_states
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return 0
+        return DenseKV(key_states, value_states)
 
 
 class _DecodePayload:
@@ -168,10 +212,38 @@ class _DecodePayload:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> DenseKV:
         """Store each sequence's decode token; return the gathered left-padded K/V."""
         self._cache.scatter(layer_idx, self._slots[:, -1:], key_states, value_states)
-        return self._cache.gather(layer_idx, self._slots)
+        return DenseKV(*self._cache.gather(layer_idx, self._slots))
 
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return int(self._slots.shape[1])
+
+class _PagedDecodePayload:
+    """Decode-pass payload that stores the new token and then only points at the pool.
+
+    The gathering payload above copies ``[B, H, max_total, D]`` of K and V out of
+    the pool on every layer of every step. This one returns the pool itself plus
+    the addresses, and the fused kernel walks them — so the copy that dominated
+    decode does not exist on this path.
+    """
+
+    def __init__(
+        self,
+        cache: ContinuousKVCache,
+        slots: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> None:
+        self._cache = cache
+        self._slots = slots
+        self._context_lens = context_lens
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> PagedKV:
+        """Store each sequence's decode token; return where the whole history lives."""
+        self._cache.scatter(layer_idx, self._slots[:, -1:], key_states, value_states)
+        key_pool, value_pool = self._cache.layer_storage(layer_idx)
+        return PagedKV(key_pool, value_pool, self._slots, self._context_lens)

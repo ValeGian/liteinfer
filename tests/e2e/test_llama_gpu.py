@@ -110,10 +110,11 @@ def eager_llm(model_dir):
 
     This test isolates liteinfer's *model* — RoPE, norms, projections, the
     cache — against the reference implementation, so the kernel has to be held
-    constant on both sides. Left on the default `sdpa` against an eager
-    reference, it would instead measure bf16 rounding: the two kernels agree to
-    about two ULP, and greedy decoding turns that into a different token around
-    position 11. That the kernels agree is pinned separately, in fp32, below.
+    constant on both sides. Left on whichever kernel the engine would choose,
+    against an eager reference, it would instead measure bf16 rounding: the
+    kernels agree to about two ULP, and greedy decoding turns that into a
+    different token around position 11. That they agree is pinned separately, in
+    fp32, below.
     """
     engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, attn_implementation="eager")
     yield engine
@@ -140,23 +141,23 @@ def test_greedy_matches_transformers(eager_llm: LLM, hf_model, prompt: str) -> N
 
 
 # ---------------------------------------------------------------------------
-# Parity: sdpa vs eager kernel
+# Parity: the three attention implementations
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def fp32_kernel_outputs(model_dir):
-    """Greedy output of both kernels in fp32, one engine resident at a time.
+    """Greedy output of every kernel in fp32, one engine resident at a time.
 
-    fp32 is the precision at which the two kernels are exactly comparable. In
-    bf16 they agree to about two ULP, which greedy decoding turns into a
-    different token as soon as the top two logits fall inside that margin —
-    around token 17 on these prompts. That is precision, not a difference in
-    what the kernels compute, so the equivalence is pinned here instead.
+    fp32 is the precision at which the kernels are exactly comparable. In bf16
+    they agree to about two ULP, which greedy decoding turns into a different
+    token as soon as the top two logits fall inside that margin — around token
+    17 on these prompts. That is precision, not a difference in what the kernels
+    compute, so the equivalence is pinned here instead.
     """
     params = SamplingParams(max_tokens=_PARITY_MAX_TOKENS, temperature=0.0)
     outputs = {}
-    for kernel in ("sdpa", "eager"):
+    for kernel in ("sdpa", "eager", "paged"):
         engine = LLM(
             str(model_dir), device=_DEVICE, dtype=torch.float32, attn_implementation=kernel
         )
@@ -188,6 +189,25 @@ def test_sdpa_matches_eager_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
     assert (
         fp32_kernel_outputs["sdpa"]["left_padded_batch"]
         == fp32_kernel_outputs["eager"]["left_padded_batch"]
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_paged_matches_sdpa_on_one_prompt(fp32_kernel_outputs) -> None:
+    """Reading the pool in place must answer what gathering out of it answered."""
+    assert fp32_kernel_outputs["paged"]["one_prompt"] == fp32_kernel_outputs["sdpa"]["one_prompt"]
+
+
+@pytest.mark.gpu
+@pytest.mark.e2e
+@pytest.mark.slow
+def test_paged_matches_sdpa_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
+    """The paged kernel builds no mask, so a batch of unequal lengths is its risk case."""
+    assert (
+        fp32_kernel_outputs["paged"]["left_padded_batch"]
+        == fp32_kernel_outputs["sdpa"]["left_padded_batch"]
     )
 
 

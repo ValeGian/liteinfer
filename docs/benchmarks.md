@@ -16,7 +16,7 @@ How to run: [`benchmarks/README.md`](../benchmarks/README.md)
 | **GPU** | NVIDIA A40 (46 GB) |
 | **vLLM** | 0.28.0 |
 | **Shape** | ISL 128 · OSL 256 |
-| **Samples** | 200 (throughput) · 50 (latency) |
+| **Samples** | 200 (throughput) · 200 (latency; the historical rows used 50) |
 | **Decoding** | greedy, forced output length |
 
 ---
@@ -90,11 +90,20 @@ refuses to run them.
 | `liteinfer-native-eager-b4` | Static batching, B=4, plain tensors | `liteinfer-native-eager` | removed |
 | `liteinfer-paged-b4` | Static batching, B=4, paged | `liteinfer-paged` | removed |
 | `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | eager kernel |
-| `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | **current** |
+| `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | fallback |
+| `liteinfer-paged-attn` | Decode attention reads the KV pool in-kernel | `liteinfer-sdpa` | **ships** |
 | `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
 
-`liteinfer-sdpa` is the engine as it ships; every row above it is a design that
-was measured and then removed, kept so the progression still renders.
+`liteinfer-paged-attn` is the engine as it ships on CUDA: `EngineConfig()`
+resolves its attention kernel from the device and the model, and picks the paged
+one wherever its preconditions hold. `liteinfer-sdpa` is what that choice falls
+back to — off CUDA, without Triton, or on a model whose head dimension the
+Triton kernel cannot tile — so both rows describe shipping configurations rather
+than one being an experiment. Every row above them is a design that was measured
+and then removed, kept so the progression still renders.
+
+Each row pins its kernel by name, so the matrix measures the kernel the row
+claims and not whatever this machine would have chosen.
 `liteinfer-continuous` stays runnable rather than becoming `historical`. Note what
 that is not: the replacement rule, read literally, says delete the eager kernel —
 `sdpa` covers its whole domain and wins there. It is kept as a deliberate
@@ -110,6 +119,15 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · greedy · vLLM 0.28.0.
 `vs base` compares each config to the one it improves on. `vs vLLM` compares to
 vLLM at the **same batch width** — the only fair cross-engine comparison.
 
+**Two kinds of `vs base`, and the table cannot mark which is which.** The three
+runnable liteinfer configs are re-measured together, so the deltas between them
+isolate what their code differs by. A delta against a *removed* config cannot be:
+its number is frozen at the engine of the day it was deleted, so
+`liteinfer-continuous`'s 6.48× over `liteinfer-paged-b4` is "the engine now
+against the engine then", not "continuous batching against static batching". That
+is the standing cost of deleting a path the benchmark proved worse — the roadmap
+takes that trade deliberately, and this is where the bill arrives.
+
 ### Throughput — 200 prompts, all offered at once
 
 | config | B | tok/s | req/s | wall (s) | vs base | vs vLLM |
@@ -121,11 +139,15 @@ vLLM at the **same batch width** — the only fair cross-engine comparison.
 | `liteinfer-eager-b4` | 4 | 281.6 | 1.1 | 181.8 | **3.84×** | 0.39× |
 | `liteinfer-native-eager-b4` | 4 | 277.6 | 1.1 | 184.4 | 3.82× | 0.38× |
 | `liteinfer-paged-b4` | 4 | 252.9 | 1.0 | 202.4 | 3.79× | 0.35× |
-| `liteinfer-continuous` | 32 | 1,268.3 | 5.0 | 40.4 | **5.01×** | 0.28× |
-| `liteinfer-sdpa` | 32 | **1,732.8** | 6.8 | 29.5 | **1.37×** | 0.39× |
+| `liteinfer-continuous` | 32 | 1,638.8 | 6.4 | 31.2 | 6.48×† | 0.37× |
+| `liteinfer-sdpa` | 32 | 1,744.8 | 6.8 | 29.3 | 1.06× | 0.39× |
+| `liteinfer-paged-attn` | 32 | **1,930.0** | 7.5 | 26.5 | **1.11×** | 0.43× |
 | `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
 | `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
 | `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
+
+† against a removed config, so it measures two engines two milestones apart. The
+two rows above it are same-session and measure only their own code.
 
 ### Latency — one request in flight
 
@@ -142,7 +164,8 @@ not be parallelised.
 | `liteinfer-native-eager-b4` | 14.9 ms | 16.7 ms | 13.9 ms | 13.9 ms | 3,561.1 ms | 0.99× |
 | `liteinfer-paged-b4` | 19.0 ms | 20.9 ms | 15.0 ms | 15.0 ms | 3,832.2 ms | 1.02× |
 | `liteinfer-continuous` | 19.0 ms | 21.0 ms | 14.9 ms | 14.9 ms | 3,807.6 ms | 1.01× |
-| `liteinfer-sdpa` | **14.0 ms** | 15.9 ms | **13.9 ms** | 14.0 ms | **3,546.6 ms** | **1.07×** |
+| `liteinfer-sdpa` | **14.0 ms** | 15.9 ms | 13.9 ms | 14.0 ms | 3,546.6 ms | **1.07×** |
+| `liteinfer-paged-attn` | 14.5 ms | 16.2 ms | **13.4 ms** | 13.5 ms | **3,431.3 ms** | 1.03× |
 | `vllm` | 22.7 ms | 27.4 ms | 5.2 ms | 5.2 ms | 1,354.8 ms | — |
 | `vllm-b4` | 22.6 ms | 27.0 ms | 5.2 ms | 5.2 ms | 1,353.9 ms | — |
 | `vllm-continuous` | 23.2 ms | 32.2 ms | 5.2 ms | 5.2 ms | 1,356.2 ms | — |
@@ -166,10 +189,12 @@ B=4 → B=32 at 5.01× against vLLM's 6.17×. Whatever the two-pass prefill+deco
 step (§1.3) costs, it is a modest residual rather than a dominant term:
 continuous ITL (14.9 ms) sits level with static paged (15.0 ms).
 
-**Paging costs ~8-10%, and that cost is now memory traffic.** Paged reaches 0.92×
-of native-eager on throughput at B=1, 0.90× at B=4, and 0.90× on ITL. The gather
-still copies the whole K/V history every decode step; removing the copy is what
-§2.3's fused kernel is for. Paged is faster than running with no cache (66.8 vs
+**Paging cost ~8-10%, and paying it back is what §2.3 did.** Paged reached 0.92×
+of native-eager on throughput at B=1, 0.90× at B=4, and 0.90× on ITL, because the
+gather copied the whole K/V history every decode step. `liteinfer-paged-attn`
+removes that copy — the block-addressed cache is now the *faster* design rather
+than a slower one bought for its memory behaviour, by 1.11× at this shape and up
+to 2.59× at ISL 1024 / OSL 1024. Paged was already faster than running with no cache (66.8 vs
 60.5 tok/s), and continuous batching is far faster than static (1,268 vs 282
 tok/s) — both of which were *false* before the gather was vectorised, and both of
 which were implementation artifacts rather than properties of the designs.
@@ -260,6 +285,12 @@ runs at all.
 The materialisation itself is untouched by that fix and fails again at longer
 prompts or wider batches. Removing it is §3.3, below.
 
+**This is the shape §2.3 helped most.** A long prompt is a long KV history from
+the first decode step, which is exactly what the gather was charging for: with
+paged decode the 1024 / 1024 row goes 688.9 → 1,783.6 tok/s and the gap to vLLM
+at that shape closes from 4.7× to 1.8×. See *Paged decode stops the step growing
+with context*.
+
 ### The fused kernel buys prompt length, not throughput
 
 Attention now goes through `torch.nn.functional.scaled_dot_product_attention`,
@@ -302,12 +333,88 @@ falls to its **memory-efficient** backend, which does take a mask and tiles the
 same way. Probed on these tensors: flash unavailable, mem-efficient available,
 and forcing the math fallback instead costs +4,872 MiB against its +32 MiB.
 
+### Paged decode stops the step growing with context
+
+`liteinfer-paged-attn` replaces the decode gather with a Triton kernel that reads
+the KV pool through the slot table. All three runnable configs re-measured
+together, which is what these stored rows are:
+
+| shape | `continuous` | `sdpa` | `paged` | paged vs sdpa |
+|---|---:|---:|---:|---:|
+| 128 / 256 | 1,638.8 | 1,744.8 | 1,930.0 | 1.11× |
+| 128 / 1024 | 1,181.1 | 1,205.9 | 1,921.9 | 1.59× |
+| 1024 / 256 | 702.9 | 781.0 | 1,542.0 | 1.97× |
+| 1024 / 1024 | 664.9 | 688.9 | 1,783.6 | **2.59×** |
+| 2048 / 128 | OOM | 398.3 | 820.1 | 2.06× |
+
+Read the first row against the fourth: at the headline shape the change is 1.11×,
+only just past the 1.1× floor this repo treats as an effect at all, and at ISL
+1024 / OSL 1024 it is 2.59×. Same code in every row. What differs is how much KV
+there is to copy — and the shape this repo has always led with is the one with
+the least of it.
+
+The `continuous` column is why all three configs were re-run and not just the two
+being compared. Its stored rows predated PRs #25-#31, so refreshing `sdpa` alone
+would have moved the sdpa-vs-continuous delta at 1024 / 1024 from 1.03× to 1.20×
+and credited the SDPA kernel with five other PRs' work — the same error one row
+further down. A `vs base` delta is only a claim about code if both engines are the
+same age.
+
+The mechanism is visible one level down. Timing `ContinuousModelRunner.decode`
+directly at B=32, so the number is the forward pass and nothing else:
+
+| context | `sdpa` | `paged` | |
+|---:|---:|---:|---:|
+| 188 | 17.14 ms | 13.28 ms | 1.29× |
+| 1,028 | 21.70 ms | **13.05 ms** | 1.66× |
+
+The paged step is **flat**: 13.28 ms at 188 tokens of context and 13.05 ms at
+1,028. The gathering step is not, because the bytes it moves are proportional to
+the history it copies. That is the whole result — decode stops paying for context
+it is not reading — and it is why the win grows with every shape that generates
+more or prompts longer.
+
+Per attention call, bf16, 8 KV heads and 32 query heads, the operation the kernel
+replaces:
+
+| B | context | gather + sdpa | paged | |
+|---:|---:|---:|---:|---:|
+| 1 | 190 | 0.107 ms | 0.047 ms | 2.27× |
+| 32 | 190 | 0.294 ms | 0.038 ms | 7.73× |
+| 32 | 1,024 | 1.478 ms | 0.131 ms | 11.31× |
+| 32 | 2,048 | 2.916 ms | 0.253 ms | 11.54× |
+
+Three things the kernel does not do explain the ratio: it never copies the
+history, it never expands 8 KV heads to 32 (`_repeat_kv` was 0.74 GiB of writes
+per step), and it never touches the padding, because it takes each sequence's
+context length rather than a mask over the batch's longest.
+
+**At B=1 it is worth nothing, and that is the same story.** Latency mode runs one
+request at a time: ITL p50 13.9 → 13.4 ms, E2E 3,546.6 → 3,431.3 ms, TTFT 14.0 →
+14.5 ms. All three are inside the ±4% floor, so the honest reading is *no effect*.
+Two reasons, and they compound: a single request has ~190 tokens of history to
+gather, which is the cheapest case in the table above, and the kernel's grid is one
+program per (sequence, KV head) — 8 programs on an 84-SM GPU. The B=1 row of the
+per-call table is 2.27× where B=32 is 7.73×, and closing that is §2.7.
+
+**The isolated number predicted this one.** 16 layers × (0.294 − 0.038) = 4.09 ms
+of predicted saving against 3.86 ms measured — 94% realised, where the three
+items before it came in at 30-60% of their component benchmarks. The difference is
+what is being removed. Those items removed *overhead* that partly overlapped with
+real work, so the isolated figure double-counted; this one removes a memory copy
+that was serialised with everything else, and a copy that does not happen is
+worth exactly what it cost.
+
 ### What five changes bought, in one place
 
-`liteinfer-continuous` is the engine at the start of this sequence;
-`liteinfer-sdpa` is where it ships. Same harness, same dataset, same shape.
+`liteinfer-continuous` is the engine at the start of that sequence and
+`liteinfer-sdpa` is where it ended. **The "before" column is a stored
+measurement from before those five PRs, and the live matrix no longer reproduces
+it**: `liteinfer-continuous` has since been re-measured on today's engine, which
+is what makes the current `vs base` deltas mean what they say. Kept here because
+it is the only place the sequence is accounted for.
 
-| | before | after | |
+| | before (as measured then) | after | |
 |---|---:|---:|---:|
 | Throughput, ISL 128 / OSL 256 | 1,268.3 tok/s | **1,732.8** | 1.37× |
 | Throughput, ISL 128 / OSL 1024 | 942.3 | **1,230.4** | 1.31× |
@@ -322,6 +429,14 @@ work *per sequence in the batch*, so removing them shows up in aggregate
 throughput and barely in a single request's step time. Latency mode runs one
 request at a time and cannot see them. A benchmark that reported only one of
 these two numbers would have told half the story either way.
+
+**And the 1.37x was never the SDPA kernel's.** Re-measured together on today's
+engine, `liteinfer-sdpa` is **1.06×** over `liteinfer-continuous` at this shape —
+the two configs differ only by the attention kernel, and that is what a kernel
+swap is worth here. The rest of the 1.37x was the other four PRs, which the
+stale baseline had been silently crediting to the kernel for five milestones.
+Re-running a baseline is not bookkeeping; it is how a delta stops being a
+different claim than it appears to be.
 
 ---
 
@@ -414,6 +529,14 @@ engine measurement disagreed, and the first where they disagreed about the
 enforce: **measure the component to find the target, measure the engine to size
 it** — and never ship on the first number alone.
 
+§2.3 is the counter-example that sharpens the rule rather than breaking it. Its
+component number predicted 4.09 ms of saving and the engine gave 3.86 ms, 94%.
+What it removes is a *copy*, which was serialised with the rest of the pass and
+therefore cost its full measured time; the four items that read high all removed
+overhead that partly overlapped with real work. So the discount is not a property
+of component benchmarks in general — it is a property of measuring something that
+was never entirely on the critical path.
+
 ---
 
 ## Certification
@@ -428,7 +551,9 @@ rounds.
 **Variance.** Re-running configs alone versus inside the parallel sweep moved
 throughput by 2.0% in one direction and ITL by 3.8% in the other — noise, not a
 systematic parallel bias, so CPU-core pinning is doing its job. Treat ±4% as the
-resolution floor; every effect reported above is ≥1.19×.
+resolution floor. Two rows above sit inside it and are reported as no effect: the
+paged kernel's latency at B=1, and the SDPA kernel's 1.06× over the eager one at
+ISL 128 / OSL 256 once both are measured on the same engine.
 
 **One measurement was thrown out.** In the first parallel sweep vLLM's TTFT read
 28.1 ms. Because vLLM's offline TTFT is mostly fixed IPC overhead to its engine
@@ -446,7 +571,8 @@ Ordered by cost, largest first.
 | Gap | Measured | Root cause | Roadmap |
 |---|---|---|---|
 | ~3x slower than vLLM per decode step, at every batch width | ITL 13.7 ms vs 5.2 ms; ~25% of memory bandwidth vs vLLM's 68% | No CUDA graphs, no fused attention | [§3.1](roadmap.md#31-torchcompile-of-the-forward-path), [§3.2](roadmap.md#32-cuda-graph-capture-for-decode), [§3.3](roadmap.md#33-flash--sdpa-attention) |
-| Paging costs 8-10% against eager | 0.92x throughput at B=1, 0.90x at B=4 and on ITL | The gather still copies the whole K/V history each step | [§2.3](roadmap.md#23-paged-kv-cache-performance-fused-kernel) |
+| Decode is single-request-slow at narrow batches | paged attention is 7.73x per layer at B=32 but 2.27x at B=1 | One program per (sequence, KV head) leaves an 84-SM GPU idle at B=1 | [§2.7](roadmap.md#27-split-the-key-loop-when-the-batch-is-narrow) |
+| Prefill still gathers, pads and expands | not isolated; `_repeat_kv` and the prefill mask are unchanged | §2.3 addressed decode only | [§3.5](roadmap.md#35-broadcast-the-grouped-query-heads-instead-of-expanding-them), [§3.6](roadmap.md#36-pack-the-batch-instead-of-padding-it) |
 | Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Two-pass step when prefill and decode coexist | [§1.3](roadmap.md#13-chunked-prefill--single-pass-mixed-batching) |
 | KV-cache benefit unquantified across shapes | 1.21x at ISL 128 / OSL 256 only | Single measured shape; the crossover is sequence-length dependent | [§8.3](roadmap.md#83-sequence-length-sweep-workload) |
 | No prefix-cache benefit | not measured | Prefix caching not implemented | [§2.2](roadmap.md#22-prefix-sharing) |

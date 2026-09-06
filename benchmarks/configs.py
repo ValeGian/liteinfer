@@ -99,6 +99,15 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         baseline="liteinfer-continuous",
         description="Continuous batching, attention through PyTorch SDPA",
     ),
+    # --- liteinfer: paged decode attention (§2.3) ---
+    BenchmarkConfig(
+        name="liteinfer-paged-attn",
+        engine="liteinfer",
+        max_num_seqs=32,
+        attn_implementation="paged",
+        baseline="liteinfer-sdpa",
+        description="Continuous batching, decode attention reads the KV pool in-kernel",
+    ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(
         name="vllm",

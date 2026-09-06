@@ -72,6 +72,12 @@ async def main():
 asyncio.run(main())
 ```
 
+The attention kernel is chosen for the device and the model unless you name
+one — on CUDA that is `paged`, a Triton kernel that reads the KV pool in place
+instead of gathering it, so the decode step stops growing with context. Pass
+`attn_implementation="sdpa"` or `"eager"` to override; naming a kernel that
+cannot run here is an error rather than a silent downgrade.
+
 ## Repository layout
 
 ```
@@ -107,7 +113,10 @@ One engine: continuous batching over a paged KV cache.
 - **`models/attention.py`** — the attention kernel, one per
   `attn_implementation`. `sdpa` (default) never materialises the score matrix;
   `eager` writes it out in plain matmuls, which reads better and is the parity
-  reference, but caps the prompt length that fits in memory.
+  reference, but caps the prompt length that fits in memory. `paged` is the fast
+  decode path: a Triton kernel that reads the KV pool through the slot table
+  instead of gathering it, so the decode step stops growing with context. The
+  engine picks between them from the device and the model's head dimension.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
 without touching the engine. `stats` records a `StepMetrics` per forward pass.
@@ -151,19 +160,26 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 
 | | liteinfer | vLLM | |
 |---|---:|---:|---|
-| Throughput, B=32 | 1,733 tok/s | 4,467 tok/s | 2.6× behind |
-| Decode step (ITL p50) | 13.9 ms | 5.2 ms | 2.7× behind |
-| Time to first token (p50) | 14.0 ms | 23.2 ms | 1.7× ahead\* |
+| Throughput, B=32 | 1,930 tok/s | 4,467 tok/s | 2.3× behind |
+| Throughput, ISL 1024 / OSL 1024 | 1,784 tok/s | 3,241 tok/s | 1.8× behind |
+| Decode step (ITL p50) | 13.4 ms | 5.2 ms | 2.6× behind |
+| Time to first token (p50) | 14.5 ms | 23.2 ms | 1.6× ahead\* |
 | Long prompts (ISL 2048) | runs | runs | eager attention cannot |
 
 \* At this prompt length TTFT is mostly fixed per-call API overhead rather than
 prefill compute, so read it as offline round-trip latency, not prefill speed.
 
-Every row is the engine as it ships — one execution path, continuous batching
-over a paged KV cache with fused attention. What remains is a roughly flat
-~2.7× per-step decode constant at every batch width: no CUDA graphs, no varlen
-packing, and a paged cache that still gathers its KV into a contiguous tensor
-every step. Those three are measured and queued, not guessed —
+Rows 1-4 are ISL 128 / OSL 256 unless stated, on the kernel the engine picks
+for an A40 — `paged`, the Triton decode kernel. Where its preconditions do not
+hold the choice falls back to `sdpa`, which runs anywhere and measures
+1,745 tok/s on row 1.
+
+The second row is the one that moved most this cycle: reading the KV pool in
+place instead of gathering it makes the decode step **flat in context length**
+(13.3 ms at 188 tokens, 13.1 ms at 1,028), which is worth 1.11× at the shape
+above and 2.59× at ISL 1024 / OSL 1024. What remains against vLLM is a per-step
+constant: no CUDA graphs, no varlen packing, and a decode grid that leaves an
+84-SM GPU idle at B=1. All three are measured and queued, not guessed —
 [`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including two
 optimisations that were built, measured and reverted.
 Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:

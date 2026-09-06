@@ -139,6 +139,33 @@ def test_each_row_names_the_config_it_improves_on() -> None:
     assert _score(members, "throughput", "liteinfer-eager").base == "liteinfer-nocache"
 
 
+# --- what a delta is a claim about ------------------------------------------
+
+
+def test_a_delta_against_a_removed_config_is_marked_in_text() -> None:
+    """`liteinfer-paged-b4` is removed, so its stored number is frozen at that engine.
+
+    A delta against it therefore compares two engines, not two configs, and the
+    reader has to be able to tell that from the delta that compares two runnable
+    configs measured together.
+    """
+    members = [_throughput("liteinfer-continuous", 10.0, baseline="liteinfer-paged-b4")]
+
+    assert "liteinfer-paged-b4*" in report.as_text(members)
+
+
+def test_a_delta_against_a_runnable_config_is_not_marked_in_text() -> None:
+    members = [_throughput("liteinfer-sdpa", 10.0, baseline="liteinfer-continuous")]
+
+    assert "liteinfer-continuous*" not in report.as_text(members)
+
+
+def test_a_delta_against_a_removed_config_is_explained_in_html() -> None:
+    members = [_throughput("liteinfer-continuous", 10.0, baseline="liteinfer-paged-b4")]
+
+    assert "spans two engines" in report.as_html(members)
+
+
 def test_differing_prompt_sets_are_flagged_in_text() -> None:
     mismatched = _throughput("liteinfer-eager", 10.0, dataset={"sha256": "different"})
     assert "WARNING" in report.as_text([_throughput("liteinfer-nocache", 10.0), mismatched])
