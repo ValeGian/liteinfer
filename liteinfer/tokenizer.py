@@ -20,6 +20,12 @@ class SupportsDecode(Protocol):
 class Tokenizer:
     def __init__(self, model_dir: str | Path) -> None:
         self._hf: Any = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
+        # Decode through the Rust tokenizer where there is one. The engine calls
+        # `decode` twice per sequence per step, and at 128 concurrent sequences
+        # that put 0.598 s in `PreTrainedTokenizerFast.decode`'s Python wrapper
+        # against 0.062 s in the Rust call it wraps — ten times the work in
+        # bookkeeping. A slow tokenizer has no backend and stays as it was.
+        self._decoder: Any = self._hf.backend_tokenizer if self._hf.is_fast else self._hf
         # Multimodal models can return a list; normalize to tuple of ints.
         eos = self._hf.eos_token_id
         if isinstance(eos, list):
@@ -38,7 +44,7 @@ class Tokenizer:
         return self._hf.encode(text, add_special_tokens=False)
 
     def decode(self, token_ids: list[int]) -> str:
-        return self._hf.decode(token_ids, skip_special_tokens=True)
+        return self._decoder.decode(token_ids, skip_special_tokens=True)
 
 
 @dataclass

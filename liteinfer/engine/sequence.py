@@ -17,6 +17,19 @@ class SequenceStatus(str, Enum):
     FINISHED_ABORTED = "finished_aborted"  # cancelled by the user
 
 
+_FINISHED_STATUSES = frozenset(
+    {
+        SequenceStatus.FINISHED_STOPPED,
+        SequenceStatus.FINISHED_LENGTH,
+        SequenceStatus.FINISHED_ABORTED,
+    }
+)
+"""Membership rather than a name prefix: this is read seven times per sequence per
+step — 229,376 times in one wide-batch run — and building `.name` to match a
+string prefix made that measurable. Naming the states also stops the check
+depending on how they happen to be spelled."""
+
+
 @dataclass
 class Sequence:
     """In-flight token stream for a single generation request."""
@@ -36,7 +49,7 @@ class Sequence:
 
     @property
     def is_finished(self) -> bool:
-        return self.status.name.startswith("FINISHED_")
+        return self.status in _FINISHED_STATUSES
 
     def __len__(self) -> int:
         return len(self.prompt_token_ids) + len(self.output_token_ids)

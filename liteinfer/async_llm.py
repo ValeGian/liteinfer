@@ -81,7 +81,9 @@ class AsyncLLM:
         async def _collect(prompt: str, req_id: str) -> RequestOutput:
             final: StreamEvent | None = None
             async with slots:
-                async for event in self.engine.generate_stream(req_id, prompt, params):
+                async for event in self.engine.generate_stream(
+                    req_id, prompt, params, stream_tokens=False
+                ):
                     final = event
             assert final is not None
             return RequestOutput(
