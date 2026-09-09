@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from benchmarks.configs import CONFIGS
@@ -75,6 +76,50 @@ def _score(result: dict, reference: dict | None, mode: str) -> float | None:
     return theirs / mine if lower_is_better else mine / theirs
 
 
+# How far apart two runs may be before their ratio stops meaning what it says.
+# A day is generous: the point is not to police clock drift but to catch a
+# baseline that predates a change, which is a matter of commits rather than hours.
+_STALENESS_WINDOW = timedelta(days=1)
+
+
+def _incomparable(result: dict, reference: dict | None) -> str | None:
+    """Why a ratio between these two should not be read, or `None` if it can be.
+
+    `vs base` divides two stored numbers and has no idea when either was taken.
+    That is fine for a change behind a config knob, where both rows are re-run
+    together — and silently wrong for an **ungated** one, which lands in every
+    config at once while the baselines it will be compared against were measured
+    before it. §3.7 did that: the report printed 1.19x for a change worth 1.10x,
+    the rest being an ungated improvement present in the newer row only.
+
+    The same applies to prompts. `benchmarks/datasets/` is gitignored, so a
+    regenerated dataset takes a new digest while older results keep the old one,
+    and two rows can quietly be answering different questions.
+    """
+    if reference is None or reference is result:
+        return None
+    if result["dataset"]["sha256"] != reference["dataset"]["sha256"]:
+        return "different prompts"
+    mine, theirs = result.get("revision"), reference.get("revision")
+    # Dirty first: it is the more specific diagnosis, and a dirty revision also
+    # differs from a clean one, so the general check would shadow it.
+    if "dirty" in (mine or "") or "dirty" in (theirs or ""):
+        return "uncommitted tree"
+    if mine and theirs and mine != theirs:
+        return "different revisions"
+    # Results stored before the revision was recorded fall back to the clock,
+    # which catches the egregious cases and misses the ones hours apart — which
+    # is exactly why the revision was added.
+    gap = abs(_measured_at(result) - _measured_at(reference))
+    if gap > _STALENESS_WINDOW:
+        return f"{gap.days}d apart"
+    return None
+
+
+def _measured_at(result: dict) -> datetime:
+    return datetime.fromisoformat(result["timestamp"])
+
+
 def _baseline(result: dict, peers: dict[str, dict]) -> dict | None:
     return peers.get(result.get("baseline") or "")
 
@@ -108,6 +153,8 @@ class Row:
     vs_base: float | None
     vs_root: float | None
     vs_vllm: float | None
+    unsound: dict[str, str] = field(default_factory=dict)
+    """Column name -> why that ratio compares two runs that are not comparable."""
 
     def value(self, key: str) -> float:
         return self.result["summary"][key]
@@ -117,16 +164,33 @@ def rows(members: list[dict], mode: str) -> list[Row]:
     """One scored row per result, ordered so each config follows its baseline."""
     peers = {r["config"]: r for r in members}
     ordered = sorted(members, key=lambda r: _ORDER.get(r["config"], len(_ORDER)))
-    return [
-        Row(
-            result=result,
-            base=result.get("baseline"),
-            vs_base=_score(result, _baseline(result, peers), mode),
-            vs_root=_score(result, _lineage_root(result, peers), mode),
-            vs_vllm=_score(result, _vllm_at_same_width(result, members), mode),
+    scored = []
+    for result in ordered:
+        references = {
+            "base": _baseline(result, peers),
+            "root": _lineage_root(result, peers),
+            "vllm": _vllm_at_same_width(result, members),
+        }
+        scores = {
+            name: _score(result, reference, mode) for name, reference in references.items()
+        }
+        scored.append(
+            Row(
+                result=result,
+                base=result.get("baseline"),
+                vs_base=scores["base"],
+                vs_root=scores["root"],
+                vs_vllm=scores["vllm"],
+                # Only worth flagging where there is a number to distrust.
+                unsound={
+                    name: reason
+                    for name, reference in references.items()
+                    if scores[name] is not None
+                    and (reason := _incomparable(result, reference)) is not None
+                },
+            )
         )
-        for result in ordered
-    ]
+    return scored
 
 
 def by_shape(results: list[dict], mode: str) -> tuple[list[tuple[int, int]], dict[str, dict]]:
@@ -158,8 +222,12 @@ def _mismatched(members: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _fmt(value: float | None) -> str:
-    return f"{value:.2f}x" if value else "-"
+def _fmt(value: float | None, unsound: bool = False) -> str:
+    if not value:
+        return "-"
+    # `~` rather than a footnote: the point is that the cell itself cannot be
+    # taken at face value, so the doubt has to travel with the number.
+    return f"{value:.2f}x{'~' if unsound else ''}"
 
 
 def as_text(results: list[dict]) -> str:
@@ -173,7 +241,10 @@ def as_text(results: list[dict]) -> str:
             f"  |  {members[0]['dataset']['num_samples']} prompts"
         )
         if _mismatched(members):
-            lines.append("  WARNING: these runs did not all use the same prompts")
+            lines.append(
+                "  WARNING: not every run here used the same prompts; "
+                "~ marks the ratios it affects"
+            )
         header = (
             f"{'config':<27}{'improves on':<25}"
             + "".join(f"{head:>11}" for _, head, _ in columns)
@@ -187,7 +258,9 @@ def as_text(results: list[dict]) -> str:
             base = (row.base or "-") + ("*" if _spans_two_engines(row) else "")
             lines.append(
                 f"{name:<27}{base:<25}{values}"
-                f"{_fmt(row.vs_base):>9}{_fmt(row.vs_root):>9}{_fmt(row.vs_vllm):>9}"
+                f"{_fmt(row.vs_base, 'base' in row.unsound):>9}"
+                f"{_fmt(row.vs_root, 'root' in row.unsound):>9}"
+                f"{_fmt(row.vs_vllm, 'vllm' in row.unsound):>9}"
             )
     for mode in ("throughput", "latency"):
         shapes, values = by_shape(results, mode)
@@ -208,6 +281,19 @@ def as_text(results: list[dict]) -> str:
         lines.append(
             "\n* measured before the code was removed; no longer runnable."
             "\n  A starred *baseline* means that delta spans two engines, not two configs."
+        )
+    reasons = sorted(
+        {
+            reason
+            for members, mode in _groups(results)
+            for row in rows(members, mode)
+            for reason in row.unsound.values()
+        }
+    )
+    if reasons:
+        lines.append(
+            "\n~ this ratio divides two runs that are not comparable "
+            f"({', '.join(reasons)}); re-measure both together before reading it."
         )
     return "\n".join(lines)
 
@@ -282,9 +368,14 @@ footer { color:var(--muted); font-size:.78rem; margin-top:38px; }
 """
 
 
-def _delta(value: float | None) -> str:
+def _delta(value: float | None, unsound: str | None = None) -> str:
     if value is None:
         return '<td class="nil">—</td>'
+    if unsound:
+        return (
+            f'<td class="nil" title="not comparable: {html.escape(unsound)}">'
+            f"{value:.2f}x~</td>"
+        )
     return f'<td class="{"up" if value >= 1 else "down"}">{value:.2f}x</td>'
 
 
@@ -319,9 +410,9 @@ def _table(members: list[dict], mode: str) -> str:
             f"&middot; {html.escape(lineage)}</span>"
             f'<span class="bar" style="width:{max(fraction, 0.012) * 100:.1f}%"></span></td>'
             + "".join(cells)
-            + _delta(row.vs_base)
-            + _delta(row.vs_root)
-            + _delta(row.vs_vllm)
+            + _delta(row.vs_base, row.unsound.get("base"))
+            + _delta(row.vs_root, row.unsound.get("root"))
+            + _delta(row.vs_vllm, row.unsound.get("vllm"))
             + "</tr>"
         )
 

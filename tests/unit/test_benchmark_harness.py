@@ -138,3 +138,11 @@ def test_rerunning_overwrites_rather_than_accumulates(tmp_path) -> None:
     _run("throughput", tmp_path, StubAdapter())
     _run("throughput", tmp_path, StubAdapter())
     assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+def test_a_result_records_the_engine_revision_it_measured() -> None:
+    """A delta is only meaningful between two runs of the same code, and the
+    timestamp is a poor proxy — the baselines §3.7 invalidated were hours old."""
+    from benchmarks.harness import _revision
+
+    assert _revision() != ""

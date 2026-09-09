@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ class Result:
     summary: dict
     raw: dict
     timestamp: str
+    revision: str
 
     @property
     def filename(self) -> str:
@@ -51,6 +53,7 @@ class Result:
             "model": self.dataset.model,
             "max_num_seqs": self.config.max_num_seqs,
             "timestamp": self.timestamp,
+            "revision": self.revision,
             "dataset": {
                 "path": str(self.dataset_path),
                 "target_isl": self.dataset.target_isl,
@@ -61,6 +64,28 @@ class Result:
             "summary": self.summary,
             "raw": self.raw,
         }
+
+
+def _revision() -> str:
+    """The engine this result measured, as a git revision.
+
+    Recorded because a delta is only meaningful between two runs of the same
+    code, and a timestamp is a poor proxy for that: the baselines an ungated
+    change invalidated in §3.7 were hours old, not days. A dirty tree is marked,
+    since then the revision does not fully identify what ran.
+    """
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True, cwd=Path(__file__).parent,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, check=True, cwd=Path(__file__).parent,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return f"{head}-dirty" if dirty else head
 
 
 def _check_lengths(counts: list[int], expected: int) -> None:
@@ -134,7 +159,7 @@ def run(
         summary, raw = runner(adapter, data)
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    result = Result(config, mode, data, Path(dataset_path), summary, raw, timestamp)
+    result = Result(config, mode, data, Path(dataset_path), summary, raw, timestamp, _revision())
     output = Path(results_dir) / result.filename
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result.as_dict(), indent=2), encoding="utf-8")

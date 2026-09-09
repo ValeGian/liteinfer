@@ -1060,10 +1060,12 @@ newer row only. Re-measuring every runnable config in one session fixed it —
 in the baseline, and the printed delta fell to the 1.10× it should always have
 been.
 
-Worth stating as a rule, because nothing in the code enforces it: **an ungated
-change invalidates every stored delta whose baseline predates it.** The
-`timestamp` each result carries is never read, so the report cannot warn about
-it. Filed as §8.4.
+Worth stating as a rule: **an ungated change invalidates every stored delta whose
+baseline predates it.** §8.4 now enforces it — each result records the git
+revision it measured, and a ratio whose two rows disagree on revision, prompt
+digest or (for older rows) the clock is printed with a `~`. A staleness window
+alone would not have caught this one: these baselines were hours old, not days,
+and what differed was the code.
 
 ### Would capturing prefill help? Only where prefill is small (§3.2 follow-up)
 
