@@ -4,6 +4,32 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 06-09-2026 — §3.2 The decode forward is replayed, not launched
+
+- **PRs.** [#35](https://github.com/ValeGian/liteinfer/pull/35)
+- **What.** A decode step issued about 700 kernels to do 7 ms of GPU work inside a 13 ms step. `EngineConfig.enable_cuda_graphs` now captures that forward once per batch width and replays it, which submits the whole sequence in one go instead of paying host dispatch per kernel. Decode step **13.4 → 6.6 ms**, throughput **1,930 → 3,112 tok/s**.
+- **Measured, against the same engine with capture pinned off.**
+
+  | throughput | before | after | |
+  |---|---:|---:|---:|
+  | 128 / 256 | 1,930.0 | **3,111.7** | **1.61x** |
+  | 128 / 1024 | 1,921.9 | 2,959.1 | 1.54x |
+  | 1024 / 1024 | 1,783.6 | 2,356.2 | 1.32x |
+  | 1024 / 256 | 1,542.0 | 1,990.8 | 1.29x |
+  | 2048 / 128 | 820.1 | 908.2 | 1.11x |
+
+  Latency at B=1: ITL p50 13.4 → **6.6 ms** (2.03x), e2e 3,431.3 → **1,698.3 ms**, and 13.8 → 7.9 ms at 3,584 tokens of context. The gap to vLLM closes from 0.43x to **0.70x** on throughput and from 2.58x to **1.27x** on the step. Largest single change the project has measured, and general: every batch width, every context, both modes.
+- **The instrumentation named it before any code was written.** `TimeBreakdown` had recorded the loop's stages since §6.4 and nothing had ever read it: the forward is **93%** of the loop, so the five PRs that went after sampling, detokenisation and per-step transfers had finished that job. Inside the forward, profiling showed the GPU **41-52% idle at every batch width** across 693-725 launches at a flat **18.7 us of wall per launch** — 32x the tokens buying 1.29x the GPU time, which is why throughput scaled with batch while the step never moved.
+- **Then the ceiling was priced before the build.** Capturing the existing forward and timing replay gave 1.76x / 1.68x / 1.50x at B=1 / 8 / 32, and replaying against static buffers refilled from live engine state was bit-identical to eager over six steps. Both numbers were on record before a line of `cuda_graphs.py` existed, which is the rule §2.7 paid to learn.
+- **Why it measured 1.06x the first time it was tried (#29) and 1.61x now.** That attempt predates §2.3. A graph fixes every shape, so the KV length has to be bucketed — and back then padding the KV length padded a *gather*, real bytes per layer per step. §2.3 deleted the gather, and the padding became a few masked loads inside one kernel.
+- **No KV buckets at all, in the end — the roadmap's own scope was heavier than needed.** A graph freezes scalars and pointers, not what a kernel reads out of device memory, and `paged_decode` bounds its loop by `context_lens`, which is a tensor. So one capture serves every context length and the slot table is a single fixed `[max_num_seqs, max_model_len]` buffer whose unread columns are never touched — no bucketing, no zeroing, and right-alignment composing is what makes a wide table hold a short sequence correctly.
+- **One graph per exact batch width, so there are no padded rows either.** vLLM pads each batch up to a ladder of captured sizes because its batch width is a token count that can be anything in the thousands; liteinfer's decode batch is bounded by `max_num_seqs`, so capturing per width is affordable and wastes nothing. Lazily, too: a run visits the widths its own scheduling produces, and a batch fills before it drains, so the largest width is captured first — which is the ordering vLLM arranges deliberately at startup. `_MAX_CAPTURES` bounds the total at 64 for an engine configured far wider than the default.
+- **What it cost.** TTFT does not move: prefill is not captured, its shapes follow the prompt, and there is one prefill per request against hundreds of decodes. ISL 2048 / OSL 128 is the weakest row at 1.11x — the shape with the most prefill and the fewest decode steps to spread a fixed saving over. The first step at each width pays three warm-up forwards and a capture. Memory went the right way: a draining batch captured all 32 widths and **reserved memory fell 2.1 GiB**, the eager path's transients having been larger than the graph pool that replaced them.
+- **The component estimate read low, which is new here.** 1.76x predicted at B=1 against 2.03x measured; every previous disagreement in `docs/benchmarks.md` went the other way by 30-60%. The ceiling was measured at 765 tokens of context and the benchmark's is 128-384, so there was less GPU work under the same fixed overhead. An overhead-removal estimate scales with how little work the step contains — the mirror image of §2.3's rule about removing a copy.
+- **What it leaves.** ITL is now **1.86x** the memory roofline (3.55 ms) against vLLM's 1.47x, so the remainder is arithmetic rather than waiting: ~45 kernels per layer where a Llama layer needs ten. That is §3.1, now sizeable against a step where a launch is nearly free. It also unblocks §2.7, whose split-K was reverted only for adding a launch per layer — with one caveat now recorded: `num_splits` is a scalar a graph bakes in, so it has to be pinned per capture rather than chosen per step.
+
+---
+
 ## 06-09-2026 — §2.3 Decode reads the KV pool where it lies
 
 - **PRs.** [#33](https://github.com/ValeGian/liteinfer/pull/33)

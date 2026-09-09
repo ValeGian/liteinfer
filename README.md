@@ -160,27 +160,29 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 
 | | liteinfer | vLLM | |
 |---|---:|---:|---|
-| Throughput, B=32 | 1,930 tok/s | 4,467 tok/s | 2.3× behind |
-| Throughput, ISL 1024 / OSL 1024 | 1,784 tok/s | 3,241 tok/s | 1.8× behind |
-| Decode step (ITL p50) | 13.4 ms | 5.2 ms | 2.6× behind |
-| Time to first token (p50) | 14.5 ms | 23.2 ms | 1.6× ahead\* |
+| Throughput, B=32 | **3,112 tok/s** | 4,467 tok/s | 1.4× behind |
+| Throughput, ISL 1024 / OSL 1024 | **2,356 tok/s** | 3,241 tok/s | 1.4× behind |
+| Decode step (ITL p50) | **6.6 ms** | 5.2 ms | 1.3× behind |
+| Time to first token (p50) | 14.9 ms | 23.2 ms | 1.6× ahead\* |
 | Long prompts (ISL 2048) | runs | runs | eager attention cannot |
 
 \* At this prompt length TTFT is mostly fixed per-call API overhead rather than
 prefill compute, so read it as offline round-trip latency, not prefill speed.
 
 Rows 1-4 are ISL 128 / OSL 256 unless stated, on the kernel the engine picks
-for an A40 — `paged`, the Triton decode kernel. Where its preconditions do not
-hold the choice falls back to `sdpa`, which runs anywhere and measures
-1,745 tok/s on row 1.
+for an A40 — `paged`, the Triton decode kernel — with the decode forward
+replayed from a CUDA graph. Where either precondition does not hold the engine
+falls back rather than failing.
 
-The second row is the one that moved most this cycle: reading the KV pool in
-place instead of gathering it makes the decode step **flat in context length**
-(13.3 ms at 188 tokens, 13.1 ms at 1,028), which is worth 1.11× at the shape
-above and 2.59× at ISL 1024 / OSL 1024. What remains against vLLM is a per-step
-constant: no CUDA graphs, no varlen packing, and a decode grid that leaves an
-84-SM GPU idle at B=1. All three are measured and queued, not guessed —
-[`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including two
+**This cycle was the launch overhead, and it was most of the gap.** A decode
+step issued ~700 kernels to do ~7 ms of GPU work, at a flat 18.7 µs of wall per
+launch whatever the batch width — so the GPU sat idle 41-52% of every step and
+32× the tokens bought 1.29× the GPU time. Replaying the forward from a captured
+graph took the decode step **13.4 → 6.6 ms (2.0×)** and throughput **1,930 →
+3,112 tok/s (1.6×)**, closing the gap to vLLM from 2.6× to 1.3× on the step. What
+remains is arithmetic rather than overhead: liteinfer's kernels are 1.9× off the
+memory roofline where vLLM's whole step is 1.5× off, and that is fusion —
+[`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including three
 optimisations that were built, measured and reverted.
 Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:
 [`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).

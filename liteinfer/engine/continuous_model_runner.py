@@ -19,6 +19,7 @@ from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import builders_for
+from liteinfer.engine.cuda_graphs import DecodeGraphs, graphs_are_enabled
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models.attention import reads_paged_kv
@@ -47,12 +48,14 @@ class ContinuousModelRunner:
         self.hf_config = None
         self.tokenizer: Tokenizer | None = None
         self._cache: ContinuousKVCache | None = None
+        self._graphs: DecodeGraphs | None = None
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
         self._cache = ContinuousKVCache(self._create_block_pool())
+        self._graphs = self._create_decode_graphs()
 
     @property
     def attn_implementation(self) -> str:
@@ -66,6 +69,15 @@ class ContinuousModelRunner:
         resolved = getattr(self.hf_config, "_attn_implementation", None)
         assert isinstance(resolved, str), "load_model() records the resolved kernel"
         return resolved
+
+    @property
+    def captured_decode_widths(self) -> list[int]:
+        """Batch widths whose decode forward is replayed from a graph, first seen first.
+
+        Empty when capture is off or nothing has been captured yet, which is the
+        same answer from the caller's side: this step ran kernel by kernel.
+        """
+        return [] if self._graphs is None else self._graphs.captured_widths
 
     def deregister_sequence(self, seq: Sequence) -> None:
         """Free paged KV blocks allocated for a finished sequence."""
@@ -118,6 +130,12 @@ class ContinuousModelRunner:
         # must contain no host-side work.
         self._cache.advance(request_ids)
         slots = self._cache.slot_table_for(request_ids)
+
+        if self._graphs is not None and self._graphs.has_capacity_for(len(seqs)):
+            return self._graphs.run(
+                input_ids, position_ids, slots, self._cache.context_lens_for(request_ids)
+            )
+
         payload, attention_mask = self._build_decode_kv(request_ids, slots)
         out = self.model(
             input_ids=input_ids,
@@ -177,6 +195,26 @@ class ContinuousModelRunner:
         input_ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
         position_ids = torch.tensor(positions, dtype=torch.long, device=self.device).unsqueeze(1)
         return input_ids, position_ids
+
+    def _create_decode_graphs(self) -> DecodeGraphs | None:
+        """Build the capture cache, or `None` where decode cannot be captured.
+
+        Built here rather than lazily in `decode` because the preconditions are
+        known once the model is loaded, and because a `None` is the whole signal
+        the decode path needs — no flag to re-read per step.
+        """
+        assert self.model is not None and self._cache is not None
+        if not graphs_are_enabled(
+            self.config.enable_cuda_graphs, self.device, self.attn_implementation
+        ):
+            return None
+        return DecodeGraphs(
+            self.model,
+            self._cache,
+            device=self.device,
+            max_num_seqs=self.config.max_num_seqs,
+            max_model_len=self.config.max_model_len,
+        )
 
     # ------------------------------------------------------------------
     # Block pool

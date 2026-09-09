@@ -22,6 +22,10 @@ class BenchmarkConfig:
     attn_implementation: str = "eager"
     """Pinned per row rather than inherited from `EngineConfig`: a stored result
     has to keep meaning the same thing after the engine default moves on."""
+    enable_cuda_graphs: bool = False
+    """Off by default for the same reason: every row stored before §3.2 was
+    measured launching the decode forward kernel by kernel, and must go on
+    meaning that."""
     baseline: str | None = None
     historical: bool = False
     """Measured before the code was removed. Kept so the report still shows the
@@ -107,6 +111,16 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         attn_implementation="paged",
         baseline="liteinfer-sdpa",
         description="Continuous batching, decode attention reads the KV pool in-kernel",
+    ),
+    # --- liteinfer: captured decode forward (§3.2) ---
+    BenchmarkConfig(
+        name="liteinfer-graphs",
+        engine="liteinfer",
+        max_num_seqs=32,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        baseline="liteinfer-paged-attn",
+        description="Paged decode replayed from a CUDA graph instead of launched per kernel",
     ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(
