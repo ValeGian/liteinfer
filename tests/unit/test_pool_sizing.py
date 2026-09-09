@@ -45,7 +45,15 @@ def test_a_config_memory_cannot_serve_is_warned_about(caplog) -> None:
     runner = _runner(max_num_seqs=32, max_model_len=10**7)
     with caplog.at_level(logging.WARNING):
         _blocks(runner)
-    assert "may exhaust it" in caplog.text
+    assert "not max_num_seqs=32" in caplog.text
+
+
+def test_the_warning_names_the_concurrency_the_pool_can_actually_serve(caplog) -> None:
+    """`max_num_seqs` is otherwise a promise the pool cannot keep, and silently."""
+    runner = _runner(max_num_seqs=32, max_model_len=10**7)
+    with caplog.at_level(logging.WARNING):
+        _blocks(runner)
+    assert "can serve 0 concurrent sequences" in caplog.text
 
 
 def test_a_config_that_fits_warns_about_nothing(caplog) -> None:
@@ -67,16 +75,16 @@ def test_the_chosen_size_is_reported(caplog) -> None:
     assert "KV pool: 16 blocks" in caplog.text
 
 
-def test_the_memory_fraction_is_tunable() -> None:
+def test_the_memory_budget_is_tunable() -> None:
     # Only binds when memory is the constraint, so ask for more than fits.
     generous = _blocks(_runner(max_num_seqs=32, max_model_len=10**7))
-    frugal = _blocks(_runner(max_num_seqs=32, max_model_len=10**7, kv_cache_memory_fraction=0.1))
+    frugal = _blocks(_runner(max_num_seqs=32, max_model_len=10**7, gpu_memory_utilization=0.1))
     assert frugal < generous
 
 
-def test_an_impossible_memory_fraction_is_rejected() -> None:
-    with pytest.raises(ValueError, match="kv_cache_memory_fraction"):
-        EngineConfig(model="unused", kv_cache_memory_fraction=1.5)
+def test_an_impossible_memory_budget_is_rejected() -> None:
+    with pytest.raises(ValueError, match="gpu_memory_utilization"):
+        EngineConfig(model="unused", gpu_memory_utilization=1.5)
 
 
 def test_pool_reports_its_own_footprint() -> None:
@@ -89,3 +97,38 @@ def test_pool_reports_its_own_footprint() -> None:
     # 5 blocks (one is the null block) x 16 slots x 2 layers x 2 heads x 8 dims
     # x 4 bytes, counted for keys and values.
     assert pool.nbytes == 5 * BLOCK_SIZE * LAYERS * KV_HEADS * HEAD_DIM * 4 * 2
+
+
+@pytest.mark.gpu
+def test_the_size_ignores_memory_that_was_freed_but_is_still_cached() -> None:
+    """The case a free-memory budget got wrong, and the reason for a total-memory one.
+
+    torch's caching allocator keeps freed blocks, so CUDA's *free* figure stays
+    low while `memory_allocated` correctly drops back. Sized from free memory the
+    pool lost 19% of its blocks to an 8 GiB allocation that no longer existed,
+    which made a benchmark's pool a property of the machine's history.
+    """
+    runner = _runner(device="cuda", max_num_seqs=32, max_model_len=10**7)
+    before = _blocks(runner)
+
+    ballast = torch.empty(2 << 30, dtype=torch.uint8, device="cuda")
+    del ballast  # freed, but the allocator holds the block
+
+    assert _blocks(runner) == before
+
+
+def test_a_measured_activation_budget_leaves_the_pool_less() -> None:
+    """The point of profiling: what the forward needs is not the pool's to take."""
+    runner = _runner(max_num_seqs=32, max_model_len=10**7)
+    unmeasured = _blocks(runner)
+
+    runner._forward_bytes = 1 << 28  # 256 MiB the forward will want
+
+    assert _blocks(runner) < unmeasured
+
+
+def test_a_cpu_engine_profiles_nothing() -> None:
+    """CPU runs exist to test the sizing arithmetic, and have no device to measure."""
+    runner = _runner(max_num_seqs=4, max_model_len=64)
+
+    assert runner._profile_forward_bytes() == 0

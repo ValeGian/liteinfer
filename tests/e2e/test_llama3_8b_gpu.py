@@ -77,7 +77,24 @@ def llm(model_dir):
     token id. That the kernels agree is pinned separately, in fp32, in the 1B
     file.
     """
-    engine = LLM(str(model_dir), device=_DEVICE, dtype=_DTYPE, attn_implementation="eager")
+    # This test holds a second copy of the same 8B model — `hf_model`, the
+    # reference — in the same process, so the engine has to be told how little KV
+    # it needs rather than sizing for its defaults. At `max_num_seqs=32` and
+    # `max_model_len=4096` the pool is 16 GiB, which with two sets of 15 GiB
+    # weights does not fit an A40. It used to fit by luck: the pool took 85% of
+    # *free* memory, and loading leaves enough allocator residue that free read
+    # ~13 GiB, so the pool came out at 11.24 GiB instead of the 16 GiB the config
+    # asked for. §2.6 made the size a function of the config, which is what turned
+    # that luck into an out-of-memory error. One short sequence is all this test
+    # decodes, so it asks for one.
+    engine = LLM(
+        str(model_dir),
+        device=_DEVICE,
+        dtype=_DTYPE,
+        attn_implementation="eager",
+        max_num_seqs=1,
+        max_model_len=512,
+    )
     yield engine
     engine.close()
     del engine

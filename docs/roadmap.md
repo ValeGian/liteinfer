@@ -145,6 +145,39 @@ listed.
   §2.3's kernel is the other half: it already takes per-sequence key lengths and
   a slot table, so mixing prefill and decode in one pass is a question of giving
   it more than one query per sequence.
+- **It costs some of §3.2, and §3.8 is the repair.** A mixed pass is not a uniform
+  decode batch, so the captured decode graph does not cover it — roughly one step
+  in eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
+  batches, which is what §3.8 exists to be.
+
+### 1.5 The loop's per-sequence work is the wide-batch tax
+- **Status.** `planned` — **the deficit §1.4 exposed, and worth ~1.23x at 128
+  concurrent sequences.**
+- **PRs.** _none yet_
+- **Why.** §3.2 made the forward nearly flat in batch width, which is what §1.4
+  spends. Everything the loop does *around* the forward is not flat — it is per
+  sequence — so widening the batch grows its share:
+
+  | stage | B=32 | B=128 |
+  |---|---:|---:|
+  | forward | 88.7% | **81.5%** |
+  | sample | 6.0% | **11.3%** |
+  | deliver | 2.0% | 4.2% |
+  | schedule + unattributed | 3.4% | 3.0% |
+
+  At 128 sequences that is **18.5% of the loop** against 11.3% at 32. It is also
+  the reason §1.4's 2.23x is smaller than vLLM's 2.48x over the same widening, so
+  the gap goes from 0.70x to 0.63x rather than closing. Removing it entirely would
+  put throughput near 8,550 tok/s and the gap at ~0.77x.
+- **Scope.** Sampling is the largest and doubles its share, which is where to
+  start — greedy rows are already taken in one kernel (§26), so what is left is
+  the per-row stochastic loop and whatever still crosses the device boundary once
+  per sequence. `deliver` builds one `StreamEvent` per sequence and detokenises
+  into it; that is per-sequence by nature, but not necessarily per-sequence
+  *Python*. Measure each against the stage timings above rather than in isolation
+  — `TimeBreakdown` already reports them, and this is the item it was built for.
+- **Parity test.** Identical greedy output and identical stream events at 128
+  concurrent sequences.
 
 ---
 
@@ -170,26 +203,6 @@ listed.
   `cache_quant: str | None` flag.
 - **Risk.** Quality regression on long contexts; needs a tolerance
   parity test against fp16/bf16.
-
-### 2.6 KV pool sizing from a measured activation budget
-- **Status.** `planned`
-- **PRs.** follow-up to [#20](https://github.com/ValeGian/liteinfer/pull/20)
-- **Why.** #20 sized the pool as `min(affordable, reachable)`, which stops it
-  hoarding VRAM it can never address. `affordable` is still a guess: a fraction
-  of whatever happens to be free when `load_model` runs. Two consequences. It is
-  not reproducible — the same config on the same GPU sizes differently depending
-  on what else was resident a second earlier, which makes a benchmark's pool a
-  property of the machine's history. And the fraction is a stand-in for the real
-  question, which is how much memory the forward pass needs at full width.
-- **Scope.** Two steps, in order. First move the fraction to *total* VRAM, so
-  the size is a function of the config and the device only. Then replace it:
-  run one worst-case forward pass at `max_num_seqs` × `max_model_len` during
-  load, record peak allocation, and give the pool what is left — vLLM's
-  approach. The WARNING #20 added stays useful either way; it names which of
-  the two constraints bound the pool.
-- **Parity test.** Pool size is identical across two loads separated by an
-  unrelated allocation; profiled size leaves a forward pass at full width
-  headroom to complete.
 
 ### 2.7 Split the key loop when the batch is narrow
 - **Status.** `planned` — built, measured at **0.94x** in the engine, and reverted.
@@ -272,14 +285,51 @@ listed.
 ## 3. Performance optimizations
 
 ### 3.1 Fuse the forward's elementwise work
-- **Status.** `planned` — **the next general win, and §3.2 is what makes it
-  sizeable.** With a launch nearly free, what is left of the step is arithmetic:
-  ITL is 1.86x the 3.55 ms memory roofline against vLLM's 1.47x, and ~725
-  launches is about 45 kernels per layer where a Llama layer needs ten.
-- **Blocked on.** the pool write, not the gather. Measured at **0.06x** before
-  §2.3; §2.3 removed half the reason. Re-measure inside a captured forward: the
-  17.9% of GPU time that elementwise work costs is now the part worth having,
-  where before it was dwarfed by the launches around it.
+- **Status.** `planned` — **ceiling measured at ~1.12x and not built.** It was
+  next in line after §3.2 and the profile disagreed; §1.4 is worth 2.19x for less
+  work. Re-open it when the batch width has been spent.
+- **Blocked on.** nothing. What stops it is its own size.
+- **What the profile says, inside a captured forward.** `mm` is **79.8%** of the
+  GPU time at B=1 and 78.5% at B=32, over exactly 113 launches — 7 per layer plus
+  the head, which is already the minimum a Llama layer needs. Everything fusible
+  is the other fifth:
+
+  | op | ms / step (B=1) | share | calls | per layer |
+  |---|---:|---:|---:|---:|
+  | `mm` | 4.730 | 79.8% | 113 | 7.06 |
+  | `mul` | 0.316 | 5.3% | 149 | 9.31 |
+  | `copy_` | 0.158 | 2.7% | 75 | 4.69 |
+  | `add` | 0.150 | 2.5% | 98 | 6.12 |
+  | `_index_put_impl_` | 0.126 | 2.1% | 32 | 2.00 |
+  | `cat` | 0.109 | 1.8% | 33 | 2.06 |
+  | `mean` | 0.107 | 1.8% | 33 | 2.06 |
+  | `neg` | 0.072 | 1.2% | 32 | 2.00 |
+  | `rsqrt` | 0.049 | 0.8% | 33 | 2.06 |
+  | `pow` | 0.047 | 0.8% | 33 | 2.06 |
+  | `silu` | 0.038 | 0.6% | 16 | 1.00 |
+
+  Non-`mm` work totals **1.20 ms of 5.93**. Fusing RMSNorm (`pow`+`mean`+`rsqrt`+
+  two `mul` into one), RoPE (`neg`+`cat`+two `mul`+`add` into one) and SiLU·mul,
+  and merging the QKV projection, adds up to about **0.72 ms** — a 6.6 ms step
+  becoming 5.9, so **1.12x**, for three custom kernels with parity tests and a
+  change to how weights are loaded. Making *every* non-`mm` kernel free would be
+  1.22x, which is the hard ceiling.
+- **The one GEMM merge that pays, and the one that does not.** Measured on the
+  projections alone through a captured graph: merging q/k/v into one GEMM is
+  **1.16x at B=1 and 1.38x at B=32** (411 → 477 GB/s — three skinny GEMMs each
+  pay their own tail), while merging gate/up is **0.97-1.02x**, because at
+  2048x8192 each one already saturates. So the QKV merge is worth having and the
+  MLP merge is not, which is not what "fuse the projections" would have assumed.
+- **Why the elementwise work costs what it does.** 475 elementwise launches per
+  step at ~1.8 us each, and at B=1 each one touches 2,048 elements — far too
+  little to be bandwidth-bound. That is a per-kernel floor, so fusion helps by
+  removing kernel *instances*, not by moving fewer bytes. It is also why the
+  saving barely changes between B=1 and B=32.
+- **`torch.compile` is still the wrong tool for it.** Measured at **0.06x** before
+  §2.3 because inductor functionalises the in-place pool write into a copy of the
+  whole pool; excluding the cache mutation recovered 1.02x and then recompiled
+  once per `layer_idx`. If this is built, build it as three Triton kernels against
+  a dense reference — the shape `models/paged_decode.py` already established.
 - **PRs.** _none yet_
 - **What it measured.** `torch.compile` on the decode forward is 206.66 ms
   against eager's 12.87 ms at a fixed shape — and it is *not* recompiling.
@@ -359,6 +409,51 @@ listed.
   §3.5 turned out to be reachable without it, on a different backend.
 - **Parity test.** Greedy output unchanged on a variable-length batch, which is
   the case padding exists to serve.
+
+### 3.8 Capture mixed batches by splitting the graph at attention
+- **Status.** `planned` — **low value today and not for a general reason**, which
+  is the part worth keeping. Re-price it when §1.3 lands.
+- **PRs.** _none yet_
+- **Why the question comes up.** §3.2 captures the decode forward whole, which
+  works because a decode batch is uniform: one query per sequence, and the only
+  thing that varies is read from a tensor. That is precisely vLLM's
+  `FULL_DECODE_ONLY` mode. vLLM's default is `FULL_AND_PIECEWISE`, where anything
+  that is *not* a uniform decode batch — prefill, and mixed prefill/decode — is
+  covered by **piecewise** capture instead: the inductor graph is split at the
+  attention ops (`splitting_ops = self._attention_ops`), attention runs outside
+  the graph, and every other piece is captured. Splitting there is what makes the
+  captured pieces shape-agnostic, because attention is the only part whose shape
+  follows per-sequence lengths.
+- **Why it buys little here, and it is the engine's fault not the technique's.** A
+  liteinfer prefill is the whole prompt in one pass, so it is GPU-bound as soon as
+  the prompt is non-trivial:
+
+  | prompt length | prefill wall | GPU busy | GPU idle |
+  |---:|---:|---:|---:|
+  | 128 | 12.92 ms | 8.08 ms | **4.84 ms (37%)** |
+  | 512 | 20.11 ms | 18.83 ms | 1.28 ms (6%) |
+  | 2048 | 80.60 ms | 79.83 ms | 0.77 ms (1%) |
+
+  There is nothing to recover past 512 tokens. vLLM's prefills are chunked to
+  `max_num_batched_tokens`, so most of *its* forwards are small mixed batches
+  where launch overhead dominates and piecewise pays. Capturing prefill on its own
+  here would buy about 1.6x on TTFT at ISL 128 and nothing beyond, for one capture
+  per (prompt-length bucket x batch width) — and unlike decode's slot-table
+  padding, padding a prompt wastes real compute.
+- **§1.3 is what changes the arithmetic, and it partly undoes §3.2.** Chunked
+  prefill merges prefill and decode into one pass, and a mixed pass is not a
+  uniform decode batch, so `DecodeGraphs` would not cover it. At OSL 256 with 32
+  slots that is roughly one step in eight, so the loss is modest — but §1.3 should
+  not land without a plan for capturing mixed batches, and this is that plan.
+- **It is also half of §3.1.** vLLM's piecewise mode requires inductor
+  compilation, so its pieces are fused *and* captured; the two wins arrive
+  together. liteinfer has no compilation step, which is why §3.2 could only take
+  the capture half, and why §3.1's 1.12x has to be earned separately by hand.
+- **Scope.** A compilation step this engine does not have yet, so the honest
+  prerequisite is either `torch.compile` on the pieces between attention calls —
+  which runs into the same in-place pool write that measured 0.06x in §3.1 — or
+  hand-partitioned capture of the non-attention spans. Neither is small; both are
+  worth less than §1.4 until §1.3 exists.
 
 ---
 
@@ -451,3 +546,31 @@ listed.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
+
+### 8.4 Make the report notice when a delta compares two ages
+- **Status.** `planned` — **the harness let a wrong number through, twice.**
+- **PRs.** _none yet_
+- **Why.** `vs base` ratios two stored rows and has no notion of when either was
+  measured. That is fine for a change behind a config knob, where both rows can
+  be re-run together — and silently wrong for an **ungated** change, which lands
+  in every config at once while the baselines it will be compared against were
+  measured before it. §3.7 did exactly that: the report printed **1.19x** for
+  `liteinfer-graphs` over `liteinfer-paged-attn` at ISL 2048 / OSL 128, where
+  graphs alone are worth 1.10x and the other 8% was §3.7 sitting in the newer row
+  only. It has happened before, for the same reason with a different cause:
+  `bench report` once printed 3.09x where the same-session answer was 2.59x.
+- **The data is already there and nothing reads it.** Every result carries a
+  `timestamp`; `report.py` uses it once, to print "last run". Two cheap guards:
+  flag any `vs base` whose two rows are more than some interval apart, and flag a
+  group whose members disagree on `dataset.sha256` — the second condition already
+  exists as a `WARNING` on the group, but it does not suppress or mark the
+  affected ratios.
+- **The dataset-identity half is live.** `benchmarks/datasets/` is gitignored, so a
+  regenerated file gets a new sha and old results keep the old one. The latency
+  rows at ISL 128 / OSL 256 were split across two shas for weeks — every current
+  liteinfer row on one, all three vLLM rows on the other — which made the headline
+  `vs vLLM` decode-step comparison cross-dataset. Re-running the vLLM rows closed
+  it; noticing it took reading the JSON by hand.
+- **Scope.** `report.py` only — a staleness window and a sha check, surfaced in
+  the `vs base` / `vs vLLM` cells rather than as a note above the table. A test
+  that builds two results with skewed timestamps and asserts the marking.

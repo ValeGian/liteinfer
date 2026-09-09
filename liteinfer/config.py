@@ -45,7 +45,11 @@ class EngineConfig:
 
     # KV block pool.
     block_size: int = 16
-    kv_cache_memory_fraction: float = 0.85  # share of free VRAM the pool may claim
+    # Share of the device's *total* memory the engine may occupy — weights,
+    # activations and KV pool together. Total rather than free so the pool is a
+    # function of the config and the device, not of what happened to be resident
+    # when `load_model` ran. vLLM's `gpu_memory_utilization` means the same thing.
+    gpu_memory_utilization: float = 0.85
     num_gpu_blocks: int | None = None  # None → sized from the fraction and the workload
 
     def __post_init__(self) -> None:
@@ -57,8 +61,8 @@ class EngineConfig:
             raise ValueError("block_size must be >= 1")
         if self.max_waiting_seqs < 1:
             raise ValueError("max_waiting_seqs must be >= 1")
-        if not 0 < self.kv_cache_memory_fraction <= 1:
-            raise ValueError("kv_cache_memory_fraction must be in (0, 1]")
+        if not 0 < self.gpu_memory_utilization <= 1:
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
         if self.attn_implementation is not None:
             resolve(self.attn_implementation)  # raises on an unknown kernel name
 

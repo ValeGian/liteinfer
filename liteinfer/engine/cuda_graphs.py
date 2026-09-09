@@ -44,6 +44,7 @@ import logging
 import torch
 
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
+from liteinfer.models import LAST_POSITION
 from liteinfer.models.attention import reads_paged_kv
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,16 +56,19 @@ _WARMUP_FORWARDS = 3
 
 # Distinct batch widths that may be captured before the rest run eager.
 #
-# A decode batch is at most `max_num_seqs` sequences, so at the default 32 this
-# never binds and every width a run visits gets its own graph — which is why
-# there are no padded rows here. vLLM pads each batch up to a ladder of sizes
-# instead, because its batch width is a *token* count that can be any value in
-# the thousands; capturing one graph per value is only possible because
-# liteinfer's decode batch is bounded by a small config. An engine configured
-# far wider than the default would want vLLM's ladder rather than this cap, and
-# until it has one, this is the bound that keeps the graphs from growing without
-# limit. See the §3.2 milestone.
-_MAX_CAPTURES = 64
+# A decode batch is at most `max_num_seqs` sequences, so every width a run visits
+# gets its own graph and there are no padded rows here. vLLM pads each batch up to
+# a ladder of sizes instead, because its batch width is a *token* count that can be
+# any value in the thousands; one graph per value is only affordable because
+# liteinfer's decode batch is bounded by a config.
+#
+# What bounds it is capture *time*, not memory: graphs after the first share the
+# first one's memory pool, so 128 of them measured +0.54 GiB against 32 of them at
+# +0.63 GiB — flat. Each costs about 60 ms to record (three warm-up forwards and
+# the capture), paid once, lazily, and only for widths a run actually visits — which
+# in a full batch is one or two, plus a short tail as it drains. This is the bound
+# on a workload that changes width constantly enough to keep paying that.
+_MAX_CAPTURES = 128
 
 
 def unsupported_reason(device: torch.device, attn_implementation: str) -> str | None:
@@ -211,6 +215,7 @@ class DecodeGraphs:
             position_ids=self._position_ids[:batch_size],
             past_key_values=payload,
             attention_mask=None,
+            logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]
 

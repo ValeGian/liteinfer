@@ -138,13 +138,15 @@ takes that trade deliberately, and this is where the bill arrives.
 | `liteinfer-eager-b4` | 4 | 281.6 | 1.1 | 181.8 | **3.84×** | 0.39× |
 | `liteinfer-native-eager-b4` | 4 | 277.6 | 1.1 | 184.4 | 3.82× | 0.38× |
 | `liteinfer-paged-b4` | 4 | 252.9 | 1.0 | 202.4 | 3.79× | 0.35× |
-| `liteinfer-continuous` | 32 | 1,638.8 | 6.4 | 31.2 | 6.48×† | 0.37× |
-| `liteinfer-sdpa` | 32 | 1,744.8 | 6.8 | 29.3 | 1.06× | 0.39× |
-| `liteinfer-paged-attn` | 32 | 1,930.0 | 7.5 | 26.5 | **1.11×** | 0.43× |
-| `liteinfer-graphs` | 32 | **3,111.7** | 12.2 | 16.5 | **1.61×** | 0.70× |
+| `liteinfer-continuous` | 32 | 1,626.8 | 6.4 | 31.5 | 6.43×† | 0.36× |
+| `liteinfer-sdpa` | 32 | 1,748.1 | 6.8 | 29.3 | 1.07× | 0.39× |
+| `liteinfer-paged-attn` | 32 | 1,931.5 | 7.5 | 26.5 | **1.10×** | 0.43× |
+| `liteinfer-graphs` | 32 | **3,152.4** | 12.3 | 16.2 | **1.63×** | 0.71× |
+| `liteinfer-graphs-b128` | 128 | **6,945.3** | 27.1 | 7.4 | — | 0.63× |
 | `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
 | `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
 | `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
+| `vllm-b128` | 128 | 11,097.5 | 43.3 | 4.6 | — | — |
 
 † against a removed config, so it measures two engines two milestones apart. The
 two rows above it are same-session and measure only their own code.
@@ -153,6 +155,17 @@ two rows above it are same-session and measure only their own code.
 
 Run sequentially on an idle GPU. See *Certification* below for why this mode must
 not be parallelised.
+
+**`bench report` prints a prompt-mismatch warning on this group, and it is
+expected.** `benchmarks/datasets/` is gitignored, so a regenerated dataset gets a
+new sha256 while older results keep the old one. The seven `historical` rows here
+were measured on a dataset that no longer exists and cannot be re-run — `bench
+run` refuses them by design — so the group will always straddle two shas. What
+matters is that every *runnable* row, liteinfer and vLLM alike, is on the current
+one; that was not true until the vLLM rows were re-measured, which had quietly
+made the headline decode-step comparison cross-dataset. §8.4 is about making the
+report say which ratios a mismatch actually affects instead of flagging the whole
+group.
 
 | config | TTFT p50 | TTFT p95 | ITL p50 | ITL p95 | E2E p50 | vs base |
 |---|---:|---:|---:|---:|---:|---:|
@@ -163,13 +176,13 @@ not be parallelised.
 | `liteinfer-eager-b4` | 15.8 ms | 17.7 ms | 14.0 ms | 14.1 ms | 3,596.6 ms | 0.98× |
 | `liteinfer-native-eager-b4` | 14.9 ms | 16.7 ms | 13.9 ms | 13.9 ms | 3,561.1 ms | 0.99× |
 | `liteinfer-paged-b4` | 19.0 ms | 20.9 ms | 15.0 ms | 15.0 ms | 3,832.2 ms | 1.02× |
-| `liteinfer-continuous` | 19.0 ms | 21.0 ms | 14.9 ms | 14.9 ms | 3,807.6 ms | 1.01× |
-| `liteinfer-sdpa` | **14.0 ms** | 15.9 ms | 13.9 ms | 14.0 ms | 3,546.6 ms | **1.07×** |
-| `liteinfer-paged-attn` | 14.5 ms | 16.2 ms | 13.4 ms | 13.5 ms | 3,431.3 ms | 1.03× |
-| `liteinfer-graphs` | 14.9 ms | 16.6 ms | **6.6 ms** | **6.6 ms** | **1,698.3 ms** | **2.03×** |
-| `vllm` | 22.7 ms | 27.4 ms | 5.2 ms | 5.2 ms | 1,354.8 ms | — |
-| `vllm-b4` | 22.6 ms | 27.0 ms | 5.2 ms | 5.2 ms | 1,353.9 ms | — |
-| `vllm-continuous` | 23.2 ms | 32.2 ms | 5.2 ms | 5.2 ms | 1,356.2 ms | — |
+| `liteinfer-continuous` | 16.1 ms | 17.1 ms | 15.4 ms | 15.5 ms | 3,947.1 ms | 0.97× |
+| `liteinfer-sdpa` | 13.9 ms | 15.5 ms | 13.9 ms | 14.0 ms | 3,561.0 ms | **1.11×** |
+| `liteinfer-paged-attn` | **13.9 ms** | 15.3 ms | 13.3 ms | 13.4 ms | 3,407.6 ms | 1.05× |
+| `liteinfer-graphs` | 14.0 ms | 15.8 ms | **6.6 ms** | **6.6 ms** | **1,698.5 ms** | **2.01×** |
+| `vllm` | 27.5 ms | 32.1 ms | 5.2 ms | 5.5 ms | 1,354.9 ms | — |
+| `vllm-b4` | 28.7 ms | 31.2 ms | 5.2 ms | 5.2 ms | 1,352.8 ms | — |
+| `vllm-continuous` | 28.6 ms | 31.4 ms | 5.2 ms | 5.2 ms | 1,352.7 ms | — |
 
 ---
 
@@ -188,7 +201,7 @@ is no longer what the numbers show.
 against vLLM's 3.84× on the same transition. Continuous batching converts
 B=4 → B=32 at 5.01× against vLLM's 6.17×. Whatever the two-pass prefill+decode
 step (§1.3) costs, it is a modest residual rather than a dominant term:
-continuous ITL (14.9 ms) sits level with static paged (15.0 ms).
+continuous ITL (15.4 ms) sits level with static paged (15.0 ms).
 
 **Paging cost ~8-10%, and paying it back is what §2.3 did.** Paged reached 0.92×
 of native-eager on throughput at B=1, 0.90× at B=4, and 0.90× on ITL, because the
@@ -211,8 +224,11 @@ model decode is kernel-launch bound, so re-feeding the whole sequence costs litt
 more than feeding one token while the cache adds per-step `torch.cat` growth.
 Expect this to widen sharply with sequence length; measuring that is §8.3.
 
-**TTFT: liteinfer is ahead, but read it narrowly.** 15.7 ms against vLLM's
-22.7 ms. At ISL=128 both engines' TTFT is dominated by fixed per-call API overhead
+**TTFT: liteinfer is ahead, but read it narrowly.** 14.0 ms against vLLM's
+28.6 ms — and vLLM's figure moved 22.7 → 28.6 ms purely by being re-measured on
+the current prompt set, which is how the cross-dataset split described above was
+found. ITL did not move at all (5.2 ms either way), because these runs pin the
+output length, so only TTFT sees the prompts change. At ISL=128 both engines' TTFT is dominated by fixed per-call API overhead
 rather than prefill compute — measured on a 2-token prompt, vLLM spends 11.1 ms
 before any real work and prefilling 128 tokens costs it only 3.4 ms more. This
 measures offline round-trip latency, where vLLM pays IPC to a separate engine
@@ -288,7 +304,7 @@ prompts or wider batches. Removing it is §3.3, below.
 
 **This is the shape §2.3 helped most.** A long prompt is a long KV history from
 the first decode step, which is exactly what the gather was charging for: with
-paged decode the 1024 / 1024 row goes 688.9 → 1,783.6 tok/s and the gap to vLLM
+paged decode the 1024 / 1024 row goes 696.3 → 1,817.4 tok/s and the gap to vLLM
 at that shape closes from 4.7× to 1.8×. See *Paged decode stops the step growing
 with context*.
 
@@ -342,11 +358,11 @@ together, which is what these stored rows are:
 
 | shape | `continuous` | `sdpa` | `paged` | paged vs sdpa |
 |---|---:|---:|---:|---:|
-| 128 / 256 | 1,638.8 | 1,744.8 | 1,930.0 | 1.11× |
-| 128 / 1024 | 1,181.1 | 1,205.9 | 1,921.9 | 1.59× |
-| 1024 / 256 | 702.9 | 781.0 | 1,542.0 | 1.97× |
-| 1024 / 1024 | 664.9 | 688.9 | 1,783.6 | **2.59×** |
-| 2048 / 128 | OOM | 398.3 | 820.1 | 2.06× |
+| 128 / 256 | 1,626.8 | 1,748.1 | 1,931.5 | 1.10× |
+| 128 / 1024 | 1,197.3 | 1,232.2 | 1,930.6 | 1.57× |
+| 1024 / 256 | 713.4 | 793.1 | 1,569.6 | 1.98× |
+| 1024 / 1024 | 670.1 | 696.3 | 1,817.4 | **2.61×** |
+| 2048 / 128 | OOM | 418.8 | 892.6 | 2.13× |
 
 Read the first row against the fourth: at the headline shape the change is 1.11×,
 only just past the 1.1× floor this repo treats as an effect at all, and at ISL
@@ -391,8 +407,8 @@ per step), and it never touches the padding, because it takes each sequence's
 context length rather than a mask over the batch's longest.
 
 **At B=1 it is worth nothing, and that is the same story.** Latency mode runs one
-request at a time: ITL p50 13.9 → 13.4 ms, E2E 3,546.6 → 3,431.3 ms, TTFT 14.0 →
-14.5 ms. All three are inside the ±4% floor, so the honest reading is *no effect*.
+request at a time: ITL p50 13.9 → 13.3 ms, E2E 3,561.0 → 3,407.6 ms, TTFT 13.9 →
+13.9 ms. All three are inside the ±4% floor, so the honest reading is *no effect*.
 Two reasons, and they compound: a single request has ~190 tokens of history to
 gather, which is the cheapest case in the table above, and the kernel's grid is one
 program per (sequence, KV head) — 8 programs on an 84-SM GPU. The B=1 row of the
@@ -614,6 +630,22 @@ the per-layer numbers predict.
 | e2e p50 | 3,431.6 → 3,629.8 ms | 1,921.6 → 1,986.7 ms |
 | TTFT p50 | 14.5 → 14.5 ms | 164.1 → 162.6 ms |
 
+‡ This shape is the least trustworthy row in the file, and it is worth saying
+why. Its ITL spreads about 5% run to run — the unsplit config read 16.1, 16.2,
+16.3, 16.9, 17.0 and 17.1 ms across six runs on two GPUs, and the captured one
+7.9 to 8.4 — which is wider than the ±4% floor claimed above. An earlier reading
+of **13.8 ms** was published here and is now discredited: neither the current
+engine nor `master` reproduces it, and a two-pass A/B on `master` put the same
+configuration at **19.8 and 19.9 ms**. So the honest range for this delta is
+roughly 2.0-2.4×, and the number in the table is the stored pair rather than a
+best case.
+
+That A/B also said something about §3.7 that the throughput rows understated:
+`master`'s TTFT at this shape is **240 ms against the branch's ~151**, far more
+than the 1.10× §3.7 measured at ISL 2048. Removing a 0.92 GiB logits allocation
+evidently saves allocator time as well as arithmetic, so §3.7 is worth more at
+long prompts than its throughput delta suggested.
+
 ISL 3584 is the most favourable shape `max_model_len` 4096 allows — the context
 where the kernel is 7x faster — and it still loses 3%. `decode()` timed directly
 agrees, 12.83/13.51 ms against 13.99/14.24 ms, and keeps that ordering when the
@@ -749,20 +781,20 @@ stored rows are the same engine with capture pinned off:
 
 | throughput | paged-attn | graphs | |
 |---|---:|---:|---:|
-| 128 / 256 | 1,930.0 | **3,111.7** | **1.61×** |
-| 128 / 1024 | 1,921.9 | **2,959.1** | **1.54×** |
-| 1024 / 1024 | 1,783.6 | **2,356.2** | 1.32× |
-| 1024 / 256 | 1,542.0 | **1,990.8** | 1.29× |
-| 2048 / 128 | 820.1 | **908.2** | 1.11× |
+| 128 / 256 | 1,931.5 | **3,152.4** | **1.63×** |
+| 128 / 1024 | 1,930.6 | **2,972.1** | **1.54×** |
+| 1024 / 1024 | 1,817.4 | **2,389.2** | 1.31× |
+| 1024 / 256 | 1,569.6 | **2,071.6** | 1.32× |
+| 2048 / 128 | 892.6 | **979.5** | 1.10× |
 
 | latency, B=1 | paged-attn | graphs | |
 |---|---:|---:|---:|
-| ITL p50, ISL 128 / OSL 256 | 13.4 ms | **6.6 ms** | **2.03×** |
-| e2e p50 | 3,431.3 ms | **1,698.3 ms** | 2.02× |
-| ITL p50, ISL 3584 / OSL 128 | 13.8 ms | **7.9 ms** | 1.75× |
-| TTFT p50 | 14.5 ms | 14.9 ms | — |
+| ITL p50, ISL 128 / OSL 256 | 13.3 ms | **6.6 ms** | **2.01×** |
+| e2e p50 | 3,407.6 ms | **1,698.5 ms** | 2.01× |
+| ITL p50, ISL 3584 / OSL 128 | 16.9 ms | **7.9 ms** | 2.14×‡ |
+| TTFT p50 | 13.9 ms | 14.0 ms | — |
 
-The gap to vLLM closes from **0.43× to 0.70×** on throughput and from **2.58× to
+The gap to vLLM closes from **0.43× to 0.71×** on throughput and from **2.56× to
 1.27×** on the decode step. It is the largest single change the project has
 measured, and it is general: every batch width, every context, both modes.
 
@@ -793,7 +825,7 @@ weights per step on an A40 at 696 GB/s is a 3.55 ms floor:
 | roofline | 3.55 ms | 1.00× |
 | vLLM ITL | 5.20 ms | 1.47× |
 | liteinfer ITL, after §3.2 | 6.60 ms | 1.86× |
-| liteinfer ITL, before | 13.40 ms | 3.77× |
+| liteinfer ITL, before | 13.30 ms | 3.75× |
 
 What is left is arithmetic, not overhead: ~725 launches is about 45 kernels per
 layer where a Llama layer needs ten, and the elementwise work among them costs
@@ -807,6 +839,268 @@ inside a capture that cost is gone, and its GPU win was up to 7.15× per layer.
 But `num_splits` is a *scalar* kernel argument, and a graph bakes those in while
 the split count this engine chooses varies with context — so §2.7 after §3.2 has
 to pin one count per capture rather than choose per step.
+
+### What §3.2 left behind, and it is not fusion (§3.1)
+
+§3.1 was next in line — with a launch nearly free, the step is arithmetic — so it
+was profiled before it was built. Inside a captured forward at B=1, 455 tokens of
+context:
+
+| op | ms / step | share | calls | per layer |
+|---|---:|---:|---:|---:|
+| `mm` | 4.730 | **79.8%** | 113 | 7.06 |
+| `mul` | 0.316 | 5.3% | 149 | 9.31 |
+| `copy_` | 0.158 | 2.7% | 75 | 4.69 |
+| `add` | 0.150 | 2.5% | 98 | 6.12 |
+| `_index_put_impl_` | 0.126 | 2.1% | 32 | 2.00 |
+| `cat` | 0.109 | 1.8% | 33 | 2.06 |
+| `mean` | 0.107 | 1.8% | 33 | 2.06 |
+| `neg` | 0.072 | 1.2% | 32 | 2.00 |
+| `rsqrt` | 0.049 | 0.8% | 33 | 2.06 |
+| `pow` | 0.047 | 0.8% | 33 | 2.06 |
+| `silu` | 0.038 | 0.6% | 16 | 1.00 |
+
+The matmuls are 79.8% of it over exactly **113 launches — 7 per layer plus the
+head**, which is already the fewest a Llama layer can be written with. Everything
+fusible is the other 1.20 ms of 5.93, and fusing RMSNorm, RoPE and SiLU·mul while
+merging the QKV projection comes to about 0.72 ms: a 6.6 ms step becoming 5.9,
+**1.12x**, for three custom kernels with parity tests and a change to weight
+loading. Making every non-`mm` kernel free would be 1.22x. That is the ceiling,
+and by this file's own standard — an effect under ~1.1x is not an effect — 1.12x
+is barely one.
+
+Two details worth keeping from the attempt that did not happen. **Only one of the
+two obvious GEMM merges pays:** measured on the projections alone through a
+captured graph, merging q/k/v is 1.16x at B=1 and **1.38x at B=32** (411 → 477
+GB/s, three skinny GEMMs each paying their own tail), while merging gate/up is
+0.97-1.02x because at 2048×8192 each already saturates. "Fuse the projections"
+would have done both. And **the elementwise cost is kernel count, not bytes**: 475
+launches at ~1.8 µs each, touching 2,048 elements apiece at B=1, which is far too
+little to be bandwidth-bound. That is a per-kernel floor, which is why the saving
+hardly moves between B=1 and B=32.
+
+### The flat step is throughput nobody is collecting (§1.4)
+
+The same measurement that priced §3.2 said something else in passing: the step is
+nearly flat in batch width. Flat means the weights are read once per step no
+matter how many sequences share it, so every extra sequence is nearly free.
+Measured on the captured step at 256 tokens of context:
+
+| `max_num_seqs` | step | decode tok/s | |
+|---:|---:|---:|---:|
+| 32 | 7.63 ms | 4,196 | — |
+| 64 | 8.93 ms | 7,165 | 1.71× |
+| 128 | 11.25 ms | 11,381 | **2.71×** |
+| 256 | 17.30 ms | 14,797 | 3.53× |
+
+Eight times the batch for 2.3× the step. Through the harness at ISL 128 / OSL 256,
+`max_num_seqs=128` measures **6,945.3 tok/s against 3,152.4 — 2.20×** — with wall
+time 16.2 → 7.4 s.
+
+#### What it paid, and the deficit it exposed
+
+Measured through the harness at ISL 128 / OSL 256, against vLLM at the **same**
+width — which is the only comparison worth making, and the reason the wide row
+carries no `baseline`:
+
+| | B=32 | B=128 | |
+|---|---:|---:|---:|
+| liteinfer | 3,152.4 | **6,945.3** | 2.20× |
+| vLLM | 4,466.6 | **11,097.5** | 2.48× |
+| gap | 0.71× | **0.63×** | |
+
+So the win is real — 2.20×, wall 16.2 → 7.4 s — and it does **not** close the gap;
+it widens it, because vLLM gains more from the same width. That is the finding
+worth having, and it is invisible if you only compare a wide engine to your own
+narrower self.
+
+Where it goes is measurable, and it is not the forward. The loop's stages by
+width:
+
+| stage | B=32 | B=128 |
+|---|---:|---:|
+| forward | 88.7% | **81.5%** |
+| sample | 6.0% | **11.3%** |
+| deliver | 2.0% | 4.2% |
+| schedule + unattributed | 3.4% | 3.0% |
+
+The forward is nearly flat in batch width — that is what §1.4 spends — but the
+per-sequence work around it is not, and at 128 sequences it is **18.5% of the
+loop** against 11.3% at 32. Removing it entirely would put throughput near 8,550
+tok/s and the gap at ~0.77×. Filed as §1.5.
+
+It is also not merely a bigger default: `max_num_seqs=128` is reachable by any
+caller today, and what was missing is the engine being *safe* at it. The pool is sized to `max_num_seqs` ×
+`max_model_len` or to a fraction of free memory, whichever is smaller — 17.2 GiB
+at 128 × 4096, which fits an A40 and does not fit a 24 GiB card, where the pool
+goes quietly under what the config promises. And `DecodeGraphs` records one graph
+per exact batch width with a cap of 64, which never binds at 32 and binds
+immediately at 128. Those are §2.6 and a capture ladder, filed as §1.4's
+prerequisites.
+
+The number above is deliberately **not** in the results table. Comparing a
+128-wide row to a 32-wide one measures the batch width, which is the one
+comparison this file refuses to make against vLLM and should not make against
+itself either. It belongs in the table when there is a `vllm-b128` beside it.
+
+### The pool is sized from the device now, not from the machine's history (§2.6)
+
+The block pool took a fraction of *free* VRAM, which made its size depend on
+what else happened to be resident. The sharper version of that bug is that it
+depends on what was resident a moment **earlier**: torch's caching allocator
+keeps freed blocks, so CUDA's free figure stays low after an allocation is
+released.
+
+| blocks a memory-bound pool would take | from free VRAM | from total VRAM |
+|---|---:|---:|
+| weights only | 72,516 | 72,208 |
+| after 8 GiB allocated **and freed** | 58,589 | 72,208 |
+| | **−19%** | unchanged |
+
+`gpu_memory_utilization` now applies to total memory less the weights already
+resident — vLLM's meaning for the same name — so the size is a function of the
+config and the device. The benchmark config is unaffected, because
+`max_num_seqs × max_model_len` binds it there: 8,192 blocks / 4.00 GiB before and
+after, so no stored result moves.
+
+It is a behaviour change elsewhere, though, and worth stating plainly: loading
+weights leaves enough allocator residue that CUDA's free figure reads well below
+`total − weights`. At Llama-3-8B's defaults the old formula produced **5,752
+blocks (11.24 GiB) where the config asks for 8,192 (16.00 GiB)** — the engine was
+quietly taking *less* than it was told whenever loading was untidy. It now takes
+what it was told, which is the point, and which means a process holding something
+else large has to say so. The 8B parity test co-loads a second copy of the same
+model as its reference and had been fitting on that accident; it now asks for the
+one short sequence it decodes.
+
+**The second half replaces the fraction with a measurement, and §3.7 is what made
+it possible.** The pool now subtracts a profiled figure: one prefill at
+`max_num_seqs × max_model_len`, which is not hypothetical because `schedule()`
+admits and prefills that many at once. On Llama-3.2-1B at 32 × 4,096 that is
+**9.04 GiB** — and **32.82 GiB** with the LM head left unsliced, which a 44 GiB
+card has nowhere to put beside weights and a pool. The roadmap had this step
+blocked on "bounding the worst case" without knowing what was making it large.
+
+The profile needs no pool, which is the trick that lets it run before the thing it
+is sizing exists: `ProfilePayload` returns the K/V the pass just computed, exactly
+as the prefill payload does after storing it, so the forward has the same shapes
+and the same peak while writing nowhere.
+
+**A test caught the first forward measuring itself.** Unwarmed, a 2-sequence
+config profiled **8.49 MiB where a 32-sequence one profiled 5.77** — the first
+forward in a process allocates cuBLAS workspaces that every later one reuses, and
+they landed inside the measurement, so the first engine loaded in any process
+would have been handed the smallest pool. One throwaway 16-token pass fixes it,
+after which the figures scale exactly 2× per doubling of the batch:
+
+| `max_num_seqs` | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|
+| profiled (MiB) | 0.361 | 0.721 | 1.442 | 2.883 | 5.766 |
+
+### Prefill's largest allocation is logits nobody reads (§3.7)
+
+`LlamaForCausalLM.forward` applies the LM head to every position; `prefill`
+returns `logits[:, -1, :]`. Measured at batch 8 with 2,048-token prompts:
+
+| | |
+|---|---:|
+| prefill peak allocation over baseline | 4.05 GiB |
+| the logits tensor inside it | **3.91 GiB — 96% of the peak** |
+| rows of it that are read | 8 of 16,384 — **0.05%** |
+| LM head flops | 8.61 TFLOP, 0.05% useful |
+
+The prefill's peak memory *is* this tensor, and it scales with
+`batch × prompt_len`: 15.6 GiB at 32 × 2,048, 31 GiB at 32 × 4,096, and **62.6 GiB
+at 128 × 2,048**, which does not fit an A40 at all.
+
+Three things follow. It is where the surplus §2.1 freed from the pool was
+actually going, and a large part of why *Long prompts are liteinfer's weak shape*
+above. It blocks §2.6's profile run, since the thing to be profiled is dominated
+by a tensor that should not exist. And it blocks §1.4 outright: raising
+concurrency to 128 would not be slow at long prompts, it would fail to run.
+
+#### What it paid, and what it did not
+
+`forward` now takes a `logits_positions` slice — `None` still computes every
+position, which is what the `transformers` parity tests compare — and every caller
+in the engine passes `LAST_POSITION`. The logits come back bit-identical and the
+prefill peak goes **3.98 → 1.01 GiB**.
+
+Both columns below are `liteinfer-graphs` — the same config either side of the
+change, which is the only way an ungated improvement can be measured. Neither
+column survives in `benchmarks/results/`: the *before* was overwritten by the
+*after*, and the *after* was itself superseded when every config was re-measured
+in one session (see below). The results table above is the current engine; this
+is the delta.
+
+| | before | after | |
+|---|---:|---:|---:|
+| TTFT p50, ISL 3584 | 162.5 ms | **147.2 ms** | **1.10×** |
+| throughput, 2048 / 128 | 908.2 | **979.0** | 1.08× |
+| throughput, 1024 / 256 | 1,990.8 | 2,069.3 | 1.04× |
+| throughput, 1024 / 1024 | 2,356.2 | 2,376.1 | 1.01× |
+| throughput, 128 / 256 | 3,111.7 | 3,115.6 | 1.00× |
+| ITL p50 | 6.6 ms | 6.6 ms | — |
+
+So it is a capability fix with a small bonus, not a throughput win: the head is
+about a fifth of prefill's arithmetic, and prefill is only part of a run. The
+prediction written here before it was built — "a throughput win at prefill-heavy
+shapes" — was optimistic by roughly half, which is worth leaving on the record
+next to the memory figure that was not.
+
+#### And it corrupted its own neighbours, which is a property of the harness
+
+Because it is ungated, §3.7 landed in *every* config at once — while the stored
+rows it would be compared against had been measured before it. `vs base` ratios
+two stored rows with no notion of when either was taken, so at ISL 2048 / OSL 128
+the report printed **1.19×** for `liteinfer-graphs` over `liteinfer-paged-attn`
+where CUDA graphs alone are worth 1.10×; the other 8% was §3.7, present in the
+newer row only. Re-measuring every runnable config in one session fixed it —
+`liteinfer-paged-attn` at that shape went 820.1 → 892.6, which is §3.7 arriving
+in the baseline, and the printed delta fell to the 1.10× it should always have
+been.
+
+Worth stating as a rule, because nothing in the code enforces it: **an ungated
+change invalidates every stored delta whose baseline predates it.** The
+`timestamp` each result carries is never read, so the report cannot warn about
+it. Filed as §8.4.
+
+### Would capturing prefill help? Only where prefill is small (§3.2 follow-up)
+
+vLLM graphs prefill, so the question is fair. It does it through **piecewise**
+capture: the inductor graph is split at the attention ops, attention runs outside
+the graph, and every other piece is captured — which works for any shape,
+including mixed prefill/decode batches. Full-forward graphs are reserved for
+uniform decode batches, which is exactly what `DecodeGraphs` is, and what vLLM
+calls `FULL_DECODE_ONLY`.
+
+Whether liteinfer wants the piecewise version depends on how much of a prefill is
+waiting rather than working:
+
+| prompt length | prefill wall | GPU busy | GPU idle |
+|---:|---:|---:|---:|
+| 128 | 12.92 ms | 8.08 ms | **4.84 ms (37%)** |
+| 512 | 20.11 ms | 18.83 ms | 1.28 ms (6%) |
+| 2048 | 80.60 ms | 79.83 ms | 0.77 ms (1%) |
+
+A liteinfer prefill is the whole prompt in one pass, so it is large and
+GPU-bound as soon as the prompt is non-trivial — the idle share collapses by 512
+tokens. That is *why* the value looks low here, and it is a property of this
+engine rather than of the technique: vLLM's prefills are chunked to
+`max_num_batched_tokens`, so most of its forwards are small mixed batches where
+the launch overhead dominates and piecewise capture pays. Two consequences worth
+recording:
+
+- Capturing prefill on its own would buy about 1.6x on TTFT at ISL 128 and
+  nothing past 512, at the cost of one capture per (prompt-length bucket × batch
+  width) — and unlike decode's slot-table padding, padding a prompt wastes real
+  compute.
+- **§1.3 changes the arithmetic and partly undoes §3.2.** Chunked prefill merges
+  prefill and decode into one pass, and a mixed pass is not a uniform decode
+  batch, so `DecodeGraphs` would not cover it. At OSL 256 with 32 slots that is
+  roughly one step in eight, so the loss is modest — but §1.3 should land with a
+  plan for capturing mixed batches, which is the point at which piecewise stops
+  being low-value here.
 
 ---
 

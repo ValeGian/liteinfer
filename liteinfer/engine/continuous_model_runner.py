@@ -16,12 +16,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload
+from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload, ProfilePayload
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import builders_for
 from liteinfer.engine.cuda_graphs import DecodeGraphs, graphs_are_enabled
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
+from liteinfer.models import LAST_POSITION
 from liteinfer.models.attention import reads_paged_kv
 from liteinfer.models.loader import load_hf_model
 from liteinfer.tokenizer import Tokenizer
@@ -31,6 +32,14 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _GIB = 1 << 30
+
+# Stand-in device size for CPU runs, which exist to test the sizing logic rather
+# than to serve anything. A constant keeps those tests independent of the host.
+_CPU_NOMINAL_TOTAL_BYTES = 1 << 30
+
+# Tokens in the throwaway forward that precedes the profile, so one-time
+# workspace allocations land outside the measurement rather than inside it.
+_PROFILE_WARMUP_TOKENS = 16
 
 
 def _head_dim(hf_config: PretrainedConfig) -> int:
@@ -49,11 +58,15 @@ class ContinuousModelRunner:
         self.tokenizer: Tokenizer | None = None
         self._cache: ContinuousKVCache | None = None
         self._graphs: DecodeGraphs | None = None
+        self._forward_bytes = 0
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
+        # Measured before the pool exists, because the pool gets whatever the
+        # forward turns out not to need.
+        self._forward_bytes = self._profile_forward_bytes()
         self._cache = ContinuousKVCache(self._create_block_pool())
         self._graphs = self._create_decode_graphs()
 
@@ -110,6 +123,7 @@ class ContinuousModelRunner:
             position_ids=position_ids,
             past_key_values=payload,
             attention_mask=attention_mask,
+            logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]  # left-padded, so the last column is the last real token
 
@@ -142,6 +156,7 @@ class ContinuousModelRunner:
             position_ids=position_ids,
             past_key_values=payload,
             attention_mask=attention_mask,
+            logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]
 
@@ -251,28 +266,121 @@ class ContinuousModelRunner:
             self._log_pool(self.config.num_gpu_blocks, bytes_per_block, "set by num_gpu_blocks")
             return self.config.num_gpu_blocks
 
-        budget = (
-            torch.cuda.mem_get_info(self.device)[0] if self.device.type == "cuda" else 1 << 30
-        )
-        affordable = int(budget * self.config.kv_cache_memory_fraction) // bytes_per_block
+        affordable = self._affordable_blocks(bytes_per_block)
         reachable = math.ceil(
             self.config.max_num_seqs * self.config.max_model_len / self.config.block_size
         )
 
         if affordable < reachable:
+            # Naming the concurrency it can actually serve is the part a caller can
+            # act on: `max_num_seqs` is otherwise a promise the pool cannot keep.
+            servable = affordable * self.config.block_size // self.config.max_model_len
             _LOGGER.warning(
-                "KV pool holds %d blocks but this config could need %d: "
-                "%d concurrent sequences of %d tokens may exhaust it. "
-                "Lower max_num_seqs or max_model_len, or raise kv_cache_memory_fraction.",
-                affordable, reachable, self.config.max_num_seqs, self.config.max_model_len,
+                "KV pool holds %d blocks but this config could need %d: at "
+                "max_model_len=%d it can serve %d concurrent sequences, not "
+                "max_num_seqs=%d. Lower max_num_seqs or max_model_len, or raise "
+                "gpu_memory_utilization.",
+                affordable, reachable, self.config.max_model_len, servable,
+                self.config.max_num_seqs,
             )
             num_blocks = max(1, affordable)
-            reason = "limited by free memory"
+            reason = "limited by the memory budget"
         else:
             num_blocks = max(1, reachable)
             reason = f"sized for {self.config.max_num_seqs} x {self.config.max_model_len} tokens"
         self._log_pool(num_blocks, bytes_per_block, reason)
         return num_blocks
+
+    def _affordable_blocks(self, bytes_per_block: int) -> int:
+        """Blocks the memory budget allows, given the weights already resident.
+
+        `mem_get_info`'s *free* figure was the obvious budget and the wrong one:
+        the same config on the same GPU sized differently depending on what else
+        happened to be resident a second earlier, which made a benchmark's pool a
+        property of the machine's history rather than of the run. Total memory is
+        a device constant and the weights are deterministic, so this answer is
+        reproducible across loads.
+
+        What it still does not measure is the forward pass. `memory_allocated`
+        counts tensors torch allocated, so the CUDA context and cuBLAS workspaces
+        fall outside it, and the activations have not been allocated yet at all —
+        the fraction is what covers both. Replacing it with a profiled figure is
+        the rest of §2.6, and needs the worst-case forward to be bounded first.
+        """
+        if self.device.type == "cuda":
+            total = torch.cuda.get_device_properties(self.device).total_memory
+            resident = torch.cuda.memory_allocated(self.device)
+        else:
+            total, resident = _CPU_NOMINAL_TOTAL_BYTES, 0
+        budget = int(total * self.config.gpu_memory_utilization) - resident
+        return max(0, budget - self._forward_bytes) // bytes_per_block
+
+    def _profile_forward_bytes(self) -> int:
+        """Peak allocation the widest prefill needs, beyond the weights.
+
+        `schedule()` admits up to `max_num_seqs` sequences at once and prefills
+        them in a single pass, so `max_num_seqs x max_model_len` tokens in one
+        forward is not hypothetical — it is what a cold engine does when that many
+        requests are already waiting. Running it here turns the activation budget
+        from a fraction someone guessed into a number this device measured, which
+        is what the fraction was standing in for. On Llama-3.2-1B at 32 x 4,096 it
+        is **9.04 GiB**, and it was 32.82 GiB before §3.7 stopped the LM head
+        running over every position — which is why that had to land first.
+
+        The payload does not write to a cache, so this needs no pool: prefill
+        attention reads the K/V the pass just computed, and `ProfilePayload` hands
+        exactly that back.
+
+        A forward that will not fit is not fatal. It means the configuration
+        cannot serve its own worst case, which is worth saying rather than
+        crashing on — sizing falls back to the fraction alone, and the WARNING in
+        `_compute_num_blocks` still reports what the pool can serve.
+        """
+        if self.device.type != "cuda":
+            return 0
+        assert self.model is not None
+
+        batch, length = self.config.max_num_seqs, self.config.max_model_len
+        try:
+            # The first forward in a process allocates cuBLAS workspaces that every
+            # later one reuses, and they land in the peak. Unwarmed, a narrow config
+            # measured 8.49 MiB where a config sixteen times wider measured 5.77 —
+            # so the first engine in a process would have been handed the smallest
+            # pool. One throwaway pass absorbs that.
+            self._prefill_forward(1, min(length, _PROFILE_WARMUP_TOKENS))
+            torch.cuda.reset_peak_memory_stats(self.device)
+            before = torch.cuda.memory_allocated(self.device)
+            self._prefill_forward(batch, length)
+            measured = torch.cuda.max_memory_allocated(self.device) - before
+        except torch.OutOfMemoryError:
+            _LOGGER.warning(
+                "the widest prefill this config allows — %d sequences x %d tokens — does "
+                "not fit, so the KV pool is sized without a measured activation budget. "
+                "Lower max_num_seqs or max_model_len to serve that case.",
+                batch, length,
+            )
+            measured = 0
+        finally:
+            torch.cuda.empty_cache()
+
+        _LOGGER.info(
+            "widest prefill (%d x %d) needs %.2f GiB of activations",
+            batch, length, measured / _GIB,
+        )
+        return max(0, measured)
+
+    def _prefill_forward(self, batch: int, length: int) -> None:
+        """One prefill-shaped forward over dummy tokens, writing to no cache."""
+        assert self.model is not None
+        build_prefill, _ = builders_for(type(self.model).__name__)
+        with torch.inference_mode():
+            self.model(
+                input_ids=torch.zeros((batch, length), dtype=torch.long, device=self.device),
+                position_ids=torch.arange(length, device=self.device).expand(batch, length),
+                past_key_values=ProfilePayload(),
+                attention_mask=build_prefill([length] * batch, self.config.dtype, self.device),
+                logits_positions=LAST_POSITION,
+            )
 
     def _log_pool(self, num_blocks: int, bytes_per_block: int, reason: str) -> None:
         _LOGGER.info(

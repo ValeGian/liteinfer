@@ -19,6 +19,10 @@ class BenchmarkConfig:
     engine: Engine
     description: str
     max_num_seqs: int = 1
+    max_model_len: int = 4096
+    """Context budget the row claims. It sizes the KV pool's ceiling and the
+    worst-case forward the engine profiles at load, so a wide row has to state one
+    it can actually serve — 128 sequences x 4,096 tokens does not fit an A40."""
     attn_implementation: str = "eager"
     """Pinned per row rather than inherited from `EngineConfig`: a stored result
     has to keep meaning the same thing after the engine default moves on."""
@@ -122,6 +126,16 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         baseline="liteinfer-paged-attn",
         description="Paged decode replayed from a CUDA graph instead of launched per kernel",
     ),
+    # --- liteinfer: the batch width a flat step pays for (§1.4) ---
+    BenchmarkConfig(
+        name="liteinfer-graphs-b128",
+        engine="liteinfer",
+        max_num_seqs=128,
+        max_model_len=1024,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        description="Captured decode at 128 concurrent sequences",
+    ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(
         name="vllm",
@@ -139,6 +153,13 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         engine="vllm",
         max_num_seqs=32,
         description="vLLM, up to 32 concurrent sequences",
+    ),
+    BenchmarkConfig(
+        name="vllm-b128",
+        engine="vllm",
+        max_num_seqs=128,
+        max_model_len=1024,
+        description="vLLM, up to 128 concurrent sequences",
     ),
 )
 

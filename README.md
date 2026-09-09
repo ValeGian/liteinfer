@@ -160,10 +160,10 @@ A40 · Llama-3.2-1B-Instruct · ISL 128 · OSL 256 · vs vLLM 0.28.0 at matched 
 
 | | liteinfer | vLLM | |
 |---|---:|---:|---|
-| Throughput, B=32 | **3,112 tok/s** | 4,467 tok/s | 1.4× behind |
-| Throughput, ISL 1024 / OSL 1024 | **2,356 tok/s** | 3,241 tok/s | 1.4× behind |
+| Throughput, B=32 | **3,152 tok/s** | 4,467 tok/s | 1.4× behind |
+| Throughput, ISL 1024 / OSL 1024 | **2,389 tok/s** | 3,241 tok/s | 1.4× behind |
 | Decode step (ITL p50) | **6.6 ms** | 5.2 ms | 1.3× behind |
-| Time to first token (p50) | 14.9 ms | 23.2 ms | 1.6× ahead\* |
+| Time to first token (p50) | 14.0 ms | 28.6 ms | 2.0× ahead\* |
 | Long prompts (ISL 2048) | runs | runs | eager attention cannot |
 
 \* At this prompt length TTFT is mostly fixed per-call API overhead rather than
@@ -178,8 +178,8 @@ falls back rather than failing.
 step issued ~700 kernels to do ~7 ms of GPU work, at a flat 18.7 µs of wall per
 launch whatever the batch width — so the GPU sat idle 41-52% of every step and
 32× the tokens bought 1.29× the GPU time. Replaying the forward from a captured
-graph took the decode step **13.4 → 6.6 ms (2.0×)** and throughput **1,930 →
-3,112 tok/s (1.6×)**, closing the gap to vLLM from 2.6× to 1.3× on the step. What
+graph took the decode step **13.3 → 6.6 ms (2.0×)** and throughput **1,932 →
+3,152 tok/s (1.6×)**, closing the gap to vLLM from 2.6× to 1.3× on the step. What
 remains is arithmetic rather than overhead: liteinfer's kernels are 1.9× off the
 memory roofline where vLLM's whole step is 1.5× off, and that is fusion —
 [`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including three
