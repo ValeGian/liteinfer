@@ -4,6 +4,17 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 09-09-2026 — §8.4 A delta says when it cannot be trusted
+
+- **PRs.** [#37](https://github.com/ValeGian/liteinfer/pull/37)
+- **What.** `vs base` divided two stored numbers and had no idea when either was taken. Each result now records the **git revision** it measured, and `report.py` marks any ratio whose two rows disagree on revision, on prompt digest, or — for results predating the field — on the clock. The mark is a `~` on the cell itself rather than a footnote, because the doubt has to travel with the number.
+- **Why the clock alone would not have worked.** The obvious guard is a staleness window, and it would have missed the case that motivated this: the baselines §3.7 invalidated were **hours** old, not days. What actually changed between them was the code, so the revision is the thing to compare and the timestamp is only a fallback for rows stored before it existed.
+- **It caught the live state immediately.** Every ratio reaching back to a frozen 2026-08-29 row is now marked *different prompts* — `benchmarks/datasets/` is gitignored, so a regenerated dataset takes a new digest while old results keep theirs, and those rows cannot be re-run because `bench run` refuses `historical` configs. The current same-session comparisons, liteinfer against vLLM included, come out clean, which is the distinction the old group-level WARNING could not draw: it flagged a whole table without saying which ratios the mismatch touched.
+- **A dirty tree is marked too**, and reported ahead of a revision mismatch because it is the more specific diagnosis — a dirty revision also differs from a clean one, so the general check would have shadowed it.
+- **What it does not do.** It does not refuse to print the ratio, and it does not re-run anything. Both were deliberate: a marked number is still the best evidence available, and the fix is always to re-measure the pair together, which is a decision about GPU time rather than something the report should take.
+
+---
+
 ## 06-09-2026 — §1.4 The batch width a flat step already pays for
 
 - **PRs.** [#36](https://github.com/ValeGian/liteinfer/pull/36)

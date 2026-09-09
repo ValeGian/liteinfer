@@ -15,6 +15,7 @@ def _result(config: str, mode: str, summary: dict, **overrides) -> dict:
         "model": "test/model",
         "max_num_seqs": 1,
         "timestamp": "2026-08-29T12:00:00+00:00",
+        "revision": "aaaaaaa",
         "dataset": {"target_isl": 16, "target_osl": 8, "num_samples": 3, "sha256": "abc"},
         "summary": summary,
     }
@@ -213,3 +214,73 @@ def test_two_shapes_produce_a_trend_section() -> None:
     long_prompt = _throughput("liteinfer-continuous", 900.0, dataset={"target_isl": 1024})
     page = report.as_html([_throughput("liteinfer-continuous", 1200.0), long_prompt])
     assert "across shapes" in page
+
+
+# ---------------------------------------------------------------------------
+# Whether a ratio compares two runs that are comparable at all (§8.4)
+# ---------------------------------------------------------------------------
+
+
+def _pair(**overrides) -> list[dict]:
+    """A config and the baseline it improves on, identical but for `overrides`."""
+    base = _throughput("liteinfer-nocache", 10.0, revision="aaaaaaa")
+    improved = _throughput(
+        "liteinfer-eager", 20.0, baseline="liteinfer-nocache", revision="aaaaaaa"
+    )
+    improved.update({k: v for k, v in overrides.items() if k != "dataset"})
+    if "dataset" in overrides:
+        improved["dataset"] = improved["dataset"] | overrides["dataset"]
+    return [base, improved]
+
+
+def test_a_delta_between_two_runs_of_the_same_engine_is_trusted() -> None:
+    assert _score(_pair(), "throughput", "liteinfer-eager").unsound == {}
+
+
+def test_a_delta_across_two_revisions_is_not_trusted() -> None:
+    """An ungated change lands in every config at once, so a baseline measured
+    before it makes the newer row look better than the change was worth."""
+    row = _score(_pair(revision="bbbbbbb"), "throughput", "liteinfer-eager")
+
+    assert row.unsound["base"] == "different revisions"
+
+
+def test_a_delta_measured_from_an_uncommitted_tree_is_not_trusted() -> None:
+    """A dirty revision does not identify what actually ran."""
+    row = _score(_pair(revision="aaaaaaa-dirty"), "throughput", "liteinfer-eager")
+
+    assert row.unsound["base"] == "uncommitted tree"
+
+
+def test_a_delta_across_two_prompt_sets_is_not_trusted() -> None:
+    """`benchmarks/datasets/` is gitignored, so a regenerated file takes a new digest."""
+    row = _score(_pair(dataset={"sha256": "different"}), "throughput", "liteinfer-eager")
+
+    assert row.unsound["base"] == "different prompts"
+
+
+def test_results_predating_the_revision_field_fall_back_to_the_clock() -> None:
+    """Older stored results carry no revision; the clock still catches the worst."""
+    base = _throughput("liteinfer-nocache", 10.0, timestamp="2026-01-01T00:00:00+00:00")
+    improved = _throughput("liteinfer-eager", 20.0, baseline="liteinfer-nocache")
+    del base["revision"], improved["revision"]
+
+    assert "apart" in _score([base, improved], "throughput", "liteinfer-eager").unsound["base"]
+
+
+def test_a_config_with_no_baseline_has_nothing_to_distrust() -> None:
+    """There is no ratio, so there is no doubt to record."""
+    assert _score(_pair(), "throughput", "liteinfer-nocache").unsound == {}
+
+
+def test_an_untrustworthy_ratio_is_marked_in_the_text_report() -> None:
+    """The doubt has to travel with the number, not sit in a footnote."""
+    assert "2.00x~" in report.as_text(_pair(revision="bbbbbbb"))
+
+
+def test_an_untrustworthy_ratio_says_why_in_the_html_report() -> None:
+    assert "different revisions" in report.as_html(_pair(revision="bbbbbbb"))
+
+
+def test_a_trustworthy_ratio_is_left_unmarked_in_the_text_report() -> None:
+    assert "2.00x~" not in report.as_text(_pair())
