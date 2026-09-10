@@ -15,6 +15,8 @@ from benchmarks import adapters, stats
 from benchmarks.configs import BenchmarkConfig
 from benchmarks.dataset import Dataset
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 Mode = Literal["throughput", "latency"]
 
 WARMUP_TOKENS = 32
@@ -77,11 +79,17 @@ def _revision() -> str:
     try:
         head = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, check=True, cwd=Path(__file__).parent,
+            capture_output=True, text=True, check=True, cwd=_REPO_ROOT,
         ).stdout.strip()
         dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            capture_output=True, text=True, check=True, cwd=Path(__file__).parent,
+            # The results are this command's own output, and a sweep writes one
+            # per run — so counting them would mark every run after the first as
+            # measuring an uncommitted tree, which is what the first attempt did.
+            [
+                "git", "status", "--porcelain", "--untracked-files=no",
+                "--", ".", ":(exclude)benchmarks/results", ":(exclude)docs/index.html",
+            ],
+            capture_output=True, text=True, check=True, cwd=_REPO_ROOT,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"

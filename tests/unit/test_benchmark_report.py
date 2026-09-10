@@ -245,11 +245,38 @@ def test_a_delta_across_two_revisions_is_not_trusted() -> None:
     assert row.unsound["base"] == "different revisions"
 
 
-def test_a_delta_measured_from_an_uncommitted_tree_is_not_trusted() -> None:
-    """A dirty revision does not identify what actually ran."""
+def test_a_delta_between_two_runs_of_one_dirty_revision_is_still_trusted() -> None:
+    """A sweep writes a result per run, so the tree is dirty for every run after
+    the first. Marking that would flag every ratio in the report; the weaker
+    evidence is said once under the table instead."""
+    pair = _pair()
+    for result in pair:
+        result["revision"] = "aaaaaaa-dirty"
+
+    assert _score(pair, "throughput", "liteinfer-eager").unsound == {}
+
+
+def test_a_dirty_revision_is_noted_under_the_table() -> None:
+    pair = _pair()
+    for result in pair:
+        result["revision"] = "aaaaaaa-dirty"
+
+    assert "uncommitted tree" in report.as_text(pair)
+
+
+def test_a_delta_between_a_clean_and_a_dirty_revision_is_not_trusted() -> None:
+    """Different strings mean different code, however they differ."""
     row = _score(_pair(revision="aaaaaaa-dirty"), "throughput", "liteinfer-eager")
 
-    assert row.unsound["base"] == "uncommitted tree"
+    assert row.unsound["base"] == "different revisions"
+
+
+def test_a_cross_engine_ratio_ignores_our_revision() -> None:
+    """A vLLM row's revision is a fact about vLLM, so comparing the two says nothing."""
+    ours = _throughput("liteinfer-eager", 20.0, revision="aaaaaaa")
+    theirs = _throughput("vllm", 10.0, revision="zzzzzzz")
+
+    assert _score([ours, theirs], "throughput", "liteinfer-eager").unsound == {}
 
 
 def test_a_delta_across_two_prompt_sets_is_not_trusted() -> None:

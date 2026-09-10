@@ -100,11 +100,18 @@ def _incomparable(result: dict, reference: dict | None) -> str | None:
         return None
     if result["dataset"]["sha256"] != reference["dataset"]["sha256"]:
         return "different prompts"
+    if result["engine"] != reference["engine"]:
+        # A vLLM row's revision is a fact about vLLM, not about this engine, so
+        # comparing the two says nothing. The prompts still have to match, which
+        # is checked above.
+        return None
     mine, theirs = result.get("revision"), reference.get("revision")
-    # Dirty first: it is the more specific diagnosis, and a dirty revision also
-    # differs from a clean one, so the general check would shadow it.
-    if "dirty" in (mine or "") or "dirty" in (theirs or ""):
-        return "uncommitted tree"
+    # Only a *difference* makes two runs incomparable. Two runs of the same dirty
+    # revision are the same code as far as anything here can tell, and marking
+    # them would flag a whole sweep — a sweep writes a result per run, so the
+    # tree is dirty for every run after the first. That the evidence is weaker
+    # when a revision is dirty is said once, under the table, rather than
+    # attached to every ratio.
     if mine and theirs and mine != theirs:
         return "different revisions"
     # Results stored before the revision was recorded fall back to the clock,
@@ -294,6 +301,12 @@ def as_text(results: list[dict]) -> str:
         lines.append(
             "\n~ this ratio divides two runs that are not comparable "
             f"({', '.join(reasons)}); re-measure both together before reading it."
+        )
+    if any("dirty" in (r.get("revision") or "") for r in results):
+        lines.append(
+            "\n! some runs measured an uncommitted tree, so their revision does not"
+            "\n  fully identify what ran. Ratios between runs of the same revision"
+            "\n  are still like-for-like."
         )
     return "\n".join(lines)
 

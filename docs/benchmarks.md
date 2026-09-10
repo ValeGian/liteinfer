@@ -138,15 +138,15 @@ takes that trade deliberately, and this is where the bill arrives.
 | `liteinfer-eager-b4` | 4 | 281.6 | 1.1 | 181.8 | **3.84×** | 0.39× |
 | `liteinfer-native-eager-b4` | 4 | 277.6 | 1.1 | 184.4 | 3.82× | 0.38× |
 | `liteinfer-paged-b4` | 4 | 252.9 | 1.0 | 202.4 | 3.79× | 0.35× |
-| `liteinfer-continuous` | 32 | 1,626.8 | 6.4 | 31.5 | 6.43×† | 0.36× |
-| `liteinfer-sdpa` | 32 | 1,748.1 | 6.8 | 29.3 | 1.07× | 0.39× |
-| `liteinfer-paged-attn` | 32 | 1,931.5 | 7.5 | 26.5 | **1.10×** | 0.43× |
-| `liteinfer-graphs` | 32 | **3,152.4** | 12.3 | 16.2 | **1.63×** | 0.71× |
-| `liteinfer-graphs-b128` | 128 | **6,945.3** | 27.1 | 7.4 | — | 0.63× |
-| `vllm` | 1 | 188.4 | 0.7 | 271.8 | — | — |
-| `vllm-b4` | 4 | 724.0 | 2.8 | 70.7 | — | — |
-| `vllm-continuous` | 32 | 4,466.6 | 17.4 | 11.5 | — | — |
-| `vllm-b128` | 128 | 11,097.5 | 43.3 | 4.6 | — | — |
+| `liteinfer-continuous` | 32 | 1,688.7 | 6.6 | 30.3 | 6.68×† | 0.38× |
+| `liteinfer-sdpa` | 32 | 1,804.6 | 7.0 | 28.4 | 1.07× | 0.41× |
+| `liteinfer-paged-attn` | 32 | 1,997.1 | 7.8 | 25.6 | **1.11×** | 0.45× |
+| `liteinfer-graphs` | 32 | **3,374.3** | 13.2 | 15.2 | **1.69×** | 0.77× |
+| `liteinfer-graphs-b128` | 128 | **8,060.4** | 31.5 | 6.4 | — | 0.74× |
+| `vllm` | 1 | 188.2 | 0.7 | 272.1 | — | — |
+| `vllm-b4` | 4 | 721.4 | 2.8 | 71.0 | — | — |
+| `vllm-continuous` | 32 | 4,396.7 | 17.2 | 11.6 | — | — |
+| `vllm-b128` | 128 | 10,958.5 | 42.8 | 4.7 | — | — |
 
 † against a removed config, so it measures two engines two milestones apart. The
 two rows above it are same-session and measure only their own code.
@@ -176,13 +176,13 @@ group.
 | `liteinfer-eager-b4` | 15.8 ms | 17.7 ms | 14.0 ms | 14.1 ms | 3,596.6 ms | 0.98× |
 | `liteinfer-native-eager-b4` | 14.9 ms | 16.7 ms | 13.9 ms | 13.9 ms | 3,561.1 ms | 0.99× |
 | `liteinfer-paged-b4` | 19.0 ms | 20.9 ms | 15.0 ms | 15.0 ms | 3,832.2 ms | 1.02× |
-| `liteinfer-continuous` | 16.1 ms | 17.1 ms | 15.4 ms | 15.5 ms | 3,947.1 ms | 0.97× |
-| `liteinfer-sdpa` | 13.9 ms | 15.5 ms | 13.9 ms | 14.0 ms | 3,561.0 ms | **1.11×** |
-| `liteinfer-paged-attn` | **13.9 ms** | 15.3 ms | 13.3 ms | 13.4 ms | 3,407.6 ms | 1.05× |
-| `liteinfer-graphs` | 14.0 ms | 15.8 ms | **6.6 ms** | **6.6 ms** | **1,698.5 ms** | **2.01×** |
-| `vllm` | 27.5 ms | 32.1 ms | 5.2 ms | 5.5 ms | 1,354.9 ms | — |
-| `vllm-b4` | 28.7 ms | 31.2 ms | 5.2 ms | 5.2 ms | 1,352.8 ms | — |
-| `vllm-continuous` | 28.6 ms | 31.4 ms | 5.2 ms | 5.2 ms | 1,352.7 ms | — |
+| `liteinfer-continuous` | 16.1 ms | 17.9 ms | 15.4 ms | 15.5 ms | 3,946.9 ms | 0.97× |
+| `liteinfer-sdpa` | 14.4 ms | 16.3 ms | 14.4 ms | 14.4 ms | 3,675.9 ms | 1.07× |
+| `liteinfer-paged-attn` | **14.1 ms** | 16.0 ms | 13.3 ms | 13.4 ms | 3,414.5 ms | 1.08× |
+| `liteinfer-graphs` | 14.7 ms | 16.5 ms | **6.5 ms** | **6.6 ms** | **1,684.9 ms** | **2.04×** |
+| `vllm` | 22.5 ms | 30.4 ms | 5.2 ms | 5.3 ms | 1,358.1 ms | — |
+| `vllm-b4` | 22.2 ms | 28.8 ms | 5.2 ms | 5.3 ms | 1,357.0 ms | — |
+| `vllm-continuous` | 22.4 ms | 28.7 ms | 5.2 ms | 5.2 ms | 1,356.5 ms | — |
 
 ---
 
@@ -224,11 +224,12 @@ model decode is kernel-launch bound, so re-feeding the whole sequence costs litt
 more than feeding one token while the cache adds per-step `torch.cat` growth.
 Expect this to widen sharply with sequence length; measuring that is §8.3.
 
-**TTFT: liteinfer is ahead, but read it narrowly.** 14.0 ms against vLLM's
-28.6 ms — and vLLM's figure moved 22.7 → 28.6 ms purely by being re-measured on
-the current prompt set, which is how the cross-dataset split described above was
-found. ITL did not move at all (5.2 ms either way), because these runs pin the
-output length, so only TTFT sees the prompts change. At ISL=128 both engines' TTFT is dominated by fixed per-call API overhead
+**TTFT: liteinfer is ahead, but read it narrowly.** 14.7 ms against vLLM's
+22.4 ms. That gap has been as wide as 28.6 ms on one measurement of the same
+configuration, which is a warning about the metric rather than about vLLM: TTFT
+at ISL 128 is mostly fixed per-call overhead, and it is the one latency figure
+that moves when the prompt set is regenerated. ITL does not (5.2 ms across every
+vLLM run here), because these runs pin the output length. At ISL=128 both engines' TTFT is dominated by fixed per-call API overhead
 rather than prefill compute — measured on a 2-token prompt, vLLM spends 11.1 ms
 before any real work and prefilling 128 tokens costs it only 3.4 ms more. This
 measures offline round-trip latency, where vLLM pays IPC to a separate engine
@@ -304,8 +305,8 @@ prompts or wider batches. Removing it is §3.3, below.
 
 **This is the shape §2.3 helped most.** A long prompt is a long KV history from
 the first decode step, which is exactly what the gather was charging for: with
-paged decode the 1024 / 1024 row goes 696.3 → 1,817.4 tok/s and the gap to vLLM
-at that shape closes from 4.7× to 1.8×. See *Paged decode stops the step growing
+paged decode the 1024 / 1024 row goes 700.9 → 1,912.8 tok/s and the gap to vLLM
+at that shape closes from 4.7× to 1.7×. See *Paged decode stops the step growing
 with context*.
 
 ### The fused kernel buys prompt length, not throughput
@@ -358,11 +359,11 @@ together, which is what these stored rows are:
 
 | shape | `continuous` | `sdpa` | `paged` | paged vs sdpa |
 |---|---:|---:|---:|---:|
-| 128 / 256 | 1,626.8 | 1,748.1 | 1,931.5 | 1.10× |
-| 128 / 1024 | 1,197.3 | 1,232.2 | 1,930.6 | 1.57× |
-| 1024 / 256 | 713.4 | 793.1 | 1,569.6 | 1.98× |
-| 1024 / 1024 | 670.1 | 696.3 | 1,817.4 | **2.61×** |
-| 2048 / 128 | OOM | 418.8 | 892.6 | 2.13× |
+| 128 / 256 | 1,688.7 | 1,804.6 | 1,997.1 | 1.11× |
+| 128 / 1024 | 1,240.7 | 1,265.0 | 2,018.0 | 1.60× |
+| 1024 / 256 | 720.9 | 806.4 | 1,631.9 | 2.02× |
+| 1024 / 1024 | 675.1 | 700.9 | 1,912.8 | **2.73×** |
+| 2048 / 128 | OOM | 419.5 | 908.3 | 2.16× |
 
 Read the first row against the fourth: at the headline shape the change is 1.11×,
 only just past the 1.1× floor this repo treats as an effect at all, and at ISL
@@ -407,8 +408,8 @@ per step), and it never touches the padding, because it takes each sequence's
 context length rather than a mask over the batch's longest.
 
 **At B=1 it is worth nothing, and that is the same story.** Latency mode runs one
-request at a time: ITL p50 13.9 → 13.3 ms, E2E 3,561.0 → 3,407.6 ms, TTFT 13.9 →
-13.9 ms. All three are inside the ±4% floor, so the honest reading is *no effect*.
+request at a time: ITL p50 14.4 → 13.3 ms, E2E 3,675.9 → 3,414.5 ms, TTFT 14.4 →
+14.1 ms. All three are inside the ±4% floor, so the honest reading is *no effect*.
 Two reasons, and they compound: a single request has ~190 tokens of history to
 gather, which is the cheapest case in the table above, and the kernel's grid is one
 program per (sequence, KV head) — 8 programs on an 84-SM GPU. The B=1 row of the
@@ -630,21 +631,18 @@ the per-layer numbers predict.
 | e2e p50 | 3,431.6 → 3,629.8 ms | 1,921.6 → 1,986.7 ms |
 | TTFT p50 | 14.5 → 14.5 ms | 164.1 → 162.6 ms |
 
-‡ This shape is the least trustworthy row in the file, and it is worth saying
-why. Its ITL spreads about 5% run to run — the unsplit config read 16.1, 16.2,
-16.3, 16.9, 17.0 and 17.1 ms across six runs on two GPUs, and the captured one
-7.9 to 8.4 — which is wider than the ±4% floor claimed above. An earlier reading
-of **13.8 ms** was published here and is now discredited: neither the current
-engine nor `master` reproduces it, and a two-pass A/B on `master` put the same
-configuration at **19.8 and 19.9 ms**. So the honest range for this delta is
-roughly 2.0-2.4×, and the number in the table is the stored pair rather than a
-best case.
+‡ The unsplit half of this row has been measured at 13.4, 13.8, 16.1, 16.2,
+16.3, 16.9, 17.0, 17.1, 19.8 and 19.9 ms across ten runs — a 1.5× spread on one
+configuration. *Within* any single run it is stable (see *A stable run is not a
+comparable one* below), so the spread is between sessions, and the benchmark host
+turns out to have 27 users on it. Read this delta as "roughly 1.7-2.4×" and the
+table's figure as the stored pair, not a best case.
 
-That A/B also said something about §3.7 that the throughput rows understated:
-`master`'s TTFT at this shape is **240 ms against the branch's ~151**, far more
-than the 1.10× §3.7 measured at ISL 2048. Removing a 0.92 GiB logits allocation
-evidently saves allocator time as well as arithmetic, so §3.7 is worth more at
-long prompts than its throughput delta suggested.
+One thing that spread did surface: on `master`, TTFT at this shape is **240 ms
+against ~147 here**, far more than the 1.10× §3.7 measured at ISL 2048. Removing
+a 0.92 GiB logits allocation evidently saves allocator time as well as
+arithmetic, so §3.7 is worth more at long prompts than its throughput delta
+suggested.
 
 ISL 3584 is the most favourable shape `max_model_len` 4096 allows — the context
 where the kernel is 7x faster — and it still loses 3%. `decode()` timed directly
@@ -781,17 +779,17 @@ stored rows are the same engine with capture pinned off:
 
 | throughput | paged-attn | graphs | |
 |---|---:|---:|---:|
-| 128 / 256 | 1,931.5 | **3,152.4** | **1.63×** |
-| 128 / 1024 | 1,930.6 | **2,972.1** | **1.54×** |
-| 1024 / 1024 | 1,817.4 | **2,389.2** | 1.31× |
-| 1024 / 256 | 1,569.6 | **2,071.6** | 1.32× |
-| 2048 / 128 | 892.6 | **979.5** | 1.10× |
+| 128 / 256 | 1,997.1 | **3,374.3** | **1.69×** |
+| 128 / 1024 | 2,018.0 | **3,216.2** | **1.59×** |
+| 1024 / 1024 | 1,912.8 | **2,534.6** | 1.33× |
+| 1024 / 256 | 1,631.9 | **2,162.3** | 1.33× |
+| 2048 / 128 | 908.3 | **1,000.1** | 1.10× |
 
 | latency, B=1 | paged-attn | graphs | |
 |---|---:|---:|---:|
-| ITL p50, ISL 128 / OSL 256 | 13.3 ms | **6.6 ms** | **2.01×** |
-| e2e p50 | 3,407.6 ms | **1,698.5 ms** | 2.01× |
-| ITL p50, ISL 3584 / OSL 128 | 16.9 ms | **7.9 ms** | 2.14×‡ |
+| ITL p50, ISL 128 / OSL 256 | 13.3 ms | **6.5 ms** | **2.04×** |
+| e2e p50 | 3,414.5 ms | **1,684.9 ms** | 2.03× |
+| ITL p50, ISL 3584 / OSL 128 | 13.4 ms | **7.8 ms** | 1.71×‡ |
 | TTFT p50 | 13.9 ms | 14.0 ms | — |
 
 The gap to vLLM closes from **0.43× to 0.71×** on throughput and from **2.56× to
@@ -823,8 +821,8 @@ weights per step on an A40 at 696 GB/s is a 3.55 ms floor:
 | | step | vs roofline |
 |---|---:|---:|
 | roofline | 3.55 ms | 1.00× |
-| vLLM ITL | 5.20 ms | 1.47× |
-| liteinfer ITL, after §3.2 | 6.60 ms | 1.86× |
+| vLLM ITL | 5.20 ms | 1.46× |
+| liteinfer ITL, after §3.2 | 6.50 ms | 1.83× |
 | liteinfer ITL, before | 13.30 ms | 3.75× |
 
 What is left is arithmetic, not overhead: ~725 launches is about 45 kernels per
@@ -894,8 +892,8 @@ Measured on the captured step at 256 tokens of context:
 | 256 | 17.30 ms | 14,797 | 3.53× |
 
 Eight times the batch for 2.3× the step. Through the harness at ISL 128 / OSL 256,
-`max_num_seqs=128` measures **6,945.3 tok/s against 3,152.4 — 2.20×** — with wall
-time 16.2 → 7.4 s.
+`max_num_seqs=128` measures **8,060.4 tok/s against 3,374.3 — 2.39×** — with wall
+time 15.2 → 6.4 s.
 
 #### What it paid, and the deficit it exposed
 
@@ -905,11 +903,11 @@ carries no `baseline`:
 
 | | B=32 | B=128 | |
 |---|---:|---:|---:|
-| liteinfer | 3,152.4 | **6,945.3** | 2.20× |
-| vLLM | 4,466.6 | **11,097.5** | 2.48× |
-| gap | 0.71× | **0.63×** | |
+| liteinfer | 3,374.3 | **8,060.4** | 2.39× |
+| vLLM | 4,396.7 | **10,958.5** | 2.49× |
+| gap | 0.77× | **0.74×** | |
 
-So the win is real — 2.20×, wall 16.2 → 7.4 s — and it does **not** close the gap;
+So the win is real — 2.39×, wall 15.2 → 6.4 s — and it does **not** close the gap;
 it widens it, because vLLM gains more from the same width. That is the finding
 worth having, and it is invisible if you only compare a wide engine to your own
 narrower self.
@@ -1103,6 +1101,83 @@ recording:
   roughly one step in eight, so the loss is modest — but §1.3 should land with a
   plan for capturing mixed batches, which is the point at which piecewise stops
   being low-value here.
+
+### The loop stopped paying per sequence for work nobody reads (§1.5)
+
+§3.2 made the forward nearly flat in batch width, which is what §1.4 spent.
+Everything the loop does *around* the forward is per sequence, so widening the
+batch grew its share — at 128 concurrent sequences the forward was 70.1% of the
+loop against 88.7% at 32. Profiling it named three costs, and none of them was
+arithmetic:
+
+| frame | calls | cumulative |
+|---|---:|---:|
+| `PreTrainedTokenizerFast.decode`'s Python wrapper | 65,536 | **0.598 s** |
+| ...the Rust `decode` inside it | 65,536 | 0.062 s |
+| `Sequence.is_finished` | 229,376 | 0.236 s |
+| `_build_event` | 32,768 | 0.158 s |
+
+**Detokenising spent ten times its own weight in bookkeeping.** The engine decodes
+twice per sequence per step, and it went through the transformers wrapper to do
+it. It now calls the backend tokenizer directly; a slow tokenizer has no backend
+and is unchanged.
+
+**`is_finished` built a string to match a prefix**, 229,376 times in one run. It
+is frozenset membership now, which also stops the check depending on how the
+states are spelled.
+
+**`generate` was served an event per token and kept the last one.** `_collect`
+discards everything before the completion, so building and queueing the rest was
+7.3% of the loop spent on objects nobody reads. `generate_stream` takes
+`stream_tokens`; the batch API passes `False`; `stream()` is untouched.
+
+| loop stage, B=128 | before | + tokenizer | + delivery |
+|---|---:|---:|---:|
+| forward | 70.1% | 80.9% | **87.4%** |
+| sample | 17.0% | 7.9% | 7.9% |
+| deliver | 7.7% | 7.3% | **0.8%** |
+| **non-forward** | **29.9%** | 19.1% | **12.6%** |
+
+Measured through the harness, and it scales with batch width because the cost was
+per sequence: **1.07× at B=32 (3,152.4 → 3,374.3) and 1.16× at B=128 (6,945.3 →
+8,060.4)**. The gap to vLLM at matched width closes from 0.71× to **0.77×** at 32
+and from 0.63× to **0.74×** at 128.
+
+Changing text output needed more than the test suite, since this is the one path a
+user reads directly. Byte-equality was checked over 4,000 random token windows,
+then over real generations covering emoji, CJK, Arabic, accents and a
+40-character word — both through the incremental detokeniser step by step and
+against a whole-sequence decode.
+
+### A stable run is not a comparable one
+
+Two latency rows from the §1.5 re-measurement came back saying `paged-attn` was
+**0.91×** of `sdpa` — paged decode *worse*, which contradicts everything in
+*Paged decode stops the step growing with context* above. The raw per-request
+data said why. Every result stores its 200 e2e times, and nothing had ever looked
+at their spread:
+
+| latency, 128/256 | max/min within the run | first→last quarter |
+|---|---:|---:|
+| `graphs` | 1.09× | 1.000 |
+| every other row in the file | ≤ 1.09× | 0.997-1.010 |
+| `sdpa`, that run | **1.27×** | **1.188** |
+| `paged-attn`, that run | **1.48×** | **0.832** |
+
+Those two ran consecutively and drifted in opposite directions across the boundary
+between them, which is an external disturbance of about ten minutes and not a
+property of either configuration. Re-run on a quiet machine they came back at
+1.04× and 1.05× spread, and in the expected order: 14.4 ms for `sdpa` against
+13.3 ms for `paged-attn`.
+
+Two things worth keeping. **The criterion has to be set before the number is
+seen** — those rows were re-run because their intra-run spread was 14× the
+file's norm, not because the answer was unwelcome. And **within-run stability
+does not imply between-run comparability**: `paged-attn` at ISL 3584 is stable to
+1.08× inside any single run and has read anywhere from 13.4 to 19.9 ms across
+sessions. The benchmark host has 27 users on it, so the ±4% variance floor this
+file claims is optimistic for anything launch-bound. Detecting the disturbed runs
+automatically is §8.5 — the data is already in every result.
 
 ---
 

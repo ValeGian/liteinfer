@@ -150,34 +150,24 @@ listed.
   in eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
   batches, which is what §3.8 exists to be.
 
-### 1.5 The loop's per-sequence work is the wide-batch tax
-- **Status.** `planned` — **the deficit §1.4 exposed, and worth ~1.23x at 128
-  concurrent sequences.**
+### 1.6 What is left of the loop outside the forward
+- **Status.** `planned` — follow-up to §1.5, and small.
 - **PRs.** _none yet_
-- **Why.** §3.2 made the forward nearly flat in batch width, which is what §1.4
-  spends. Everything the loop does *around* the forward is not flat — it is per
-  sequence — so widening the batch grows its share:
-
-  | stage | B=32 | B=128 |
-  |---|---:|---:|
-  | forward | 88.7% | **81.5%** |
-  | sample | 6.0% | **11.3%** |
-  | deliver | 2.0% | 4.2% |
-  | schedule + unattributed | 3.4% | 3.0% |
-
-  At 128 sequences that is **18.5% of the loop** against 11.3% at 32. It is also
-  the reason §1.4's 2.23x is smaller than vLLM's 2.48x over the same widening, so
-  the gap goes from 0.70x to 0.63x rather than closing. Removing it entirely would
-  put throughput near 8,550 tok/s and the gap at ~0.77x.
-- **Scope.** Sampling is the largest and doubles its share, which is where to
-  start — greedy rows are already taken in one kernel (§26), so what is left is
-  the per-row stochastic loop and whatever still crosses the device boundary once
-  per sequence. `deliver` builds one `StreamEvent` per sequence and detokenises
-  into it; that is per-sequence by nature, but not necessarily per-sequence
-  *Python*. Measure each against the stage timings above rather than in isolation
-  — `TimeBreakdown` already reports them, and this is the item it was built for.
-- **Parity test.** Identical greedy output and identical stream events at 128
-  concurrent sequences.
+- **Why.** §1.5 took the non-forward share of the loop from 29.9% to **12.6%** at
+  128 concurrent sequences. What remains is almost all `sample`, at 7.9%, and
+  about half of that is the incremental detokeniser: two `decode` calls per
+  sequence per step, of which the Rust work is now 0.055 s against the frame's
+  0.167 s.
+- **Scope.** The two calls decode overlapping windows — `[prefix_offset,
+  read_offset)` and `[prefix_offset, end)` — and the first re-decodes a window
+  the previous step already covered, so there may be one call's worth of text to
+  carry forward instead of recomputing. That is a change to the one piece of the
+  engine whose output is user-visible text, so it needs the byte-equality checks
+  §1.5 used: random windows, then real generations across emoji, CJK, Arabic and
+  accents, compared both incrementally and against a whole-sequence decode.
+- **Size it first.** 4% of the loop is the whole prize, so this is worth doing
+  only if it is genuinely small. Measure against `TimeBreakdown`'s stage timings
+  rather than in isolation.
 
 ---
 
@@ -546,3 +536,26 @@ listed.
 - **Parity test.** HF runner greedy outputs match liteinfer eager
   outputs on the same prompts (already validated by existing e2e
   parity tests; benchmark runner just reuses that path).
+
+### 8.5 Notice when a run was disturbed
+- **Status.** `planned` — **the data is already stored and nothing reads it.**
+- **PRs.** _none yet_
+- **Why.** Every latency result keeps its 200 per-request `e2e_s` and `ttft_s`
+  values, and the report only ever takes percentiles of them. Two rows in the §1.5
+  re-measurement had an intra-run spread of **1.27x and 1.48x** where every other
+  row in the file is at most 1.09x, and drifted in opposite directions across the
+  boundary between them — an external disturbance of about ten minutes on a host
+  that has 27 users. Unnoticed, it made the report claim paged decode was 0.91x of
+  `sdpa`, reversing §2.3.
+- **Scope.** `report.py` computes max/min and a first-quarter-to-last-quarter
+  drift per result and marks the row when either leaves a band the rest of the
+  file sets. Throughput results record no per-request series, so this covers
+  latency only — recording one is the alternative and a bigger change.
+- **Why it is worth having rather than remembering.** §8.4 catches a delta between
+  two runs that should not be compared. This catches a single run that should not
+  be believed, which is the failure the §1.5 numbers actually hit, and the
+  criterion has to exist before a number is seen to be worth anything.
+- **It also bounds the variance claim.** `docs/benchmarks.md` says run-to-run
+  variance is about ±4%. Within a run that holds; between sessions the same
+  configuration has read 13.4 to 19.9 ms at ISL 3584. Whatever this measures
+  should replace that number with a measured one.
