@@ -4,6 +4,29 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 10-09-2026 — §1.5 The loop stops paying per sequence for work nobody reads
+
+- **PRs.** [#38](https://github.com/ValeGian/liteinfer/pull/38)
+- **What.** §3.2 made the forward nearly flat in batch width, which is what §1.4 spent; everything the loop does *around* the forward is per sequence, so widening the batch grew its share. At 128 concurrent sequences the forward was **70.1%** of the loop against 88.7% at 32. Three costs, and none of them arithmetic — which is why the roadmap's guess that sampling was the problem was wrong.
+- **Detokenising spent ten times its own weight in a Python wrapper.** `Tokenizer.decode` went through `PreTrainedTokenizerFast.decode`, which put **0.598 s** into bookkeeping around **0.062 s** of Rust; the engine calls it twice per sequence per step, so 65,536 times in one run. It now calls the backend tokenizer directly, and a slow tokenizer has no backend and is unchanged.
+- **`Sequence.is_finished` built a string to match a prefix**, 229,376 times. Frozenset membership now, which also stops the check depending on how the states are spelled.
+- **`generate` was served an event per token and kept the last one.** `_collect` discards everything before the completion, so 7.3% of the loop went into objects nobody reads. `generate_stream` takes `stream_tokens`, the batch API passes `False`, and `stream()` is untouched. `_forget` became the single funnel for per-request state so a new piece of it cannot be released on the completion path and leaked on the failure path.
+
+  | loop stage, B=128 | before | + tokenizer | + delivery |
+  |---|---:|---:|---:|
+  | forward | 70.1% | 80.9% | **87.4%** |
+  | sample | 17.0% | 7.9% | 7.9% |
+  | deliver | 7.7% | 7.3% | **0.8%** |
+  | non-forward | 29.9% | 19.1% | **12.6%** |
+
+- **Measured, and it scales with batch width because the cost was per sequence.** Throughput **1.07x at B=32** (3,152.4 → 3,374.3) and **1.16x at B=128** (6,945.3 → 8,060.4); the gap to vLLM at matched width closes from 0.71x to **0.77x** at 32 and 0.63x to **0.74x** at 128. ITL at B=1 is unchanged, as it should be: this was never the forward.
+- **Text output needed more than the test suite.** Byte-equality was checked over 4,000 random token windows, then over real generations covering emoji, CJK, Arabic, accents and a 40-character word — both through the incremental detokeniser step by step and against a whole-sequence decode. This is the one path a user reads directly.
+- **§8.4 failed on its first real use, and the fix was not to re-run.** It marked *every* ratio in the report. `_revision()` ran `git status` over the whole tree, and the harness writes its results into the repo — so every run after the first recorded `-dirty`. Generated output is excluded now, and two runs of the *same* revision string count as comparable whether it is clean or dirty, with the weaker evidence noted once under the table rather than attached to every ratio. Re-measuring for 100 minutes to obtain clean strings would have treated the symptom.
+- **It also compared revisions across engines**, which is meaningless — a vLLM row's revision is a fact about vLLM. Skipped now; the prompt-digest check still applies.
+- **And it caught a real one.** Two latency rows came back claiming `paged-attn` was 0.91x of `sdpa`, reversing §2.3. Their intra-run spread was **1.27x and 1.48x** where every other row in the file is at most 1.09x, drifting in opposite directions across the boundary between them — ten minutes of external disturbance on a host with 27 users. Re-run quiet they came back at 1.04x and 1.05x spread and in the expected order. The criterion was the spread, set before the answer was seen; §8.5 is filed to compute it rather than remember it.
+
+---
+
 ## 09-09-2026 — §8.4 A delta says when it cannot be trusted
 
 - **PRs.** [#37](https://github.com/ValeGian/liteinfer/pull/37)

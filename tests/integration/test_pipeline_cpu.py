@@ -414,3 +414,60 @@ def test_num_waiting_counts_both_queues(tiny_llama_dir: Path) -> None:
             return llm.engine.num_waiting
 
     assert _run(_run_test()) == 0
+
+
+def test_the_batch_api_is_delivered_one_event_per_request(tiny_llama_dir: Path) -> None:
+    """`generate` keeps only the last event, so the rest are built for nobody.
+
+    At 128 concurrent sequences that was 7.3% of the loop, paid per sequence per
+    step. Asking the engine for the completion alone is what removes it, and the
+    count is the contract: one event, not one per token.
+    """
+    events: list[int] = []
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            received = 0
+            async for _ in llm.engine.generate_stream(
+                "req-final-only",
+                "tok2 tok3",
+                SamplingParams(max_tokens=6, temperature=0.0),
+                stream_tokens=False,
+            ):
+                received += 1
+            events.append(received)
+
+    _run(_run_test())
+    assert events == [1]
+
+
+def test_the_one_delivered_event_is_the_completed_generation(tiny_llama_dir: Path) -> None:
+    """Skipping the intermediate events must not skip the answer."""
+    final = None
+
+    async def _run_test():
+        nonlocal final
+        async with _async_llm(tiny_llama_dir) as llm:
+            async for event in llm.engine.generate_stream(
+                "req-final-only-2",
+                "tok2 tok3",
+                SamplingParams(max_tokens=6, temperature=0.0),
+                stream_tokens=False,
+            ):
+                final = event
+
+    _run(_run_test())
+    assert final is not None and final.is_finished
+
+
+def test_generate_still_returns_every_token_it_produced(tiny_llama_dir: Path) -> None:
+    """The batch API now asks for one event, so its output must not have shrunk."""
+
+    async def _run_test():
+        async with _async_llm(tiny_llama_dir) as llm:
+            return await llm.generate(
+                ["tok2 tok3"], SamplingParams(max_tokens=6, temperature=0.0)
+            )
+
+    outputs = _run(_run_test())
+    assert len(outputs[0].token_ids) == 6
