@@ -25,6 +25,7 @@ from liteinfer.hub import resolve_model_path
 from liteinfer.models import LAST_POSITION
 from liteinfer.models.attention import reads_paged_kv
 from liteinfer.models.loader import load_hf_model
+from liteinfer.models.paged_decode import choose_num_splits
 from liteinfer.tokenizer import Tokenizer
 
 if TYPE_CHECKING:
@@ -176,7 +177,10 @@ class ContinuousModelRunner:
         assert self._cache is not None
         if reads_paged_kv(self.attn_implementation):
             context_lens = self._cache.context_lens_for(request_ids)
-            return self._cache.make_paged_decode_payload(slots, context_lens), None
+            payload = self._cache.make_paged_decode_payload(
+                slots, context_lens, self.splits_for_width(len(request_ids))
+            )
+            return payload, None
 
         # The cache's token counts already include this step's token, and they are
         # what addressed the slots above — so the mask is built from the same source.
@@ -185,6 +189,30 @@ class ContinuousModelRunner:
         return (
             self._cache.make_decode_payload(slots),
             build_decode(seq_total_lens, self.config.dtype, self.device),
+        )
+
+    def splits_for_width(self, batch_size: int) -> int:
+        """How many programs share one sequence's decode key loop at this batch width.
+
+        Chosen from ``max_model_len`` rather than from this step's context, so the
+        count is a function of the batch width alone. That is what a capture needs:
+        a CUDA graph bakes scalar kernel arguments in, while one capture serves
+        every context that fits its slot buffer — and it keeps the captured and
+        eager paths choosing the same grid for the same batch.
+
+        The cost is that a short context runs more splits than it would pick for
+        itself. Measured per layer at batch 1 against the count the context would
+        choose: 0.83x at 128 tokens, 1.32x at 256, 3.77x at 1,024, 4.47x at 4,096.
+        Only the first of those is a loss, and it is 0.9 us on a 6.1 ms step.
+        """
+        if self.config.paged_decode_splits is not None:
+            return self.config.paged_decode_splits
+        assert self.hf_config is not None
+        return choose_num_splits(
+            batch_size,
+            self.hf_config.num_key_value_heads,
+            self.config.max_model_len,
+            self.device.index or 0,
         )
 
     def _build_prefill_inputs(
@@ -229,6 +257,7 @@ class ContinuousModelRunner:
             device=self.device,
             max_num_seqs=self.config.max_num_seqs,
             max_model_len=self.config.max_model_len,
+            splits_for_width=self.splits_for_width,
         )
 
     # ------------------------------------------------------------------

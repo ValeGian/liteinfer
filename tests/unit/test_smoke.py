@@ -56,6 +56,15 @@ def test_engine_config_rejects_zero_max_model_len() -> None:
         EngineConfig(model="dummy", max_model_len=0)
 
 
+def test_engine_config_rejects_a_split_count_below_one() -> None:
+    with pytest.raises(ValueError):
+        EngineConfig(model="dummy", paged_decode_splits=0)
+
+
+def test_engine_config_leaves_the_split_count_to_the_kernel_by_default() -> None:
+    assert EngineConfig(model="dummy").paged_decode_splits is None
+
+
 def test_engine_config_accepts_defaults() -> None:
     cfg = EngineConfig(model="dummy")
     assert cfg.device == "auto"

@@ -26,7 +26,9 @@ _PROMPT_LENS = (6, 9, 4)
 _DECODE_STEPS = 24
 
 
-def _runner(model_dir: Path, *, capture: bool, max_num_seqs: int) -> ContinuousModelRunner:
+def _runner(
+    model_dir: Path, *, capture: bool, max_num_seqs: int, splits: int | None = None
+) -> ContinuousModelRunner:
     config = EngineConfig(
         model=str(model_dir),
         device="cuda",
@@ -34,6 +36,7 @@ def _runner(model_dir: Path, *, capture: bool, max_num_seqs: int) -> ContinuousM
         max_num_seqs=max_num_seqs,
         max_model_len=64,
         enable_cuda_graphs=capture,
+        paged_decode_splits=splits,
     )
     runner = ContinuousModelRunner(config)
     runner.load_model()
@@ -112,6 +115,36 @@ def test_a_narrowing_batch_captures_each_width_it_visits(tiny_llama_dir: Path):
     runner.decode(seqs)
 
     assert sorted(runner.captured_decode_widths) == [1, 2, 3]
+
+
+def test_a_replayed_split_decode_gives_the_same_tokens_as_an_eager_one(tiny_llama_dir: Path):
+    """The split count is a scalar, and a capture freezes scalars.
+
+    Four splits over contexts of 4 to 30 tokens means most programs hold one key
+    or none, and the graph was recorded at the shortest context of all — so this
+    generates past it. Divergence here would mean the count, or the emptiness of
+    a split, had been baked in where it should follow `context_lens`.
+    """
+    eager = _greedy_tokens(
+        _runner(tiny_llama_dir, capture=False, max_num_seqs=4, splits=4), _PROMPT_LENS
+    )
+    captured = _greedy_tokens(
+        _runner(tiny_llama_dir, capture=True, max_num_seqs=4, splits=4), _PROMPT_LENS
+    )
+
+    assert captured == eager
+
+
+def test_a_replayed_split_decode_matches_an_unsplit_one(tiny_llama_dir: Path):
+    """Splitting is a grid, not an answer: the captured forward must not notice."""
+    unsplit = _greedy_tokens(
+        _runner(tiny_llama_dir, capture=True, max_num_seqs=4, splits=1), _PROMPT_LENS
+    )
+    split = _greedy_tokens(
+        _runner(tiny_llama_dir, capture=True, max_num_seqs=4, splits=4), _PROMPT_LENS
+    )
+
+    assert split == unsplit
 
 
 def test_capture_is_off_when_a_gathering_kernel_is_pinned(tiny_llama_dir: Path):

@@ -128,15 +128,19 @@ class ContinuousKVCache:
         return _DecodePayload(self, slots)
 
     def make_paged_decode_payload(
-        self, slots: torch.Tensor, context_lens: torch.Tensor
+        self,
+        slots: torch.Tensor,
+        context_lens: torch.Tensor,
+        num_splits: int | None = None,
     ) -> _PagedDecodePayload:
         """Return a payload that hands the pool's addresses to the paged kernel.
 
         Same slot table as ``make_decode_payload``; the difference is that the
         K/V never leave the pool, so the kernel also needs to know where each
-        sequence's history ends.
+        sequence's history ends — and how many programs to cut that history
+        across, where the caller has an opinion.
         """
-        return _PagedDecodePayload(self, slots, context_lens)
+        return _PagedDecodePayload(self, slots, context_lens, num_splits)
 
     def advance(self, request_ids: list[str]) -> None:
         """Account for the token about to be decoded, allocating a block if needed."""
@@ -252,10 +256,12 @@ class _PagedDecodePayload:
         cache: ContinuousKVCache,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
+        num_splits: int | None = None,
     ) -> None:
         self._cache = cache
         self._slots = slots
         self._context_lens = context_lens
+        self._num_splits = num_splits
 
     def update(
         self,
@@ -266,4 +272,4 @@ class _PagedDecodePayload:
         """Store each sequence's decode token; return where the whole history lives."""
         self._cache.scatter(layer_idx, self._slots[:, -1:], key_states, value_states)
         key_pool, value_pool = self._cache.layer_storage(layer_idx)
-        return PagedKV(key_pool, value_pool, self._slots, self._context_lens)
+        return PagedKV(key_pool, value_pool, self._slots, self._context_lens, self._num_splits)

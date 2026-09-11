@@ -40,6 +40,7 @@ changes every step; only the paged kernel takes its bounds as a tensor.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import torch
 
@@ -123,10 +124,15 @@ class DecodeGraphs:
         device: torch.device,
         max_num_seqs: int,
         max_model_len: int,
+        splits_for_width: Callable[[int], int | None] = lambda _: None,
     ) -> None:
         self._model = model
         self._cache = cache
         self._max_num_seqs = max_num_seqs
+        # Per width, not per engine: a graph is captured per batch width, and the
+        # split count that fills the device at one width over-splits another —
+        # 21 programs per sequence at batch 1 against 1 from batch 12 up.
+        self._splits_for_width = splits_for_width
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._memory_pool = None
 
@@ -208,7 +214,9 @@ class DecodeGraphs:
     def _forward(self, batch_size: int) -> torch.Tensor:
         """The decode forward over the static buffers, at one batch width."""
         payload = self._cache.make_paged_decode_payload(
-            self._slots[:batch_size], self._context_lens[:batch_size]
+            self._slots[:batch_size],
+            self._context_lens[:batch_size],
+            self._splits_for_width(batch_size),
         )
         out = self._model(
             input_ids=self._input_ids[:batch_size],
