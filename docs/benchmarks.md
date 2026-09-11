@@ -1310,9 +1310,8 @@ Ordered by cost, largest first.
 | Gap | Measured | Root cause | Roadmap |
 |---|---|---|---|
 | 1.3x slower than vLLM per decode step | ITL 6.6 ms vs 5.2 ms; 1.86x the memory roofline vs vLLM's 1.47x | Unfused elementwise work — ~45 kernels per layer where ten would do | [§3.1](roadmap.md#31-fuse-the-forwards-elementwise-work) |
-| Decode is single-request-slow at narrow batches | paged attention is 7.73x per layer at B=32 but 2.27x at B=1 | One program per (sequence, KV head) leaves an 84-SM GPU idle at B=1 | [§2.7](roadmap.md#27-split-the-key-loop-when-the-batch-is-narrow) |
-| Prefill still gathers, pads and expands | not isolated; `_repeat_kv` and the prefill mask are unchanged | §2.3 addressed decode only | [§3.5](roadmap.md#35-broadcast-the-grouped-query-heads-instead-of-expanding-them), [§3.6](roadmap.md#36-pack-the-batch-instead-of-padding-it) |
-| Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Two-pass step when prefill and decode coexist | [§1.3](roadmap.md#13-chunked-prefill--single-pass-mixed-batching) |
+| Prefill pads, gathers and expands | **3.8-4.0x** the work of a packed pass at batch 32 on real prompt lengths, which pad 11.64x; the mask also costs flash, 4.11x on attention at 4,096 tokens | Left-padding to the batch's longest prompt, and an additive mask no flash kernel accepts | [§3.6](roadmap.md#36-pack-the-prefill-batch-instead-of-padding-it), [§3.5](roadmap.md#35-broadcast-the-grouped-query-heads-instead-of-expanding-them) |
+| Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Two-pass step when prefill and decode coexist | [§1.3](roadmap.md#13-one-forward-for-a-mixed-batch) |
 | KV-cache benefit unquantified across shapes | 1.21x at ISL 128 / OSL 256 only | Single measured shape, and not re-measurable: the no-cache and DynamicCache configs are `historical`, so the number is frozen at the engine of the day they were deleted | — |
 | No prefix-cache benefit | not measured | Prefix caching not implemented | [§2.2](roadmap.md#22-prefix-sharing) |
 
