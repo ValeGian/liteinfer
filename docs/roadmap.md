@@ -121,34 +121,29 @@ listed.
 
 ## 1. Batching and scheduling
 
-### 1.3 Chunked prefill / single-pass mixed batching
-- **Status.** `planned`
+### 1.3 One forward for a mixed batch
+- **Status.** `planned` — the stage the rest of the chain exists to reach.
+- **Stage 6 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
-- **Why.** The current continuous-batching step issues two separate
-  forward passes when newly admitted sequences (prefill) and running
-  sequences (decode) coexist: one prefill pass and one decode pass.
-  Chunked prefill merges both into a single forward pass by interleaving
-  prefill tokens and decode tokens in the same batch tensor. This halves
-  kernel launches in the common case and reduces TTFT for waiting
-  sequences.
-  It also bounds peak activation memory: a chunk size caps how many prefill
-  tokens enter one pass, so prompt length stops setting the size of the
-  largest allocation. That is the second half of the ISL 1024 failure
-  (`docs/benchmarks.md`, "Long prompts are liteinfer's weak shape") — §3.3
-  removes the score matrix, §1.3 caps what feeds it.
-- **Scope.** Requires a flash-attention-style kernel that accepts
-  per-sequence key-length metadata (block tables + variable query
-  lengths). `ContinuousModelRunner` grows a `mixed_step(prefill_seqs,
-  decode_seqs)` path; `AsyncLLMEngine._step` uses it. The two-pass path stays as
-  a fallback for the dense kernels.
-- **Pre-req.** §3.6, which is where the per-sequence length metadata comes from.
-  §2.3's kernel is the other half: it already takes per-sequence key lengths and
-  a slot table, so mixing prefill and decode in one pass is a question of giving
-  it more than one query per sequence.
+- **Why.** A step that admits new sequences while others decode issues **two**
+  forward passes, and each pass costs its own ~700 kernel launches whatever it
+  carries. Merging them halves that in the common case and lets a waiting request
+  start generating without waiting for a decode step to end. It also bounds peak
+  activation memory: a chunk size caps how many prefill tokens enter one pass, so
+  prompt length stops setting the largest allocation.
+- **Scope.** `ContinuousModelRunner.prefill`/`decode` become one `execute` over
+  the packed buffer. The scheduler already says what to run — §1.7 makes its
+  output `num_scheduled_tokens` per request — and the attention kernel already
+  takes per-request lengths once §2.10 gives it a query dimension. What is left
+  here is the runner: one input build, one forward, one sample.
+- **Pre-reqs.** §1.7 for the budget, §2.10 for the kernel, §3.6 and §2.9 for the
+  layout. Attacking this before them means building all four inside one PR.
 - **It costs some of §3.2, and §3.8 is the repair.** A mixed pass is not a uniform
-  decode batch, so the captured decode graph does not cover it — roughly one step
-  in eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
+  decode batch, so the captured graph does not cover it — roughly one step in
+  eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
   batches, which is what §3.8 exists to be.
+- **Parity test.** Greedy output identical to the two-pass engine on a workload
+  that forces admissions mid-generation, which is the case this exists to serve.
 
 ### 1.6 What is left of the loop outside the forward
 - **Status.** `planned` — follow-up to §1.5, and small.
@@ -168,6 +163,34 @@ listed.
 - **Size it first.** 4% of the loop is the whole prize, so this is worth doing
   only if it is genuinely small. Measure against `TimeBreakdown`'s stage timings
   rather than in isolation.
+
+### 1.7 Schedule a token budget, not a slot count
+- **Status.** `planned`
+- **Stage 4 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **PRs.** _none yet_
+- **Why.** `ContinuousScheduler` admits whole sequences until `max_num_seqs` slots
+  are full, so one 10,000-token prompt and one 17-token prompt cost the same slot
+  and the batch's work is whatever they happen to add up to. vLLM's scheduler has
+  no phases at all: each request carries `num_computed_tokens`, and every step
+  hands out `num_tokens - num_computed_tokens` clamped by a **token** budget. A
+  prompt too large for what is left is not deferred, it is *chunked* — which is
+  what stops a 16k-token buffer from overflowing when 200 requests are waiting.
+- **Scope.** `max_num_batched_tokens` alongside `max_num_seqs` — a token cap and a
+  slot cap, both binding. `ContinuousSchedulerOutput` becomes
+  `num_scheduled_tokens: dict[str, int]`, which replaces the `prefill_seqs` /
+  `decode_seqs` split with the one concept that covers both: a request with all
+  its prompt computed gets 1 token, a new one gets as many as the budget allows.
+- **Keep it two clamps and one dict.** vLLM's scheduler is 3,000 lines because it
+  also carries speculative decoding, LoRA, encoder budgets, preemption and
+  disaggregated KV. The mechanism worth borrowing is the first twenty lines of its
+  loop; the rest is why liteinfer exists.
+- **Land it without §1.3.** The runner can keep running two passes off the new
+  output — prefill the requests with more than one token scheduled, decode the
+  rest. That makes this stage shippable and reviewable on its own, and leaves
+  exactly one thing for §1.3 to change.
+- **Parity test.** Same greedy output as slot-based admission on the same arrival
+  order, and a prompt longer than the budget completes across several steps
+  instead of being refused.
 
 ---
 
@@ -210,6 +233,48 @@ listed.
   narrower domain than the kernel now serves.
 - **Measure it** per layer through a captured graph, five repeats and a minimum —
   the two traps in `docs/benchmarks.md` under §2.7 both bite at this scale.
+
+### 2.9 Address cache writes by token, not by right-aligned row
+- **Status.** `planned`
+- **Stage 3 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **PRs.** _none yet_
+- **Why.** `slot_table()` returns `[batch, max_total]`, right-aligned so it lines
+  up with the left-padding the masks expect. Once §3.6 packs the prefill inputs,
+  the write side has no rows to align — it has a flat run of tokens, each needing
+  one slot. Keeping a 2-D table to serve a 1-D write is the padding surviving its
+  own removal.
+- **Scope.** A `slot_mapping[total_tokens]` built from `query_start_loc` and each
+  request's `num_computed_tokens`, used by every write. Decode *reads* keep the
+  2-D table: `paged_decode` walks one row per sequence, and that is the one place
+  liteinfer deliberately differs from vLLM, which passes the block table and does
+  the `block_idx * block_size + offset` arithmetic inside the kernel.
+- **Build it on the host first.** vLLM computes its slot mapping in a Triton
+  kernel; ours is one `torch.repeat_interleave` plus an add. Port it to the device
+  only if it shows up in `TimeBreakdown` — §1.5 is the precedent for measuring
+  before assuming the host is the problem.
+- **Parity test.** The pool holds byte-identical K/V after a packed write and
+  after today's padded one, on the same batch.
+
+### 2.10 Paged attention with more than one query per sequence
+- **Status.** `planned` — the real engineering of the packed move.
+- **Stage 5 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **PRs.** _none yet_
+- **Why.** `paged_decode` assumes exactly one query per sequence: that is what
+  lets it read the whole history with no causal mask, and it is stated in the
+  module docstring. A mixed batch breaks the assumption — a prefill chunk brings
+  many queries *and* must attend to the prefix already in the pool. Without this
+  there is no single forward, so §1.3 stops here.
+- **Scope.** The kernel takes `query_start_loc` alongside `context_lens`, loops a
+  query block per request, and masks causally *within* that block while keeping
+  the unmasked read of everything before it. The split-K grid (§2.7) stays: a
+  decode row is the `q = 1` case of the same kernel, and the chooser already
+  returns 1 wherever the batch is wide.
+- **It is one kernel serving both**, which is the point. vLLM reaches the same
+  place through FlashAttention's varlen-with-block-table entry point; liteinfer
+  reaches it by giving the kernel it already owns a query dimension.
+- **Parity test.** Against `eager` on a batch mixing a 1-query row with a
+  many-query row, and against today's `paged_decode` on an all-decode batch,
+  which must stay bit-identical.
 
 ---
 
@@ -317,29 +382,46 @@ listed.
   each call. In the engine, **0.64x** — reverted. Bucketing the KV length to 64
   cuts 128 distinct shapes to 3 and reaches parity, not a win.
 
-### 3.6 Pack the batch instead of padding it
-- **Status.** `planned`
+### 3.6 Pack the prefill batch instead of padding it
+- **Status.** `planned` — the first stage that moves a number.
+- **Stage 2 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
-- **Why.** Prompts of different lengths are left-padded, so every attention call
-  needs an explicit additive mask to hide each row's pad prefix. That mask is
-  what keeps liteinfer off FlashAttention: PyTorch reports "Flash Attention does
-  not support non-null attn_mask", so SDPA falls to the memory-efficient
-  backend. Both tile the softmax, so §3.3's memory win is unaffected — but flash
-  is the faster of the two, and the padding also costs real compute on positions
-  that are thrown away. Verified: the same tensors with no mask and
-  `is_causal=True` make flash available.
-- **Scope.** Pack the batch as one flat token run plus cumulative sequence-length
-  offsets (`cu_seqlens`), the varlen entry point vLLM uses. Padding stops
-  existing, so `engine/attention_mask.py` has nothing to mask and `is_causal`
-  replaces it. Touches the runner's input builders, the cache's `slot_table`
-  right-alignment, and the null block, which exists to absorb padded positions.
-- **Unblocks.** §1.3 needs the same per-sequence length metadata to mix prefill
-  and decode in one pass, so this is its prerequisite as much as its own change.
-  It also buys flash over the memory-efficient backend for the padded case, and
-  stops computing on positions that are discarded. Note what it does *not* gate:
-  §3.5 turned out to be reachable without it, on a different backend.
+- **Why, measured.** `_build_prefill_inputs` left-pads a batch to its longest
+  prompt, so the pass computes `batch * max_len` positions to keep `sum(len)` of
+  them. On the length distribution of the corpus the benchmark datasets are cut
+  from — median **17** tokens, mean 74, p99 1,286, max 10,046 — that ratio is
+  2.41x at batch 4 and **11.64x at batch 32**, and the scheduler admits up to
+  `max_num_seqs` at once, so a burst pays it. In the engine, a padded batch of 32
+  against one pass over the same real tokens:
+
+  | real tokens | padded tokens | padded | one packed pass | |
+  |---:|---:|---:|---:|---:|
+  | 1,915 | 10,016 | 276.8 ms | 68.6 ms | **4.04x** |
+  | 3,477 | 21,024 | 574.2 ms | 151.0 ms | **3.80x** |
+  | 1,991 | 10,624 | 278.5 ms | 72.8 ms | **3.83x** |
+
+  The mask is the second cost. An additive float mask rules FlashAttention out —
+  `can_use_flash_attention` returns False with one, verified rather than quoted —
+  so a padded prefill lands on the memory-efficient backend. Same tensors, mask
+  against `is_causal`: 1.53x at 512 tokens, 3.27x at 2,048, **4.11x at 4,096**.
+- **The varlen entry point needs no new dependency.** `torch.ops.aten._flash_attention_forward`
+  takes `cu_seqlens` and returns true varlen flash. Checked on an A40 in bf16
+  against per-sequence SDPA over lengths `[17, 300, 1024, 5]`: **max abs diff 0.0**.
+  So this is a kernel *wrapper*, not a kernel project — `varlen` joins
+  `IMPLEMENTATIONS` the way `sdpa` did, with a per-sequence SDPA fallback for
+  where flash cannot run and `eager` still the reference both are checked against.
+- **Scope.** `_build_prefill_inputs` emits a flat `[total_tokens]` `input_ids` and
+  `positions` plus `query_start_loc`; the prefill payload writes K/V by per-token
+  slot rather than through the right-aligned table; `build_prefill_mask` stops
+  being called on this path. Decode is untouched — it is *already* packed, one
+  query per sequence — so §3.2's captures and §2.7's split count carry over
+  unchanged.
+- **Measure it** on §8.7's mixed-length shape in `latency` mode, reading TTFT. On
+  a fixed-length dataset the padding ratio is exactly 1.00 and this is worth
+  nothing, which is why §8.7 comes first.
 - **Parity test.** Greedy output unchanged on a variable-length batch, which is
-  the case padding exists to serve.
+  the case padding exists to serve, plus `varlen` against `eager` on the same
+  tensors.
 
 ### 3.8 Capture mixed batches by splitting the graph at attention
 - **Status.** `planned` — **low value today and not for a general reason**, which
@@ -385,6 +467,28 @@ listed.
   which runs into the same in-place pool write that measured 0.06x in §3.1 — or
   hand-partitioned capture of the non-attention spans. Neither is small; both are
   worth less than §1.4 until §1.3 exists.
+
+### 3.9 Retire the padded path
+- **Status.** `planned` — the closing stage; nothing to build, everything to delete.
+- **Stage 7 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **PRs.** _none yet_
+- **Why.** Padding is currently undone by five mechanisms that exist only to
+  cancel each other: left-padded inputs, a right-aligned slot table, a null block
+  absorbing pad positions, two mask builders, and two runner entry points. Once
+  §1.3 lands, every one of them has a packed equivalent and the engine keeps both.
+  Keeping a slower general path "just in case" is how the codebase stops being
+  readable.
+- **Scope.** Delete `build_prefill_mask` and the padded input builders, drop the
+  slot table's right-alignment and the null block if decode capture no longer
+  needs it, collapse `prefill()`/`decode()` into the single entry §1.3 leaves, and
+  then simplify what the choice left behind — a dispatcher with one entry is the
+  shape to look for.
+- **What stays.** `eager` and `sdpa` keep a packed per-sequence loop. They are the
+  correctness reference and the CPU path, not performance paths, and should not
+  pretend otherwise.
+- **The rule this follows** is "Shipping an improvement", step 6: confirm the
+  superseded configs' results are stored, flag them `historical`, delete the code,
+  then collapse the abstraction.
 
 ---
 
@@ -514,3 +618,22 @@ listed.
 - **Watch the pool.** vLLM sizes its own KV cache from `gpu_memory_utilization`;
   at a 16k budget the two engines must be given the same ceiling or the row
   measures the cache, not the decode.
+
+### 8.7 A dataset whose prompts are not all the same length
+- **Status.** `planned` — nothing else in the packed chain can be measured until this exists.
+- **Stage 1 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **PRs.** _none yet_
+- **Why.** Every dataset is a run of fixed-size windows cut from one token
+  stream, so every prompt in a run is the same length and left-padding wastes
+  **exactly nothing**. §3.6 would measure 1.00x on the whole matrix and look
+  worthless. On the real length distribution of the same corpus — median 17,
+  mean 74, p99 1,286 — padding a batch of 32 costs 11.64x the positions. The
+  benchmark is currently measuring the one workload where the bug is invisible.
+- **Scope.** A dataset mode that samples whole turns rather than cutting windows,
+  keeping the corpus's own length spread, plus the `BenchmarkConfig` rows that use
+  it. `filename_for` needs a shape name that says "mixed" rather than an ISL.
+- **It also fixes a claim.** `docs/benchmarks.md` reports TTFT against vLLM on
+  fixed-length prompts only; neither engine has been measured where prompt
+  lengths vary, which is what production traffic is.
+- **Parity test.** The generated file's length distribution matches the corpus's
+  within a tolerance, so a run cannot silently become fixed-length again.
