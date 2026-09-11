@@ -123,7 +123,7 @@ listed.
 
 ### 1.3 One forward for a mixed batch
 - **Status.** `planned` — the stage the rest of the chain exists to reach.
-- **Stage 6 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 6 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** A step that admits new sequences while others decode issues **two**
   forward passes, and each pass costs its own ~700 kernel launches whatever it
@@ -166,7 +166,7 @@ listed.
 
 ### 1.7 Schedule a token budget, not a slot count
 - **Status.** `planned`
-- **Stage 4 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 4 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** `ContinuousScheduler` admits whole sequences until `max_num_seqs` slots
   are full, so one 10,000-token prompt and one 17-token prompt cost the same slot
@@ -236,7 +236,7 @@ listed.
 
 ### 2.9 Address cache writes by token, not by right-aligned row
 - **Status.** `planned`
-- **Stage 3 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 3 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** `slot_table()` returns `[batch, max_total]`, right-aligned so it lines
   up with the left-padding the masks expect. Once §3.6 packs the prefill inputs,
@@ -257,7 +257,7 @@ listed.
 
 ### 2.10 Paged attention with more than one query per sequence
 - **Status.** `planned` — the real engineering of the packed move.
-- **Stage 5 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 5 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** `paged_decode` assumes exactly one query per sequence: that is what
   lets it read the whole history with no causal mask, and it is stated in the
@@ -384,7 +384,7 @@ listed.
 
 ### 3.6 Pack the prefill batch instead of padding it
 - **Status.** `planned` — the first stage that moves a number.
-- **Stage 2 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 2 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why, measured.** `_build_prefill_inputs` left-pads a batch to its longest
   prompt, so the pass computes `batch * max_len` positions to keep `sum(len)` of
@@ -470,7 +470,7 @@ listed.
 
 ### 3.9 Retire the padded path
 - **Status.** `planned` — the closing stage; nothing to build, everything to delete.
-- **Stage 7 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** Padding is currently undone by five mechanisms that exist only to
   cancel each other: left-padded inputs, a right-aligned slot table, a null block
@@ -618,22 +618,3 @@ listed.
 - **Watch the pool.** vLLM sizes its own KV cache from `gpu_memory_utilization`;
   at a 16k budget the two engines must be given the same ceiling or the row
   measures the cache, not the decode.
-
-### 8.7 A dataset whose prompts are not all the same length
-- **Status.** `planned` — nothing else in the packed chain can be measured until this exists.
-- **Stage 1 of the packed-batch move**, which runs §8.7 → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
-- **PRs.** _none yet_
-- **Why.** Every dataset is a run of fixed-size windows cut from one token
-  stream, so every prompt in a run is the same length and left-padding wastes
-  **exactly nothing**. §3.6 would measure 1.00x on the whole matrix and look
-  worthless. On the real length distribution of the same corpus — median 17,
-  mean 74, p99 1,286 — padding a batch of 32 costs 11.64x the positions. The
-  benchmark is currently measuring the one workload where the bug is invisible.
-- **Scope.** A dataset mode that samples whole turns rather than cutting windows,
-  keeping the corpus's own length spread, plus the `BenchmarkConfig` rows that use
-  it. `filename_for` needs a shape name that says "mixed" rather than an ISL.
-- **It also fixes a claim.** `docs/benchmarks.md` reports TTFT against vLLM on
-  fixed-length prompts only; neither engine has been measured where prompt
-  lengths vary, which is what production traffic is.
-- **Parity test.** The generated file's length distribution matches the corpus's
-  within a tolerance, so a run cannot silently become fixed-length again.

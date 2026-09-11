@@ -13,7 +13,7 @@ from typing import Literal
 
 from benchmarks import adapters, stats
 from benchmarks.configs import BenchmarkConfig
-from benchmarks.dataset import Dataset
+from benchmarks.dataset import Dataset, shape_slug
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -40,10 +40,10 @@ class Result:
 
     @property
     def filename(self) -> str:
-        return (
-            f"{self.config.name}__{self.mode}"
-            f"__isl{self.dataset.target_isl}_osl{self.dataset.target_osl}.json"
+        shape = shape_slug(
+            self.dataset.target_isl, self.dataset.target_osl, self.dataset.max_isl
         )
+        return f"{self.config.name}__{self.mode}__{shape}.json"
 
     def as_dict(self) -> dict:
         return {
@@ -60,6 +60,7 @@ class Result:
                 "path": str(self.dataset_path),
                 "target_isl": self.dataset.target_isl,
                 "target_osl": self.dataset.target_osl,
+                "max_isl": self.dataset.max_isl,
                 "num_samples": len(self.dataset.samples),
                 "sha256": self.dataset.sha256,
             },
