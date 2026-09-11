@@ -60,6 +60,8 @@ class PagedKV(NamedTuple):
     """``[batch, max_context]`` physical slot per logical position, right-aligned."""
     context_lens: torch.Tensor
     """``[batch]`` real cached tokens per sequence — where each row's history ends."""
+    num_splits: int | None = None
+    """How many programs share each sequence's key loop; None lets the kernel choose."""
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -153,6 +155,7 @@ def paged_attention(
         kv.context_lens,
         scaling,
         num_kv_groups,
+        num_splits=kv.num_splits,
     )
     return attn_output.unsqueeze(2)
 

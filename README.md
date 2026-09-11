@@ -184,6 +184,16 @@ remains is arithmetic rather than overhead: liteinfer's kernels are 1.9× off th
 memory roofline where vLLM's whole step is 1.5× off, and that is fusion —
 [`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including three
 optimisations that were built, measured and reverted.
+
+**One of those reverts came back.** Split-K decode lost by 6% in #34 because the
+extra kernel launch it adds per layer cost more than the kernel saved, on a step
+that was then 47% host time. A captured step is 97.5% GPU, so the same kernel now
+pays: at one request and a 15,360-token context the decode step is **12.0 → 7.5 ms
+(1.6×)**, and at ISL 3584 it is 7.8 → 6.7 ms. The win grows with context because a
+single request's attention runs on 8 programs of an 84-SM device and that is the
+part of the step context lengthens — 2% of a short step, 65% of a 32k one. At
+ISL 128 it is 1.00×, and from 12 concurrent sequences up the batch already fills
+the device and the kernel is the unsplit one.
 Throughput figures are certified against `vllm bench throughput` to within 1%. Full tables, methodology, and per-milestone deltas:
 [`docs/benchmarks.md`](docs/benchmarks.md) · [live dashboard](https://valegian.github.io/liteinfer/).
 

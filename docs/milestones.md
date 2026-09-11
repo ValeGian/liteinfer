@@ -4,6 +4,28 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 11-09-2026 — §2.7 The split key loop wins once the step is GPU-bound
+
+- **PRs.** [#39](https://github.com/ValeGian/liteinfer/pull/39)
+- **What.** Split-K decode was built, measured at **0.94x** in the engine and reverted in [#34](https://github.com/ValeGian/liteinfer/pull/34). The kernel is unchanged; the step it runs in is not. Before §3.2 a batch-1 decode step was 13.8 ms of which 7.35 ms was GPU — 47% host — so the one extra launch per layer cost more than a 7x kernel saved. Captured, the same step is **7.41 ms of which 7.23 ms is GPU**, and the paged decode kernel is 1.37 ms of it. The saving is now the step's.
+- **Measured, batch 1, both halves of every row in one session on one revision.**
+
+  | latency, B=1 | graphs | split-K | |
+  |---|---:|---:|---:|
+  | ITL p50, ISL 128 / OSL 256 | 6.5 ms | 6.5 ms | 1.00x |
+  | ITL p50, ISL 3584 / OSL 128 | 7.8 ms | **6.7 ms** | **1.16x** |
+  | ITL p50, ISL 15360 / OSL 128 | 12.0 ms | **7.5 ms** | **1.61x** |
+  | e2e p50, ISL 15360 / OSL 128 | 3,493.4 ms | **2,912.9 ms** | 1.20x |
+
+- **The benchmark matrix was hiding the case.** At batch 1 the unsplit kernel walks the context one 64-token tile at a time on 8 programs, so attention's share of the step grows with context while the rest does not — 2% at 200 tokens, 18% at 3.6k, 49% at 16k, **65% at 32k**. Every stored latency row stopped at ISL 3584 because `max_model_len` did, which is why this looked like a narrow-batch change worth 1.16x rather than a long-context one worth 1.61x. The matrix now carries a 15,360-token shape.
+- **The ceiling was computed before the kernel was wired in**, which is the rule the first attempt paid to learn: predicted 1.01x / 1.16x / 1.67x from attention's profiled share times the per-layer speedup, measured 1.00x / 1.16x / 1.61x.
+- **The scalar a graph bakes in was the filed blocker, and it resolves by construction.** `num_splits` is a scalar kernel argument and a capture freezes scalars. It never varies within a graph: the bound it is chosen from is `slot_table.shape[1]`, and under capture that table is one fixed `[max_num_seqs, max_model_len]` buffer. No capture is keyed by context and `_MAX_CAPTURES` is untouched. What a capture *does* change is which count a short context runs — measured per layer at batch 1, a pinned 21 splits is identical to the chooser's answer from 256 tokens up and **0.83x at 128**, which is 0.9 us on a 6.1 ms step and never reached the engine.
+- **What it cost.** Nothing above the noise. TTFT does not move — prefill delegates to `sdpa`. Throughput is untouched by construction: the chooser returns 1 from batch 12 up, so every wide row runs the identical unsplit grid and none needed re-running.
+- **It joins rather than replaces.** Split-K applies only where the batch cannot fill the device; from batch 12 up it *is* the unsplit kernel, so there is no workload the single pass stops serving. `EngineConfig.paged_decode_splits` pins the count, and every row stored before this change is pinned to 1 so it keeps describing the grid it was measured on.
+- **Left open.** §2.8 — the chooser's two constants were fitted to a sweep that stopped at 4,096 tokens and the kernel now runs at 32k. §8.6 — the 16k rows have no vLLM reference, because comparing them to a 128-token row would measure the prompt.
+
+---
+
 ## 10-09-2026 — §1.5 The loop stops paying per sequence for work nobody reads
 
 - **PRs.** [#38](https://github.com/ValeGian/liteinfer/pull/38)

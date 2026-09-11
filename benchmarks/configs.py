@@ -30,6 +30,11 @@ class BenchmarkConfig:
     """Off by default for the same reason: every row stored before §3.2 was
     measured launching the decode forward kernel by kernel, and must go on
     meaning that."""
+    paged_decode_splits: int | None = 1
+    """Programs sharing one sequence's decode key loop. One by default for the
+    same reason again: every row stored before §2.7 ran the unsplit grid, and a
+    stored number has to keep describing the grid it was measured on. `None`
+    hands the choice to the kernel, which is what the split rows measure."""
     baseline: str | None = None
     historical: bool = False
     """Measured before the code was removed. Kept so the report still shows the
@@ -135,6 +140,38 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         attn_implementation="paged",
         enable_cuda_graphs=True,
         description="Captured decode at 128 concurrent sequences",
+    ),
+    # --- liteinfer: split the decode key loop when the batch is narrow (§2.7) ---
+    BenchmarkConfig(
+        name="liteinfer-splitk",
+        engine="liteinfer",
+        max_num_seqs=32,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        paged_decode_splits=None,
+        baseline="liteinfer-graphs",
+        description="Captured decode, narrow batches splitting their key loop across programs",
+    ),
+    # --- liteinfer: the same pair past the 4,096-token context the matrix stopped at ---
+    BenchmarkConfig(
+        name="liteinfer-graphs-16k",
+        engine="liteinfer",
+        max_num_seqs=8,
+        max_model_len=16384,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        description="Captured decode with a 16k context budget, one program per KV head",
+    ),
+    BenchmarkConfig(
+        name="liteinfer-splitk-16k",
+        engine="liteinfer",
+        max_num_seqs=8,
+        max_model_len=16384,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        paged_decode_splits=None,
+        baseline="liteinfer-graphs-16k",
+        description="Split decode where attention is most of the step: long context, narrow batch",
     ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(

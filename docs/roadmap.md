@@ -194,81 +194,22 @@ listed.
 - **Risk.** Quality regression on long contexts; needs a tolerance
   parity test against fp16/bf16.
 
-### 2.7 Split the key loop when the batch is narrow
-- **Status.** `planned` — built, measured at **0.94x** in the engine, and reverted.
-  Follow-up to §2.3.
-- **Unblocked by §3.2**, which landed. Split-K lost only because it added one
-  launch per layer to a step that paid 18.7 us per launch; inside a capture that
-  cost is gone and its GPU win — up to 7.15x per layer — is what is left. One
-  caveat the second attempt has to carry: `num_splits` is a **scalar** kernel
-  argument, and a graph bakes scalars in while the chooser varies the count with
-  context. So it must be pinned per capture rather than chosen per step, which is
-  the one thing the reverted implementation does not already do.
-- **PRs.** [#34](https://github.com/ValeGian/liteinfer/pull/34) — built, measured, reverted.
-- **Why.** The paged kernel runs one program per (sequence, KV head), which is
-  256 programs at B=32 and **8** at B=1 — on an A40's 84 SMs, a single-request
-  decode leaves most of the GPU idle. Measured per layer at 8 KV heads, 32 query
-  heads, bf16: 2.27x at B=1 against 7.73x at B=32, same context. The fix is
-  flash-decoding's: split each sequence's keys across several programs, each
-  producing a partial softmax, and combine them in a second pass.
-- **Scope.** A `num_splits` chosen from batch width and context so the grid
-  always covers the device, partial `[batch, heads, splits, head_dim]` output
-  plus its log-sum-exp, and a combine step.
-- **What it bought on the GPU.** All of it. Per layer, unsplit against a chooser
-  fitted to a sweep of `num_splits` over batch width and context, timed through a
-  captured CUDA graph:
-
-  | context | B=1 | B=2 | B=4 | B=8 | B≥12 |
-  |---:|---:|---:|---:|---:|---:|
-  | 128 | 1.00x | 1.00x | 1.00x | 1.00x | 1.00x |
-  | 256 | **1.42x** | 1.35x | 1.14x | 0.94x | 1.00x |
-  | 512 | **2.24x** | 1.92x | 1.52x | 1.13x | 1.00x |
-  | 1024 | **3.45x** | 2.77x | 1.95x | 1.12x | 1.00x |
-  | 4096 | **7.15x** | 3.44x | 1.76x | 1.06x | 1.00x |
-
-  The 1.00x entries are the unsplit pass, chosen: from B=12 up the grid already
-  holds two programs per SM, and below four key tiles there is less sequential
-  work than the combine pass costs to add. Profiled in the engine the saving
-  survives — GPU kernel time per decode step falls **7.35 → 6.31 ms** at B=1 and
-  3,645 tokens of context, the 1.04 ms the component number predicts.
-- **And the engine got slower anyway, at every shape.** The same profile counts
-  **695 → 711 kernel launches** per step: one extra per layer. That is what the
-  step actually costs, because at B=1 only 7.35 ms of a 12.8 ms step is GPU work
-  and the rest is host. Measured, `liteinfer-paged-attn` against the same engine
-  with splitting enabled:
-
-  | latency, B=1 | ISL 128 / OSL 256 | ISL 3584 / OSL 128 |
-  |---|---:|---:|
-  | ITL p50, unsplit | 13.4 ms | 13.8 ms |
-  | ITL p50, split | **14.2 ms** | **14.3 ms** |
-  | | 0.94x | 0.97x |
-  | e2e p50 | 3,431.6 → 3,629.8 ms | 1,921.6 → 1,986.7 ms |
-
-  ISL 3584 is the most favourable shape reachable under `max_model_len` 4096 — the
-  context where the kernel is 7x faster — and it still loses 3%. `decode()` timed
-  directly agrees: 12.83/13.51 ms unsplit against 13.99/14.24 ms split, and the
-  same ordering when the split run goes first, so it is not run-order bias.
-  Throughput is untouched by construction: at B=32 the chooser returns 1 and the
-  pass is byte-identical.
-- **Why it is §3.2 that unblocks it.** The extra launch is only expensive because
-  the forward pays host cost per launch — `paged_decode` costs 74 us of host time
-  per call against 11.8 us of GPU work, and Triton's own dispatch is most of that.
-  A captured graph replays the launches with no host work between them, which is
-  exactly the condition under which the GPU column above becomes the step. So the
-  order is §3.2 first, then this: the component measurement here is the estimate
-  of what §3.2 would then be worth at B=1.
-- **What it says about §3.2's own number.** §3.2 measured 1.06x at B=32, where a
-  step has real GPU work in it. At B=1 the same step is 43% idle across ~700
-  launches, and nothing has measured graphs there. That is a bigger prize than
-  the one §3.2's entry currently claims, and it is measured on the wrong batch
-  width.
-- **The implementation is in the history of the PR that filed this measurement**
-  ([#34](https://github.com/ValeGian/liteinfer/pull/34)). Roughly 400 lines: two
-  grids sharing one online-softmax device function, a combine kernel, a chooser
-  fitted to the sweep, and 14 tests including a split-count sweep against the
-  dense reference. `docs/benchmarks.md` carries the analysis and the two
-  measurement traps that nearly set the policy from noise.
-- **Measure it in `latency` mode**, which is the only mode that runs at B=1.
+### 2.8 Re-fit the split chooser past 4,096 tokens
+- **Status.** `planned` — follow-up to §2.7, and small.
+- **PRs.** _none yet_
+- **Why.** `_TARGET_PROGRAMS_PER_SM` and `_MAX_SPLITS` were fitted to a sweep that
+  stopped at 4,096 tokens, because `max_model_len` did. §2.7 then measured the
+  kernel at 16k and 32k, where the chooser returns the same 21 splits it returns
+  at 4k — the cap is not binding and the target is not re-derived, so whether 21
+  is still the right answer over 256 key tiles is unmeasured. Per layer at batch 1
+  the unsplit pass is 368.6 us at 16k against 64.6 split, so a further 10% there is
+  worth about as much as the whole win at ISL 3584.
+- **Scope.** Re-run the `num_splits` sweep at 8k, 16k and 32k, and at the KV-head
+  counts a larger model brings (Llama-3-8B is 8 heads, 70B is 8 over more layers).
+  The chooser's shape is fine; it is the two constants that were fitted on a
+  narrower domain than the kernel now serves.
+- **Measure it** per layer through a captured graph, five repeats and a minimum —
+  the two traps in `docs/benchmarks.md` under §2.7 both bite at this scale.
 
 ---
 
@@ -559,3 +500,17 @@ listed.
   variance is about ±4%. Within a run that holds; between sessions the same
   configuration has read 13.4 to 19.9 ms at ISL 3584. Whatever this measures
   should replace that number with a measured one.
+
+### 8.6 A long-context vLLM reference row
+- **Status.** `planned`
+- **PRs.** _none yet_
+- **Why.** §2.7's win lands at 15,360 tokens, and the vLLM rows stop at ISL 2048 —
+  so `liteinfer-splitk-16k` is the first liteinfer row with no reference point.
+  Comparing it to a 128-token vLLM row would measure the prompt, not the engine,
+  and the report is right to print nothing there. Whether vLLM's long-context
+  decode is faster than 7.5 ms is simply unknown.
+- **Scope.** A `vllm-16k` entry matched to `liteinfer-graphs-16k` on batch width
+  and `max_model_len`, run on the ISL 15360 dataset that now exists.
+- **Watch the pool.** vLLM sizes its own KV cache from `gpu_memory_utilization`;
+  at a 16k budget the two engines must be given the same ceiling or the row
+  measures the cache, not the decode.

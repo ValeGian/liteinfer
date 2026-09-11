@@ -41,6 +41,13 @@ class EngineConfig:
     # `engine/cuda_graphs.py`.
     enable_cuda_graphs: bool | None = None
 
+    # How many programs share one sequence's decode key loop under the paged
+    # kernel, or None to choose from the batch width, the context bound and the
+    # device. Splitting buys the parallelism a narrow batch cannot supply;
+    # pinning it is what lets a benchmark row keep measuring one grid. See
+    # `models/paged_decode.py`.
+    paged_decode_splits: int | None = None
+
     collect_stats: bool = True
 
     # KV block pool.
@@ -61,6 +68,8 @@ class EngineConfig:
             raise ValueError("block_size must be >= 1")
         if self.max_waiting_seqs < 1:
             raise ValueError("max_waiting_seqs must be >= 1")
+        if self.paged_decode_splits is not None and self.paged_decode_splits < 1:
+            raise ValueError("paged_decode_splits must be >= 1")
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
         if self.attn_implementation is not None:

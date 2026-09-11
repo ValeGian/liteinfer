@@ -127,3 +127,32 @@ def test_the_profile_payload_hands_back_what_it_was_given():
     kv = ProfilePayload().update(key_states, value_states, _LAYER)
 
     assert kv.keys is key_states
+
+
+def test_paged_payload_hands_the_kernel_a_pinned_split_count():
+    """How many programs share the key loop travels with the addresses.
+
+    The kernel chooses for itself when the engine has no opinion; pinning the
+    count is what lets a benchmark row keep measuring one shape of the grid, so
+    the value has to survive the trip from the config to the launch.
+    """
+    cache, request_ids = _two_sequences_mid_decode()
+    payload = cache.make_paged_decode_payload(
+        cache.slot_table_for(request_ids), cache.context_lens_for(request_ids), num_splits=4
+    )
+
+    kv = payload.update(*_decode_token(len(request_ids)), _LAYER)
+
+    assert kv.num_splits == 4
+
+
+def test_paged_payload_leaves_the_split_count_to_the_kernel_by_default():
+    """`None` is "choose from the batch width and the device", which is the engine default."""
+    cache, request_ids = _two_sequences_mid_decode()
+    payload = cache.make_paged_decode_payload(
+        cache.slot_table_for(request_ids), cache.context_lens_for(request_ids)
+    )
+
+    kv = payload.update(*_decode_token(len(request_ids)), _LAYER)
+
+    assert kv.num_splits is None
