@@ -1149,6 +1149,103 @@ then over real generations covering emoji, CJK, Arabic, accents and a
 40-character word — both through the incremental detokeniser step by step and
 against a whole-sequence decode.
 
+### The same kernel wins once the step is GPU-bound (§2.7)
+
+Split-K decode was built, measured at **0.94x** in the engine and reverted in #34.
+Nothing about the kernel changed here. What changed is the step it runs in.
+
+**The precondition, measured rather than assumed.** Profiled on `master` at batch
+1 and 3,680 tokens of context, with the decode forward replayed from a graph:
+
+| | ms / step | share |
+|---|---:|---:|
+| step wall | 7.411 | — |
+| GPU | 7.226 | **97.5% of wall** |
+| `_paged_decode_kernel`, 16 calls | 1.366 | 18.9% of GPU |
+
+Before §3.2 the same step was 13.8 ms of which 7.35 ms was GPU — 47% host, which
+is why an extra launch per layer cost more than a 7x kernel saved. A captured
+graph replays those launches with no host work between them, so the extra launch
+is now nearly free and the kernel saving is the step saving.
+
+**The ceiling was computed before anything was written**, which is the rule the
+first attempt paid to learn. Attention's share of a captured B=1 step, and what
+the measured per-layer speedup predicts of it:
+
+| context | step ms | attn ms | attn share | per-layer x | predicted |
+|---:|---:|---:|---:|---:|---:|
+| 200 | 6.14 | 0.12 | 2% | 1.00x | 1.01x |
+| 3,656 | 7.56 | 1.36 | 18% | 4.49x | 1.16x |
+| 8,264 | 9.23 | 3.01 | 33% | 5.25x | 1.36x |
+| 16,456 | 12.19 | 5.92 | 49% | 5.75x | 1.67x |
+| 32,840 | 18.11 | 11.74 | 65% | 6.00x | 2.26x |
+
+**`max_model_len` 4,096 was hiding the case.** At batch 1 the unsplit kernel
+traverses the context one 64-token tile at a time on 8 programs, so attention's
+share grows with context while the rest of the step does not: 2% at 200 tokens,
+**65% at 32k**. This is a long-context change that looks like a narrow-batch
+change, and the benchmark matrix stopped short of where it applies. The matrix now
+carries a 15,360-token shape.
+
+**The scalar a graph bakes in resolves by construction.** The roadmap filed this
+as the caveat that a revival had to answer: `num_splits` is a scalar kernel
+argument, a capture freezes scalars, and the count varies with context. It does
+not vary, because the bound it is chosen from is `slot_table.shape[1]` — and under
+capture that table is one fixed `[max_num_seqs, max_model_len]` buffer. Every
+replay of a graph wants the count that graph recorded. No capture is keyed by
+context, and `_MAX_CAPTURES` is untouched.
+
+What a capture does change is *which* count a short context runs: the one
+`max_model_len` asked for, not the one its own length would pick. Measured per
+layer at batch 1, 21 splits pinned against the chooser's answer for each context:
+
+| context | unsplit | pinned 21 | |
+|---:|---:|---:|---:|
+| 128 | 4.2 us | 5.1 us | **0.83x** |
+| 256 | 6.7 | 5.1 | 1.32x |
+| 1,024 | 22.0 | 5.8 | 3.77x |
+| 4,096 | 93.9 | 21.0 | 4.47x |
+| 16,384 | 368.6 | 64.6 | 5.71x |
+
+Only the first row is a loss, and it is 0.9 us per layer on a 6.1 ms step. The
+count a short context would rather have is not worth a second graph to hold it.
+Splits that fall past a sequence's keys contribute no weight — the `-inf`
+log-sum-exp and the guarded denominator were already there, and the pinned count
+is what makes that path routine rather than an edge case.
+
+**In the engine**, both halves of every row re-measured in one session on one
+revision:
+
+| latency, B=1 | graphs | split-K | |
+|---|---:|---:|---:|
+| ITL p50, ISL 128 / OSL 256 | 6.5 ms | 6.5 ms | 1.00x |
+| ITL p50, ISL 3584 / OSL 128 | 7.8 ms | **6.7 ms** | **1.16x** |
+| ITL p50, ISL 15360 / OSL 128 | 12.0 ms | **7.5 ms** | **1.61x** |
+| e2e p50, ISL 15360 / OSL 128 | 3,493.4 ms | **2,912.9 ms** | 1.20x |
+| TTFT p50, ISL 15360 / OSL 128 | 1,963.1 ms | 1,962.5 ms | — |
+
+Predicted 1.01x / 1.16x / 1.67x from the component numbers before the kernel was
+wired in; measured 1.00x / 1.16x / 1.61x.
+
+**What it cost.** Nothing that showed above the noise. TTFT does not move, because
+prefill delegates to `sdpa` and is untouched. Throughput is untouched *by
+construction*: the chooser returns 1 from batch 12 up, so `liteinfer-graphs-b128`
+and every other wide row runs the identical unsplit grid and needed no re-run.
+The 0.83x at 128 tokens is real but did not reach the engine — the ISL 128 row is
+1.00x, not 0.99x.
+
+**It joins rather than replaces.** Split-K applies where the batch cannot fill the
+device, which is batch 1 to 8; from 12 up it *is* the unsplit kernel. There is no
+workload where the split grid supersedes the single pass, so both stay, chosen by
+the precondition. `paged_decode_splits` pins the count so a stored row keeps
+measuring the grid it was measured on, and every row from before this change is
+pinned to 1.
+
+**The 16k pair has no vLLM column.** The reference rows were measured at ISL 128
+to 2048; comparing a 15,360-token liteinfer row against a 128-token vLLM one would
+measure the prompt, not the engine. Whether vLLM's own long-context decode is
+faster is unmeasured and stays that way until a matched row exists.
+
 ### A stable run is not a comparable one
 
 Two latency rows from the §1.5 re-measurement came back saying `paged-attn` was
