@@ -117,6 +117,35 @@ def test_a_narrowing_batch_captures_each_width_it_visits(tiny_llama_dir: Path):
     assert sorted(runner.captured_decode_widths) == [1, 2, 3]
 
 
+def test_the_split_count_does_not_follow_the_context(tiny_llama_dir: Path):
+    """What makes one capture per width enough.
+
+    A graph bakes scalar kernel arguments in, so a count chosen from this step's
+    context would be frozen at the context the graph was recorded at and wrong
+    for every step after. The policy reads `max_model_len` instead, so generating
+    must not move it.
+    """
+    runner = _runner(tiny_llama_dir, capture=True, max_num_seqs=4)
+    before = runner.splits_for_width(1)
+    _greedy_tokens(runner, (5,))
+
+    assert runner.splits_for_width(1) == before
+
+
+def test_a_narrow_batch_is_split_more_finely_than_a_wide_one(tiny_llama_dir: Path):
+    """The count is per width because the device fills at different widths."""
+    runner = _runner(tiny_llama_dir, capture=True, max_num_seqs=4)
+
+    assert runner.splits_for_width(1) >= runner.splits_for_width(4)
+
+
+def test_a_pinned_split_count_overrides_the_policy(tiny_llama_dir: Path):
+    """A stored benchmark row has to keep measuring the grid it was measured on."""
+    runner = _runner(tiny_llama_dir, capture=True, max_num_seqs=4, splits=1)
+
+    assert runner.splits_for_width(1) == 1
+
+
 def test_a_replayed_split_decode_gives_the_same_tokens_as_an_eager_one(tiny_llama_dir: Path):
     """The split count is a scalar, and a capture freezes scalars.
 
