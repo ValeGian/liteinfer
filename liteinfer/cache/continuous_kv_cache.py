@@ -36,8 +36,8 @@ from typing import Protocol
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, slot_table
-from liteinfer.models.attention import DenseKV, PagedKV
+from liteinfer.cache.block_pool import BlockPool, slot_mapping, slot_table
+from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
 
 
 class KVPayload(Protocol):
@@ -117,6 +117,18 @@ class ContinuousKVCache:
         """Return a payload for one prefill forward pass over ``request_ids``."""
         return _PrefillPayload(self, request_ids, prompt_lens)
 
+    def make_packed_prefill_payload(
+        self, request_ids: list[str], prompt_lens: list[int]
+    ) -> _PackedPrefillPayload:
+        """Return a payload for prompts laid end to end rather than left-padded.
+
+        Same writes as `make_prefill_payload` — every real token lands in the slot
+        its block table names — addressed by a flat mapping instead of a padded,
+        right-aligned table. What changes for the kernel is what comes back:
+        boundaries to respect rather than padding to mask.
+        """
+        return _PackedPrefillPayload(self, request_ids, prompt_lens)
+
     def make_decode_payload(self, slots: torch.Tensor) -> _DecodePayload:
         """Return a payload for one decode forward pass reading ``slots``.
 
@@ -152,6 +164,15 @@ class ContinuousKVCache:
     # ------------------------------------------------------------------
     # Internal helpers shared by payloads
     # ------------------------------------------------------------------
+
+    def slot_mapping_for(self, request_ids: list[str], counts: list[int]) -> torch.Tensor:
+        """One slot per real token, for a packed pass. See `block_pool.slot_mapping`."""
+        return slot_mapping(
+            [self._block_tables[r] for r in request_ids],
+            counts,
+            self._pool.block_size,
+            self._pool.device,
+        )
 
     def slot_table_for(self, request_ids: list[str]) -> torch.Tensor:
         """Physical slot of every cached token for these sequences."""
@@ -218,6 +239,53 @@ class _PrefillPayload:
         # two line up column for column; padding lands in the null block.
         self._cache.scatter(layer_idx, self._slots, key_states, value_states)
         return DenseKV(key_states, value_states)
+
+
+class _PackedPrefillPayload:
+    """Prefill payload for a batch packed end to end, with no padding anywhere.
+
+    The padded sibling above leans on two alignments cancelling: prompts arrive
+    left-padded, the slot table is right-aligned, so the two line up column for
+    column. Here there is nothing to cancel — token `i` of the flat run belongs
+    to whichever sequence `cu_seqlens` says, and writes go to the slot the
+    mapping names.
+    """
+
+    def __init__(
+        self,
+        cache: ContinuousKVCache,
+        request_ids: list[str],
+        prompt_lens: list[int],
+    ) -> None:
+        self._cache = cache
+        self._request_ids = request_ids
+        self._prompt_lens = prompt_lens
+        self._slots = torch.empty(0, dtype=torch.long)
+        self._cu_seqlens = torch.empty(0, dtype=torch.int32)
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> VarlenKV:
+        """Store every prompt token; return the K/V this pass computed, plus the boundaries."""
+        if layer_idx == 0:
+            for req_id, prompt_len in zip(self._request_ids, self._prompt_lens, strict=True):
+                self._cache._token_counts[req_id] = prompt_len
+            self._slots = self._cache.slot_mapping_for(self._request_ids, self._prompt_lens)
+            self._cu_seqlens = _cumulative_lengths(self._prompt_lens, self._cache._pool.device)
+
+        self._cache.scatter(layer_idx, self._slots, key_states, value_states)
+        return VarlenKV(key_states, value_states, self._cu_seqlens, max(self._prompt_lens))
+
+
+def _cumulative_lengths(lengths: list[int], device: torch.device) -> torch.Tensor:
+    """`[0, l0, l0 + l1, ...]` as int32, which is the layout the flash kernel reads."""
+    boundaries = [0]
+    for length in lengths:
+        boundaries.append(boundaries[-1] + length)
+    return torch.tensor(boundaries, dtype=torch.int32, device=device)
 
 
 class _DecodePayload:

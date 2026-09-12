@@ -1,0 +1,28 @@
+{
+  "config": "liteinfer-graphs-mixed",
+  "engine": "liteinfer",
+  "description": "Captured decode with a padded prefill, at a mixed dataset's context budget",
+  "baseline": null,
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-09-12T09:19:05+00:00",
+  "revision": "01af1c1-dirty",
+  "dataset": {
+    "path": "benchmarks/datasets/islmixed2048_osl128_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": null,
+    "target_osl": 128,
+    "max_isl": 2048,
+    "num_samples": 200,
+    "sha256": "d3de8f4e6ec9fb683be98e3316da7affe078e382b47d7b63dcf379259ba5f14e"
+  },
+  "summary": {
+    "output_tokens_per_s": 2016.8820753235939,
+    "requests_per_s": 15.756891213465577,
+    "wall_time_s": 12.692859098315239
+  },
+  "raw": {
+    "wall_time_s": 12.692859098315239,
+    "output_tokens": 25600
+  }
+}

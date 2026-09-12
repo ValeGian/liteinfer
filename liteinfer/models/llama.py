@@ -261,13 +261,15 @@ class LlamaForCausalLM(nn.Module):
         position_ids: torch.LongTensor,
         past_key_values: Cache,
         attention_mask: torch.Tensor,
-        logits_positions: slice | None = None,
+        logits_positions: slice | torch.Tensor | None = None,
     ) -> CausalLMOutput:
         """Run the model and project the selected positions to vocabulary logits.
 
         `logits_positions` says which positions need logits; `None` computes them
         all, which is what a language model is expected to do and what the
-        `transformers` parity tests compare against.
+        `transformers` parity tests compare against. A padded batch wants the same
+        column from every row, which is a slice; a packed one wants a different
+        index per sequence, which is a tensor of them.
 
         Passing `models.LAST_POSITION` instead is not a micro-optimisation. The head's
         output is `batch x positions x vocab`, which at batch 8 and a 2,048-token
