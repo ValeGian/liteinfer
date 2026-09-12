@@ -33,6 +33,19 @@ few tokens (max deviation 3, mean 0.34 at ISL=128); each sample records the
 length it actually has. Every result stores the SHA-256 of its prompt set, and
 the report flags any group whose members disagree.
 
+**Two dataset shapes, because a fixed length hides one whole class of cost.**
+A fixed-ISL dataset gives every prompt in a run the same length, which isolates
+one shape — and makes left-padding free, since a batch padded to its longest
+prompt wastes nothing when every prompt *is* the longest. Every liteinfer number
+on this page was measured that way, so nothing here says what padding costs.
+A **mixed** dataset (`--isl mixed`) keeps whole corpus turns instead and carries
+the spread real traffic has: median 18 tokens, p99 1,567, capped at 2,048 so a
+run still fits the configs' `max_model_len`. On it, a batch of 32 computes
+**13.4x** the positions it keeps. Use mixed for batching, padding and scheduling
+work; use a fixed ISL for kernels, where a varying prompt length is noise rather
+than the subject. The shape is part of a result's filename and part of the key
+the report groups by, so the two are never compared against each other.
+
 **Forced output length.** `min_tokens = max_tokens = OSL` with `ignore_eos`, so
 output-length variance can never be mistaken for an engine difference. Lengths
 are verified after every run; a run that violates this fails instead of

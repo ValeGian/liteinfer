@@ -4,6 +4,26 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 11-09-2026 — §8.7 A dataset whose prompts are not all the same length
+
+- **PRs.** [#41](https://github.com/ValeGian/liteinfer/pull/41)
+- **What.** Every dataset was a run of consecutive fixed-size windows cut from one token stream, so every prompt in a run held exactly `target_isl` tokens. That isolates a shape, which is what a kernel measurement wants — and it makes left-padding **free**, because a batch padded to its longest prompt wastes nothing when every prompt is the longest. The benchmark was measuring the one workload where padding costs nothing, and the packed-batch chain (§3.6 onward) would have reported 1.00x across the matrix however well it worked.
+- **`--isl mixed` keeps whole turns instead**, so a run carries the corpus's own spread. Generated, 200 prompts: median **18** tokens, mean 60, p99 1,567, max 1,829 — against the corpus's own median 17 and mean 74, the difference being the `--max-isl` cap. What that buys is a workload where the cost is visible:
+
+  | batch | padded positions / real | wasted |
+  |---:|---:|---:|
+  | 4 | 2.37x | 58% |
+  | 8 | 4.08x | 75% |
+  | 16 | 7.18x | 86% |
+  | 32 | **13.36x** | **93%** |
+
+- **The cap is part of the shape, not a footnote.** Turns reach 10,046 tokens and the configs declare `max_model_len` 4,096, so a mixed run needs a ceiling; 2,048 sits past the corpus's p99 and leaves room for the output tokens. Two caps are two workloads, so `max_isl` travels in the filename (`islmixed2048_osl128_…`), in the stored result, and in the key the report groups by — a ratio can no longer be drawn across them. Turns longer than the cap are skipped rather than truncated, which would pile mass at the cap and report a spread the corpus does not have.
+- **Whole turns also make the recorded length exact.** A windowed prompt is decoded back to text, and the round-trip moves its length by a few tokens; a turn is taken as it stands, so `input_tokens` is what the engine will see.
+- **What the report had to learn.** A shape is now `(target_isl, target_osl, max_isl)` with `None` meaning mixed, which plain tuple sorting cannot compare — mixed columns sort last, because they are a different workload rather than the long end of a trend, and render as `mix2048/128`. Results written before this carry no `max_isl` and read back as `None`, which is what a fixed ISL means.
+- **What it did not need.** The roadmap item expected new `BenchmarkConfig` rows; a dataset is a `--dataset` argument, not a config field, so every existing config runs against the mixed shape unchanged. Smoke-checked end to end: `liteinfer-graphs` on the mixed dataset reads ITL p50 6.5 ms with **TTFT p50 15.2 ms against p99 97.0** — the spread the fixed-ISL rows cannot show, and the thing §3.6 exists to attack.
+
+---
+
 ## 11-09-2026 — §2.7 The split key loop wins once the step is GPU-bound
 
 - **PRs.** [#39](https://github.com/ValeGian/liteinfer/pull/39)

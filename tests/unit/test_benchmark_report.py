@@ -55,6 +55,33 @@ def test_results_split_by_benchmark_shape() -> None:
     assert len(report.group([_throughput("a", 10.0), other])) == 2
 
 
+def test_two_mixed_runs_with_different_caps_are_different_shapes() -> None:
+    """Different caps hold different prompts, so a ratio across them compares workloads."""
+    narrow = _throughput("a", 10.0, dataset={"target_isl": None, "max_isl": 512})
+    wide = _throughput("a", 10.0, dataset={"target_isl": None, "max_isl": 2048})
+
+    assert len(report.group([narrow, wide])) == 2
+
+
+def test_a_result_written_before_mixed_shapes_still_groups() -> None:
+    """Stored results carry no `max_isl`, and a fixed ISL has no cap to carry."""
+    stored = _throughput("a", 10.0)
+
+    assert "max_isl" not in stored["dataset"] and report.shape_of(stored) == (16, 8, None)
+
+
+def test_a_mixed_shape_is_labelled_by_its_cap() -> None:
+    """A reader must not mistake a mixed column for a prompt length."""
+    assert report._shape_label((None, 128, 2048)) == "mix2048/128"
+
+
+def test_mixed_shapes_sort_after_fixed_ones() -> None:
+    """Mixed is a different workload, not the long end of a trend."""
+    shapes = [(None, 128, 2048), (3584, 128, None), (128, 256, None)]
+
+    assert sorted(shapes, key=report._shape_order)[-1] == (None, 128, 2048)
+
+
 # --- vs base ----------------------------------------------------------------
 
 
@@ -196,13 +223,13 @@ def test_text_reports_an_empty_results_dir() -> None:
 def test_shapes_are_collected_across_results() -> None:
     long_prompt = _throughput("liteinfer-continuous", 900.0, dataset={"target_isl": 1024})
     shapes, _ = report.by_shape([_throughput("liteinfer-continuous", 1200.0), long_prompt], "throughput")
-    assert shapes == [(16, 8), (1024, 8)]
+    assert shapes == [(16, 8, None), (1024, 8, None)]
 
 
 def test_each_config_reports_its_value_per_shape() -> None:
     long_prompt = _throughput("liteinfer-continuous", 900.0, dataset={"target_isl": 1024})
     _, values = report.by_shape([_throughput("liteinfer-continuous", 1200.0), long_prompt], "throughput")
-    assert values["liteinfer-continuous"] == {(16, 8): 1200.0, (1024, 8): 900.0}
+    assert values["liteinfer-continuous"] == {(16, 8, None): 1200.0, (1024, 8, None): 900.0}
 
 
 def test_a_single_shape_produces_no_trend_section() -> None:

@@ -40,6 +40,21 @@ MODE_NOTE = {
 _ORDER = {name: index for index, name in enumerate(CONFIGS)}
 
 
+Shape = tuple[int | None, int, int | None]
+"""(target ISL or None for mixed, target OSL, the cap a mixed run admits)."""
+
+
+def shape_of(result: dict) -> Shape:
+    """The workload a result describes, which is what results may be grouped by.
+
+    `max_isl` is part of it: two mixed runs with different caps hold different
+    prompts, so a ratio across them would compare two workloads. Results written
+    before mixed shapes existed carry no `max_isl`, and `None` is what they mean.
+    """
+    data = result["dataset"]
+    return (data["target_isl"], data["target_osl"], data.get("max_isl"))
+
+
 def load_results(results_dir: str | Path) -> list[dict]:
     return [
         json.loads(path.read_text(encoding="utf-8"))
@@ -47,15 +62,18 @@ def load_results(results_dir: str | Path) -> list[dict]:
     ]
 
 
+def _sorted_groups(results: list[dict]) -> list[tuple[tuple, list[dict]]]:
+    """Groups in reading order. A mixed shape holds `None`, which plain sorting cannot compare."""
+    return sorted(
+        group(results).items(),
+        key=lambda item: (item[0][0], item[0][1], _shape_order(item[0][2:])),
+    )
+
+
 def group(results: list[dict]) -> dict[tuple, list[dict]]:
     grouped: dict[tuple, list[dict]] = {}
     for result in results:
-        key = (
-            result["mode"],
-            result["model"],
-            result["dataset"]["target_isl"],
-            result["dataset"]["target_osl"],
-        )
+        key = (result["mode"], result["model"], *shape_of(result))
         grouped.setdefault(key, []).append(result)
     return grouped
 
@@ -200,24 +218,46 @@ def rows(members: list[dict], mode: str) -> list[Row]:
     return scored
 
 
-def by_shape(results: list[dict], mode: str) -> tuple[list[tuple[int, int]], dict[str, dict]]:
-    """Headline metric per config across every measured (ISL, OSL) shape.
+def _isl_label(data: dict) -> str:
+    """What a shape's prompts are, in words a reader can act on."""
+    if data["target_isl"] is not None:
+        return str(data["target_isl"])
+    return f"mixed, up to {data.get('max_isl')}"
+
+
+def _shape_label(shape: Shape) -> str:
+    target_isl, target_osl, max_isl = shape
+    return f"{f'mix{max_isl}' if target_isl is None else target_isl}/{target_osl}"
+
+
+def _shape_order(shape: Shape) -> tuple:
+    """Fixed shapes by prompt length, then the mixed ones.
+
+    Mixed sits last because it is a different workload rather than a longer one,
+    and a reader scanning left to right should not read it as the end of a trend.
+    """
+    target_isl, target_osl, max_isl = shape
+    return (target_isl is None, target_isl or max_isl or 0, target_osl)
+
+
+def by_shape(results: list[dict], mode: str) -> tuple[list[Shape], dict[str, dict]]:
+    """Headline metric per config across every measured shape.
 
     A ratio measured at one shape says nothing about another, so when several
     shapes exist the report shows the trend rather than leaving them as
     unrelated tables.
     """
     key, _, _ = COLUMNS[mode][0]
-    shapes: set[tuple[int, int]] = set()
-    values: dict[str, dict[tuple[int, int], float]] = {}
+    shapes: set[Shape] = set()
+    values: dict[str, dict[Shape, float]] = {}
     for result in results:
         if result["mode"] != mode:
             continue
-        shape = (result["dataset"]["target_isl"], result["dataset"]["target_osl"])
+        shape = shape_of(result)
         shapes.add(shape)
         values.setdefault(result["config"], {})[shape] = result["summary"][key]
     ordered = sorted(values, key=lambda name: _ORDER.get(name, len(_ORDER)))
-    return sorted(shapes), {name: values[name] for name in ordered}
+    return sorted(shapes, key=_shape_order), {name: values[name] for name in ordered}
 
 
 def _mismatched(members: list[dict]) -> bool:
@@ -241,10 +281,12 @@ def as_text(results: list[dict]) -> str:
     if not results:
         return "No results found."
     lines: list[str] = []
-    for (mode, model, isl, osl), members in sorted(group(results).items()):
+    for (mode, model, *shape), members in _sorted_groups(results):
+        osl = shape[1]
         columns = COLUMNS[mode]
         lines.append(
-            f"\n{mode}  |  {model.split('/')[-1]}  |  ISL={isl} OSL={osl}"
+            f"\n{mode}  |  {model.split('/')[-1]}"
+            f"  |  ISL={_isl_label(members[0]['dataset'])} OSL={osl}"
             f"  |  {members[0]['dataset']['num_samples']} prompts"
         )
         if _mismatched(members):
@@ -275,7 +317,7 @@ def as_text(results: list[dict]) -> str:
             continue
         _, head_label, _ = COLUMNS[mode][0]
         lines.append(f"\n{mode} across shapes  |  {head_label}")
-        header = f"{'config':<27}" + "".join(f"{f'{i}/{o}':>13}" for i, o in shapes)
+        header = f"{'config':<27}" + "".join(f"{_shape_label(s):>13}" for s in shapes)
         lines.append(header)
         lines.append("-" * len(header))
         for name, per_shape in values.items():
@@ -312,7 +354,7 @@ def as_text(results: list[dict]) -> str:
 
 
 def _groups(results: list[dict]):
-    return [(members, key[0]) for key, members in sorted(group(results).items())]
+    return [(members, key[0]) for key, members in _sorted_groups(results)]
 
 
 def _is_historical(row: Row) -> bool:
@@ -443,7 +485,7 @@ def _facts(results: list[dict]) -> str:
     return (
         '<div class="facts">'
         f"<span>model <b>{html.escape(first['model'].split('/')[-1])}</b></span>"
-        f"<span>ISL <b>{first['dataset']['target_isl']}</b></span>"
+        f"<span>ISL <b>{_isl_label(first['dataset'])}</b></span>"
         f"<span>OSL <b>{first['dataset']['target_osl']}</b></span>"
         f"<span>prompts <b>{' / '.join(str(c) for c in counts)}</b></span>"
         f"<span>decoding <b>greedy, forced length</b></span>"
@@ -457,9 +499,11 @@ def as_html(results: list[dict], title: str = "liteinfer benchmarks") -> str:
         body = "<p>No results yet. Run <code>bench run --all</code>.</p>"
     else:
         sections = [_facts(results)]
-        for (mode, model, isl, osl), members in sorted(group(results).items()):
+        for (mode, model, *shape), members in _sorted_groups(results):
+            osl = shape[1]
             sections.append(
-                f"<h2>{mode} · {html.escape(model.split('/')[-1])} · ISL={isl} OSL={osl}</h2>"
+                f"<h2>{mode} · {html.escape(model.split('/')[-1])} · "
+                f"ISL={html.escape(_isl_label(members[0]['dataset']))} OSL={osl}</h2>"
                 f'<p class="meta">{MODE_NOTE[mode]} '
                 f"{members[0]['dataset']['num_samples']} prompts, forced output length {osl}. "
                 f"Prompt set {members[0]['dataset']['sha256'][:12]}.</p>"
@@ -472,7 +516,10 @@ def as_html(results: list[dict], title: str = "liteinfer benchmarks") -> str:
             if len(shapes) < 2:
                 continue
             _, head_label, _ = COLUMNS[mode][0]
-            head = "".join(f"<th>{i}&thinsp;/&thinsp;{o}</th>" for i, o in shapes)
+            head = "".join(
+                f"<th>{html.escape(_shape_label(s)).replace('/', '&thinsp;/&thinsp;')}</th>"
+                for s in shapes
+            )
             body_rows = []
             for name, per_shape in values.items():
                 cells = "".join(

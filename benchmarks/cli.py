@@ -24,6 +24,11 @@ DEFAULT_RESULTS_DIR = "benchmarks/results"
 DEFAULT_DATASET_DIR = "benchmarks/datasets"
 
 
+def _isl(value: str) -> int | None:
+    """`--isl 128` asks for prompts of that length; `--isl mixed` asks for the corpus's spread."""
+    return None if value == "mixed" else int(value)
+
+
 def _cmd_dataset(args: argparse.Namespace) -> int:
     path = dataset.generate(
         model=args.model,
@@ -31,6 +36,7 @@ def _cmd_dataset(args: argparse.Namespace) -> int:
         target_osl=args.osl,
         num_samples=args.num_samples,
         output_dir=args.out,
+        max_isl=args.max_isl,
     )
     print(f"Wrote {path}")
     return 0
@@ -206,8 +212,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     make = sub.add_parser("dataset", help="Generate a canonical dataset")
     make.add_argument("--model", required=True)
-    make.add_argument("--isl", type=int, required=True)
+    make.add_argument("--isl", type=_isl, required=True, help="tokens per prompt, or 'mixed'")
     make.add_argument("--osl", type=int, required=True)
+    make.add_argument(
+        "--max-isl",
+        type=int,
+        default=dataset.DEFAULT_MAX_MIXED_ISL,
+        help="longest prompt a mixed dataset admits; ignored for a fixed ISL",
+    )
     make.add_argument("-n", "--num-samples", type=int, default=200)
     make.add_argument("--out", default=DEFAULT_DATASET_DIR)
     make.set_defaults(func=_cmd_dataset)

@@ -21,6 +21,29 @@ bench run --all --dataset "$DS" --mode latency    -n 200
 bench report --out docs/index.html
 ```
 
+### Two dataset shapes, and when each one lies
+
+`--isl 128` gives every prompt in a run the same length, which isolates one
+shape and is what a kernel measurement wants. It also makes left-padding free:
+a batch padded to its longest prompt wastes nothing when every prompt is the
+longest. Anything that attacks padding measures **1.00x** on these datasets no
+matter how well it works.
+
+`--isl mixed` keeps whole corpus turns instead, so the run carries the length
+spread real traffic has — median 18 tokens, p99 1,567, capped by `--max-isl`
+(default 2,048) so a run still fits the `max_model_len` the configs declare.
+On that dataset a batch of 32 computes **13.4x** the positions it keeps.
+
+```bash
+bench dataset --model meta-llama/Llama-3.2-1B-Instruct --isl mixed --osl 128 -n 200
+# -> benchmarks/datasets/islmixed2048_osl128_n200_....json
+```
+
+Use mixed for anything about batching, padding or scheduling; use a fixed ISL
+for anything about kernels, where a varying prompt length is noise rather than
+the subject. Results carry the shape in their filename either way, and the
+report never compares across shapes.
+
 Sweep a grid of shapes — a speedup measured at one shape is a claim about that
 shape only:
 
