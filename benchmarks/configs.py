@@ -188,7 +188,10 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         enable_packed_prefill=True,
         paged_decode_splits=None,
         baseline="liteinfer-graphs-mixed",
-        description="Prefill as one flat token run; measure it on a mixed-length dataset",
+        description=(
+            "Prefill as one flat token run, where FlashAttention's varlen entry can run: "
+            "CUDA, half precision, paged kernel. Measure it on a mixed-length dataset"
+        ),
     ),
     # The baseline it improves on: the same engine with the batch padded, at the
     # context budget a mixed dataset needs (2,048 cap plus its output tokens).

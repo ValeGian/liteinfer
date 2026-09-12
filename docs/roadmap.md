@@ -451,7 +451,17 @@ listed.
   shape to look for.
 - **What stays.** `eager` and `sdpa` keep a packed per-sequence loop. They are the
   correctness reference and the CPU path, not performance paths, and should not
-  pretend otherwise.
+  pretend otherwise. `eager` in particular is the oracle the fused kernels are
+  checked against, and it is what caught §3.6 attending across prompt boundaries
+  when no benchmark did.
+- **Price the loop before landing it, because it is not free.** A per-sequence
+  loop wastes launches where padding wastes arithmetic, and at short prompts the
+  launches cost more. Measured on 32 mixed prompts, padded batch against one
+  forward per sequence: **273.2 ms vs 448.5** and 276.5 vs 426.9 where the longest
+  prompt was ~320 tokens, but 571.2 vs **456.0** where it was 657. So retiring the
+  padded layout makes the dense paths slower on exactly the workloads they serve
+  — short prompts, many of them — unless the loop is replaced by something
+  better. Say what it costs rather than discovering it afterwards.
 - **The rule this follows** is "Shipping an improvement", step 6: confirm the
   superseded configs' results are stored, flag them `historical`, delete the code,
   then collapse the abstraction.

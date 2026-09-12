@@ -1306,6 +1306,31 @@ no such batch until §8.7. Decode is untouched either way — it is already pack
 one query per sequence — so §3.2's captures and §2.7's split counts carry over
 unchanged, and nothing in the latency tables moves.
 
+**Why the padded path stays, which is not "for safety".** Packing joins rather
+than replaces, because it has three preconditions and each one has a real
+occupant: FlashAttention is CUDA-only, so CPU installs keep the dense path; it
+computes in half precision, and the kernel-parity e2e tests run **float32** on
+purpose, because that is what makes `eager`, `sdpa` and `paged` agree to a tight
+tolerance; and only the paged implementation dispatches on the payload type, so
+a Triton-less install never reaches the varlen kernel.
+
+Where those fail, packing is not merely unavailable — it would be *worse*. A
+packed batch without a varlen kernel can only be attended per sequence, one
+forward's worth of launches each, or under a block-diagonal mask that costs
+O(total²) memory and rules flash out anyway. Measured, 32 mixed prompts prefilled
+as a padded batch against the same prompts one at a time:
+
+| real tokens | longest prompt | padded batch | per sequence | |
+|---:|---:|---:|---:|---:|
+| 1,915 | 313 | **273.2 ms** | 448.5 ms | padded wins |
+| 1,991 | 332 | **276.5 ms** | 426.9 ms | padded wins |
+| 3,477 | 657 | 571.2 ms | **456.0 ms** | the loop wins |
+
+Which one wins depends on the spread: padding wastes arithmetic, a loop wastes
+launches, and at these prompt lengths the launches usually cost more. That is
+the trade a fallback would be making, and it is why the fallback is the padded
+batch rather than a packed loop.
+
 **What the varlen entry point is.** `torch.ops.aten._flash_attention_forward`,
 which is what PyTorch's own SDPA calls once it has decided flash applies. Going
 through it directly is what lets the call carry `cu_seqlens`; SDPA's public
