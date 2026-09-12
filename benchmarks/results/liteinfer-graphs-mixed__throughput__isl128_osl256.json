@@ -6,8 +6,8 @@
   "mode": "throughput",
   "model": "unsloth/Llama-3.2-1B-Instruct",
   "max_num_seqs": 32,
-  "timestamp": "2026-09-12T09:21:41+00:00",
-  "revision": "01af1c1-dirty",
+  "timestamp": "2026-09-12T09:44:46+00:00",
+  "revision": "16a85ab-dirty",
   "dataset": {
     "path": "benchmarks/datasets/isl128_osl256_n200_unsloth_llama_3_2_1b_instruct.json",
     "target_isl": 128,
@@ -17,12 +17,12 @@
     "sha256": "d97d71495aff03159e2deb9e9a6e918dc6698b03311bd955a7d6f8b306273cb8"
   },
   "summary": {
-    "output_tokens_per_s": 3366.0379606205092,
-    "requests_per_s": 13.148585783673864,
-    "wall_time_s": 15.210761316120625
+    "output_tokens_per_s": 3371.203256292194,
+    "requests_per_s": 13.168762719891383,
+    "wall_time_s": 15.187455667182803
   },
   "raw": {
-    "wall_time_s": 15.210761316120625,
+    "wall_time_s": 15.187455667182803,
     "output_tokens": 51200
   }
 }

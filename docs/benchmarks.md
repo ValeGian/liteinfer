@@ -1259,6 +1259,72 @@ to 2048; comparing a 15,360-token liteinfer row against a 128-token vLLM one wou
 measure the prompt, not the engine. Whether vLLM's own long-context decode is
 faster is unmeasured and stays that way until a matched row exists.
 
+### The prefill batch stops being padded (§3.6)
+
+A prefill batch was left-padded to its longest prompt, so the pass computed
+`len(seqs) * max(prompt_lens)` positions to keep `sum(prompt_lens)` of them and
+then built a mask to hide the difference. §8.7's mixed-length dataset is what
+makes that visible: on it a batch of 32 computes **13.36x** the positions it
+keeps, where on every fixed-ISL dataset in this file the ratio is exactly 1.00.
+
+**The ceiling first, from the engine's own stats.** `EngineStats` already splits
+prefill wall from decode wall, so what packing can address is prefill's share of
+the run — and that share falls as OSL grows, because decode is untouched:
+
+| OSL | prefill wall | decode wall | prefill share | ceiling |
+|---:|---:|---:|---:|---:|
+| 16 | 5.41 s | 1.59 s | **77.2%** | 3.50x |
+| 128 | 5.37 s | 6.78 s | **44.2%** | 1.69x |
+
+**Measured**, both halves of every row in one session on one revision:
+
+| throughput, mixed ≤2048 | padded | packed | |
+|---|---:|---:|---:|
+| OSL 128 | 2,009.2 tok/s | **3,336.5** | **1.66x** |
+| wall | 12.7 s | **7.7 s** | |
+| OSL 16 | 504.5 tok/s | **2,422.2** | **4.80x** |
+| wall | 6.3 s | **1.3 s** | |
+
+**The OSL 16 row beat its own ceiling, and the gap is the point.** 3.50x was
+computed from padded positions alone — remove 13.36x of arithmetic, keep the
+rest. Packing removes three other things at the same time: the additive mask
+(which no flash kernel accepts, so a padded prefill runs on the
+memory-efficient backend — 3.27x slower at 2,048 tokens), the `_repeat_kv` copy
+of K and V per query head, and the `max_model_len`-shaped attention the mask
+implies. A ceiling built from one of four costs is a floor for the other three.
+
+**And it costs nothing where there is nothing to remove.** The same pair on a
+fixed-ISL dataset, where every prompt is the same length:
+
+| throughput, ISL 128 / OSL 256 | padded | packed | |
+|---|---:|---:|---:|
+| | 3,371.2 tok/s | 3,367.3 | **1.00x** |
+
+That row is the one worth keeping in mind when reading the other two: this is a
+change to how a *batch of varying lengths* is laid out, and the matrix measured
+no such batch until §8.7. Decode is untouched either way — it is already packed,
+one query per sequence — so §3.2's captures and §2.7's split counts carry over
+unchanged, and nothing in the latency tables moves.
+
+**What the varlen entry point is.** `torch.ops.aten._flash_attention_forward`,
+which is what PyTorch's own SDPA calls once it has decided flash applies. Going
+through it directly is what lets the call carry `cu_seqlens`; SDPA's public
+signature has nowhere to put them. It is a private op, so its answer is pinned
+against `eager` on mixed lengths, on grouped-query heads, and on the boundary
+case — two sequences in one run must give the same answer as one sequence run
+alone.
+
+**The bug this shipped with, for one commit.** `VarlenKV` names its fields
+`keys` and `values` exactly as the dense payloads do, so `eager_attention`
+accepted a packed batch: it attended across the boundary between two prompts
+and, with no mask, across each prompt's own future. It returned plausible
+tokens rather than raising. The e2e parity suite caught it — liteinfer answered
+"the capital of France is the capital of France is" where `transformers` answered
+"Paris" — which is exactly the failure a parity test against a reference
+implementation exists to catch, and which no benchmark would ever have shown.
+Packing is now gated on the kernel as well as the device (`handles_packed_prefill`),
+and the dense kernels reject a packed batch loudly rather than misreading it.
+
 ### A stable run is not a comparable one
 
 Two latency rows from the §1.5 re-measurement came back saying `paged-attn` was
@@ -1323,7 +1389,7 @@ Ordered by cost, largest first.
 | Gap | Measured | Root cause | Roadmap |
 |---|---|---|---|
 | 1.3x slower than vLLM per decode step | ITL 6.6 ms vs 5.2 ms; 1.86x the memory roofline vs vLLM's 1.47x | Unfused elementwise work — ~45 kernels per layer where ten would do | [§3.1](roadmap.md#31-fuse-the-forwards-elementwise-work) |
-| Prefill pads, gathers and expands | **3.8-4.0x** the work of a packed pass at batch 32 on real prompt lengths, which pad 11.64x; the mask also costs flash, 4.11x on attention at 4,096 tokens | Left-padding to the batch's longest prompt, and an additive mask no flash kernel accepts | [§3.6](roadmap.md#36-pack-the-prefill-batch-instead-of-padding-it), [§3.5](roadmap.md#35-broadcast-the-grouped-query-heads-instead-of-expanding-them) |
+| Prefill is two passes when a batch mixes admission with decode | not isolated; a step that admits while others decode issues one forward for each | The runner has a `prefill` and a `decode` entry, and nothing that mixes them | [§1.3](roadmap.md#13-one-forward-for-a-mixed-batch) |
 | Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Two-pass step when prefill and decode coexist | [§1.3](roadmap.md#13-one-forward-for-a-mixed-batch) |
 | KV-cache benefit unquantified across shapes | 1.21x at ISL 128 / OSL 256 only | Single measured shape, and not re-measurable: the no-cache and DynamicCache configs are `historical`, so the number is frozen at the engine of the day they were deleted | — |
 | No prefix-cache benefit | not measured | Prefix caching not implemented | [§2.2](roadmap.md#22-prefix-sharing) |

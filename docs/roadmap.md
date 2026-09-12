@@ -123,7 +123,7 @@ listed.
 
 ### 1.3 One forward for a mixed batch
 - **Status.** `planned` — the stage the rest of the chain exists to reach.
-- **Stage 6 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 6 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ (both landed) → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** A step that admits new sequences while others decode issues **two**
   forward passes, and each pass costs its own ~700 kernel launches whatever it
@@ -166,7 +166,7 @@ listed.
 
 ### 1.7 Schedule a token budget, not a slot count
 - **Status.** `planned`
-- **Stage 4 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 4 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ (both landed) → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** `ContinuousScheduler` admits whole sequences until `max_num_seqs` slots
   are full, so one 10,000-token prompt and one 17-token prompt cost the same slot
@@ -236,28 +236,32 @@ listed.
 
 ### 2.9 Address cache writes by token, not by right-aligned row
 - **Status.** `planned`
-- **Stage 3 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 3 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ (both landed) → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** `slot_table()` returns `[batch, max_total]`, right-aligned so it lines
-  up with the left-padding the masks expect. Once §3.6 packs the prefill inputs,
-  the write side has no rows to align — it has a flat run of tokens, each needing
-  one slot. Keeping a 2-D table to serve a 1-D write is the padding surviving its
-  own removal.
-- **Scope.** A `slot_mapping[total_tokens]` built from `query_start_loc` and each
-  request's `num_computed_tokens`, used by every write. Decode *reads* keep the
-  2-D table: `paged_decode` walks one row per sequence, and that is the one place
-  liteinfer deliberately differs from vLLM, which passes the block table and does
-  the `block_idx * block_size + offset` arithmetic inside the kernel.
-- **Build it on the host first.** vLLM computes its slot mapping in a Triton
-  kernel; ours is one `torch.repeat_interleave` plus an add. Port it to the device
-  only if it shows up in `TimeBreakdown` — §1.5 is the precedent for measuring
-  before assuming the host is the problem.
-- **Parity test.** The pool holds byte-identical K/V after a packed write and
-  after today's padded one, on the same batch.
+  up with the left-padding the masks expect. §3.6 landed `slot_mapping()` beside
+  it — one slot per real token, sequences end to end — but only prefill writes
+  through it. Decode still writes through the padded table, so the engine carries
+  both layouts and the right-alignment survives the padding it existed for.
+- **What is left.** The decode write path, which stores one token per sequence
+  and reads `self._slots[:, -1:]` — the last column of a right-aligned table,
+  which is exactly the convention this removes. In packed terms that write is
+  `slot_mapping` over a batch where every count is 1.
+- **Scope.** Decode's payload takes a flat mapping; `slot_table` keeps serving
+  decode *reads*, because `paged_decode` walks one row per sequence, and that is
+  the one place liteinfer deliberately differs from vLLM, which passes the block
+  table and does the `block_idx * block_size + offset` arithmetic inside the
+  kernel. The right-alignment then only exists for those reads, which is what
+  §3.9 finishes.
+- **It is not a speed item.** Nothing measurable moves; it removes a second way
+  of saying the same thing. Bundle it with §1.7 or §2.10 rather than shipping a
+  PR whose benchmark table is empty.
+- **Parity test.** The pool holds byte-identical K/V after a packed decode write
+  and after today's padded one, on the same batch.
 
 ### 2.10 Paged attention with more than one query per sequence
 - **Status.** `planned` — the real engineering of the packed move.
-- **Stage 5 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 5 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ (both landed) → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** `paged_decode` assumes exactly one query per sequence: that is what
   lets it read the whole history with no causal mask, and it is stated in the
@@ -368,60 +372,22 @@ listed.
   attention layers all-reduce.
 
 ### 3.5 Broadcast the grouped-query heads instead of expanding them
-- **Status.** `planned` — **superseded by §2.3 on the decode path.**
-- **What is left of it.** This item existed to stop `_repeat_kv` materialising a
-  4x copy of K and V, 0.74 GiB of writes per decode step. §2.3's kernel reads
-  each KV head once and broadcasts over its query group in-register, so on the
-  paged path that copy is gone. `_repeat_kv` still runs in **prefill**, and on
-  the dense decode path that CPU and Triton-less installs still use — so
-  the item is not closed, it is re-scoped to prefill, where the copy is made once
-  per prompt rather than once per token and is worth much less.
+- **Status.** `planned` — **superseded by §2.3 on decode and by §3.6 on prefill.**
+- **What is left of it, which is now only the dense kernels.** This item existed
+  to stop `_repeat_kv` materialising a 4x copy of K and V, 0.74 GiB of writes per
+  decode step. §2.3's kernel reads each KV head once and broadcasts over its
+  query group in-register, so the paged decode path never makes that copy; §3.6's
+  packed prefill goes through FlashAttention's varlen entry, which reads one KV
+  head per query group natively, so the paged prefill path does not either.
+  `_repeat_kv` now runs only in `eager` and `sdpa` — the reference kernel and the
+  path CPU and Triton-less installs use. Neither is a performance path, so what
+  is left of this item is worth close to nothing; close it rather than build it
+  unless a dense path becomes load-bearing again.
 - **What it measured on its own.** Only cuDNN broadcasts KV heads under an
   additive mask, and cuDNN builds a plan per shape while decode changes shape
   every step: 0.223 ms fixed-shape, **36.177 ms** when the shape grows by one
   each call. In the engine, **0.64x** — reverted. Bucketing the KV length to 64
   cuts 128 distinct shapes to 3 and reaches parity, not a win.
-
-### 3.6 Pack the prefill batch instead of padding it
-- **Status.** `planned` — the first stage that moves a number.
-- **Stage 2 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
-- **PRs.** _none yet_
-- **Why, measured.** `_build_prefill_inputs` left-pads a batch to its longest
-  prompt, so the pass computes `batch * max_len` positions to keep `sum(len)` of
-  them. On the length distribution of the corpus the benchmark datasets are cut
-  from — median **17** tokens, mean 74, p99 1,286, max 10,046 — that ratio is
-  2.41x at batch 4 and **11.64x at batch 32**, and the scheduler admits up to
-  `max_num_seqs` at once, so a burst pays it. In the engine, a padded batch of 32
-  against one pass over the same real tokens:
-
-  | real tokens | padded tokens | padded | one packed pass | |
-  |---:|---:|---:|---:|---:|
-  | 1,915 | 10,016 | 276.8 ms | 68.6 ms | **4.04x** |
-  | 3,477 | 21,024 | 574.2 ms | 151.0 ms | **3.80x** |
-  | 1,991 | 10,624 | 278.5 ms | 72.8 ms | **3.83x** |
-
-  The mask is the second cost. An additive float mask rules FlashAttention out —
-  `can_use_flash_attention` returns False with one, verified rather than quoted —
-  so a padded prefill lands on the memory-efficient backend. Same tensors, mask
-  against `is_causal`: 1.53x at 512 tokens, 3.27x at 2,048, **4.11x at 4,096**.
-- **The varlen entry point needs no new dependency.** `torch.ops.aten._flash_attention_forward`
-  takes `cu_seqlens` and returns true varlen flash. Checked on an A40 in bf16
-  against per-sequence SDPA over lengths `[17, 300, 1024, 5]`: **max abs diff 0.0**.
-  So this is a kernel *wrapper*, not a kernel project — `varlen` joins
-  `IMPLEMENTATIONS` the way `sdpa` did, with a per-sequence SDPA fallback for
-  where flash cannot run and `eager` still the reference both are checked against.
-- **Scope.** `_build_prefill_inputs` emits a flat `[total_tokens]` `input_ids` and
-  `positions` plus `query_start_loc`; the prefill payload writes K/V by per-token
-  slot rather than through the right-aligned table; `build_prefill_mask` stops
-  being called on this path. Decode is untouched — it is *already* packed, one
-  query per sequence — so §3.2's captures and §2.7's split count carry over
-  unchanged.
-- **Measure it** on §8.7's mixed-length shape in `latency` mode, reading TTFT. On
-  a fixed-length dataset the padding ratio is exactly 1.00 and this is worth
-  nothing, which is why §8.7 comes first.
-- **Parity test.** Greedy output unchanged on a variable-length batch, which is
-  the case padding exists to serve, plus `varlen` against `eager` on the same
-  tensors.
 
 ### 3.8 Capture mixed batches by splitting the graph at attention
 - **Status.** `planned` — **low value today and not for a general reason**, which
@@ -470,7 +436,7 @@ listed.
 
 ### 3.9 Retire the padded path
 - **Status.** `planned` — the closing stage; nothing to build, everything to delete.
-- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ (landed) → §3.6 → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
+- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ (both landed) → §2.9 → §1.7 → §2.10 → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** Padding is currently undone by five mechanisms that exist only to
   cancel each other: left-padded inputs, a right-aligned slot table, a null block
