@@ -2,7 +2,7 @@
 
 Components:
 - `AsyncLLMEngine`         — continuous-batching loop; owned by `AsyncLLM`.
-- `ContinuousScheduler`    — fills empty batch slots and evicts finished sequences.
+- `ContinuousScheduler`    — spends a token budget per step across free slots; evicts finished sequences.
 - `ContinuousModelRunner`  — executes one prefill or decode forward pass.
 - `Sequence`               — the in-flight representation of a request.
 """

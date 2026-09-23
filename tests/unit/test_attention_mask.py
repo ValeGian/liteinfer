@@ -91,3 +91,36 @@ def test_decode_mask_hides_exactly_the_pad_prefix_of_every_row() -> None:
 
     masked_per_row = (mask[:, 0, 0, :] == torch.finfo(torch.float32).min).sum(dim=1)
     assert masked_per_row.tolist() == [max(lens) - n for n in lens]
+
+
+# ---------------------------------------------------------------------------
+# A chunk continuing a cached prompt
+# ---------------------------------------------------------------------------
+
+
+def _chunk_mask() -> torch.Tensor:
+    """Two queries at positions 3 and 4 of a 5-token context, beside a 2-token prompt."""
+    return build_prefill_mask(
+        prompt_lens=[2, 2],
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        context_lens=[5, 2],
+    )
+
+
+def test_a_chunk_mask_has_a_column_per_key_the_sequence_holds() -> None:
+    assert _chunk_mask().shape == (2, 1, 2, 5)
+
+
+def test_a_chunk_s_first_query_sees_the_whole_cached_prefix_and_itself() -> None:
+    assert _chunk_mask()[0, 0, 0].tolist() == [0.0, 0.0, 0.0, 0.0, _min(torch.float32)]
+
+
+def test_a_chunk_s_last_query_sees_every_key() -> None:
+    assert _chunk_mask()[0, 0, 1].tolist() == [0.0] * 5
+
+
+def test_a_prompt_beside_a_chunk_masks_the_columns_it_does_not_hold() -> None:
+    """Right-aligned: its two keys are the last two columns, and it stays causal among them."""
+    neg = _min(torch.float32)
+    assert _chunk_mask()[1, 0].tolist() == [[neg, neg, neg, 0.0, neg], [neg, neg, neg, 0.0, 0.0]]

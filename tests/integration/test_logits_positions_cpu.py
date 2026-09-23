@@ -50,14 +50,19 @@ def _prefill_logits(runner: ContinuousModelRunner, logits_positions: slice | Non
         )
         for i, prompt_len in enumerate(_PROMPT_LENS)
     ]
-    prompt_lens = list(_PROMPT_LENS)
-    for seq, prompt_len in zip(seqs, prompt_lens, strict=True):
-        runner._cache.register(seq.request_id, prompt_len)
+    prompt_lens: list[int] = list(_PROMPT_LENS)
+    request_ids = [s.request_id for s in seqs]
+    cache = runner._cache
+    assert cache is not None, "load_model() builds the cache"
+    for request_id in request_ids:
+        cache.register(request_id)
+    chunks = runner._next_prompt_chunks(seqs, None)
+    cache.advance(request_ids, prompt_lens)
 
-    input_ids, position_ids = runner._build_prefill_inputs(seqs, prompt_lens, max(prompt_lens))
+    input_ids, position_ids = runner._build_prefill_inputs(chunks)
     build_prefill, _ = builders_for(type(runner.model).__name__)
     mask = build_prefill(prompt_lens, runner.config.dtype, runner.device)
-    payload = runner._cache.make_prefill_payload([s.request_id for s in seqs], prompt_lens)
+    payload = cache.make_prefill_payload(request_ids, prompt_lens)
 
     with torch.inference_mode():
         out = runner.model(

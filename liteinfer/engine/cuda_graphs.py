@@ -138,6 +138,9 @@ class DecodeGraphs:
 
         self._input_ids = torch.zeros((max_num_seqs, 1), dtype=torch.long, device=device)
         self._position_ids = torch.zeros((max_num_seqs, 1), dtype=torch.long, device=device)
+        # Where each row's new token is written: a packed run of one slot per
+        # sequence, so its leading axis is the packed batch axis of 1.
+        self._write_slots = torch.zeros((1, max_num_seqs), dtype=torch.long, device=device)
         # One table for every context length there will ever be. Unread columns
         # hold whatever they last held; see the module docstring.
         self._slots = torch.zeros((max_num_seqs, max_model_len), dtype=torch.long, device=device)
@@ -153,6 +156,7 @@ class DecodeGraphs:
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
+        write_slots: torch.Tensor,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
     ) -> torch.Tensor:
@@ -165,7 +169,7 @@ class DecodeGraphs:
             raise ValueError(
                 f"decode batch of {batch_size} exceeds max_num_seqs={self._max_num_seqs}"
             )
-        self._fill(batch_size, input_ids, position_ids, slots, context_lens)
+        self._fill(batch_size, input_ids, position_ids, write_slots, slots, context_lens)
 
         graph = self._graphs.get(batch_size)
         if graph is None:
@@ -189,6 +193,7 @@ class DecodeGraphs:
         batch_size: int,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
+        write_slots: torch.Tensor,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
     ) -> None:
@@ -203,6 +208,7 @@ class DecodeGraphs:
             )
         self._input_ids[:batch_size].copy_(input_ids)
         self._position_ids[:batch_size].copy_(position_ids)
+        self._write_slots[:, :batch_size].copy_(write_slots)
         self._context_lens[:batch_size].copy_(context_lens)
         # The slot table is right-aligned, so it lands in the table's last columns
         # and every row keeps its own alignment — right-alignment composes, which
@@ -214,6 +220,7 @@ class DecodeGraphs:
     def _forward(self, batch_size: int) -> torch.Tensor:
         """The decode forward over the static buffers, at one batch width."""
         payload = self._cache.make_paged_decode_payload(
+            self._write_slots[:, :batch_size],
             self._slots[:batch_size],
             self._context_lens[:batch_size],
             self._splits_for_width(batch_size),

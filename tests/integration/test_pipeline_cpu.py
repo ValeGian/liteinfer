@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from liteinfer import AsyncLLM, EngineOverloaded
+from liteinfer.engine.metrics import Phase
 from liteinfer.sampling.params import SamplingParams
 from tests.integration import tiny_llama
 
@@ -202,8 +203,8 @@ def test_continuous_pipeline_stops_on_eos(tiny_llama_dir: Path) -> None:
             original_prefill = llm.engine.model_runner.prefill
             original_decode = llm.engine.model_runner.decode
 
-            def _prefill_forcing_eos(seqs):
-                logits = original_prefill(seqs)
+            def _prefill_forcing_eos(seqs, num_tokens=None):
+                logits = original_prefill(seqs, num_tokens)
                 forced = torch.full((logits.shape[0], tiny_llama.VOCAB_SIZE), float("-inf"))
                 forced[:, tiny_llama.EOS_ID] = 0.0
                 return forced
@@ -256,6 +257,33 @@ def test_engine_still_serves_requests_after_a_bad_one(tiny_llama_dir: Path) -> N
             )
 
     assert len(_run(run())) == 1
+
+
+def test_a_prompt_with_no_tokens_raises_to_its_own_caller(tiny_llama_dir: Path) -> None:
+    """The tiny tokenizer adds no BOS, so an empty string encodes to nothing at all."""
+
+    async def run() -> None:
+        async with _async_llm(tiny_llama_dir) as llm:
+            with pytest.raises(ValueError, match="no tokens"):
+                await asyncio.wait_for(llm.generate([""], SamplingParams(max_tokens=2)), timeout=20)
+
+    _run(run())
+
+
+def test_a_prompt_with_no_tokens_does_not_fail_the_requests_beside_it(tiny_llama_dir: Path) -> None:
+    async def run():
+        async with _async_llm(tiny_llama_dir) as llm:
+            _, beside = await asyncio.wait_for(
+                asyncio.gather(
+                    llm.generate([""], SamplingParams(max_tokens=2)),
+                    llm.generate(["tok5"], SamplingParams(max_tokens=2)),
+                    return_exceptions=True,
+                ),
+                timeout=20,
+            )
+            return beside
+
+    assert not isinstance(_run(run()), BaseException)
 
 
 def test_a_failing_forward_pass_raises_to_the_caller(tiny_llama_dir: Path) -> None:
@@ -471,3 +499,77 @@ def test_generate_still_returns_every_token_it_produced(tiny_llama_dir: Path) ->
 
     outputs = _run(_run_test())
     assert len(outputs[0].token_ids) == 6
+
+
+# ---------------------------------------------------------------------------
+# Token budget (§1.7)
+# ---------------------------------------------------------------------------
+
+# Lengths on both sides of the budget, and more prompts than slots, so sequences
+# are admitted while others are generating and some prompts need several chunks.
+_BUDGET_PROMPT_LENS = (11, 3, 9, 2, 14, 5)
+_BUDGET_SLOTS = 2
+_BUDGET = 5
+# Smaller than usual and prime to the budget, so chunk windows start part-way
+# into a block and straddle block boundaries rather than lining up with them.
+_BUDGET_BLOCK_SIZE = 4
+
+
+def _prompt(length: int, offset: int) -> str:
+    return " ".join(f"tok{2 + (offset + i) % 200}" for i in range(length))
+
+
+def _budgeted_generate(model_dir: Path, max_num_batched_tokens: int | None):
+    """Greedy completions of `_BUDGET_PROMPT_LENS`, and the step log that produced them."""
+    prompts = [_prompt(length, 7 * i) for i, length in enumerate(_BUDGET_PROMPT_LENS)]
+
+    async def _run_test():
+        llm = AsyncLLM(
+            str(model_dir), device="cpu", dtype=torch.float32,  # type: ignore[arg-type]
+            max_num_seqs=_BUDGET_SLOTS, max_num_batched_tokens=max_num_batched_tokens,
+            block_size=_BUDGET_BLOCK_SIZE,
+        )
+        async with llm:
+            outputs = await llm.generate(
+                prompts, SamplingParams(max_tokens=6, temperature=0.0, ignore_eos=True)
+            )
+            return [list(o.token_ids) for o in outputs], llm.engine.stats.steps
+
+    return _run(_run_test())
+
+
+def test_a_token_budget_generates_what_slot_admission_generates(tiny_llama_dir: Path) -> None:
+    """The plumbing end to end: admission mid-generation, chunking, delivery.
+
+    Not a check on attention: the tiny random model mostly repeats its input
+    token whatever attention returns, so its greedy output cannot tell a chunk
+    that attends to the wrong keys. `test_chunked_prefill_cpu.py` compares
+    logits for that.
+    """
+    unbudgeted, _ = _budgeted_generate(tiny_llama_dir, None)
+    budgeted, _ = _budgeted_generate(tiny_llama_dir, _BUDGET)
+
+    assert budgeted == unbudgeted
+
+
+def test_a_prompt_longer_than_the_budget_completes_rather_than_being_refused(
+    tiny_llama_dir: Path,
+) -> None:
+    outputs, _ = _budgeted_generate(tiny_llama_dir, _BUDGET)
+
+    assert [len(tokens) for tokens in outputs] == [6] * len(_BUDGET_PROMPT_LENS)
+
+
+def test_no_forward_pass_computes_more_tokens_than_the_budget(tiny_llama_dir: Path) -> None:
+    """Also what keeps the parity test above honest: the budget really did split prompts."""
+    _, steps = _budgeted_generate(tiny_llama_dir, _BUDGET)
+
+    assert max(step.input_tokens for step in steps) <= _BUDGET
+
+
+def test_every_prompt_token_is_computed_exactly_once(tiny_llama_dir: Path) -> None:
+    """A chunk continues where the cache left off; it neither skips nor recomputes."""
+    _, steps = _budgeted_generate(tiny_llama_dir, _BUDGET)
+    prefill_tokens = sum(step.input_tokens for step in steps if step.phase is Phase.PREFILL)
+
+    assert prefill_tokens == sum(_BUDGET_PROMPT_LENS)

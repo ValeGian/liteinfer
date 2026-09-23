@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 
@@ -109,6 +110,10 @@ def test_the_size_ignores_memory_that_was_freed_but_is_still_cached() -> None:
     which made a benchmark's pool a property of the machine's history.
     """
     runner = _runner(device="cuda", max_num_seqs=32, max_model_len=10**7)
+    # Runners from earlier tests sit in reference cycles and hold device memory
+    # until the cyclic collector runs — which allocating the ballast can trigger,
+    # freeing memory between the two readings that this test did not free.
+    gc.collect()
     before = _blocks(runner)
 
     ballast = torch.empty(2 << 30, dtype=torch.uint8, device="cuda")

@@ -69,18 +69,27 @@ class VarlenKV(NamedTuple):
 
     The dense payloads hand back `[batch, heads, keys, dim]` and rely on padding
     plus a mask to keep one sequence's queries away from another's keys. A packed
-    batch has no padding to mask: it is one flat run of tokens, and `cu_seqlens`
-    is where each sequence starts.
+    batch has no padding to mask: it is one flat run of tokens, and the prefix
+    sums say where each sequence starts.
+
+    Queries and keys carry separate boundaries because they differ when a prompt
+    is chunked: a chunk continuing a prompt brings only its own queries, but
+    attends to every key the sequence holds. Where no sequence had anything
+    cached before the pass, the two are the same tensors.
     """
 
     keys: torch.Tensor
-    """`[1, kv_heads, total_tokens, head_dim]` — the prompt K this pass computed."""
+    """`[1, kv_heads, total_keys, head_dim]` — every key the batch's sequences hold."""
     values: torch.Tensor
     """The matching V."""
-    cu_seqlens: torch.Tensor
-    """`[num_sequences + 1]` int32 prefix sums: sequence `i` owns `[cu[i], cu[i + 1])`."""
-    max_seqlen: int
-    """Longest sequence in the batch, which the kernel needs as a host-side int."""
+    cu_seqlens_q: torch.Tensor
+    """`[num_sequences + 1]` int32 prefix sums: sequence `i`'s queries are `[cu[i], cu[i + 1])`."""
+    max_seqlen_q: int
+    """Most queries any one sequence brings, which the kernel needs as a host-side int."""
+    cu_seqlens_k: torch.Tensor
+    """The same prefix sums over the keys."""
+    max_seqlen_k: int
+    """Most keys any one sequence holds."""
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -173,6 +182,13 @@ def varlen_attention(
     flash reads one KV head per query group directly, where the dense path
     materialises a copy of K and V per query head first.
 
+    `is_causal` aligns the causal diagonal to the bottom right when a sequence
+    has fewer queries than keys, so a chunk's queries sit at the *end* of the
+    context: each attends to the whole prefix and to its own chunk up to itself,
+    which is what a chunk continuing a cached prompt needs.
+    `tests/unit/test_varlen_attention.py` pins that alignment, because the op's
+    signature does not state it.
+
     The entry point is `torch.ops.aten._flash_attention_forward`, which is what
     PyTorch's own SDPA calls once it has decided flash applies. Going through it
     directly is what lets the call carry `cu_seqlens`; SDPA's public signature has
@@ -194,10 +210,10 @@ def varlen_attention(
         packed_query,
         packed_key,
         packed_value,
-        kv.cu_seqlens,
-        kv.cu_seqlens,
-        kv.max_seqlen,
-        kv.max_seqlen,
+        kv.cu_seqlens_q,
+        kv.cu_seqlens_k,
+        kv.max_seqlen_q,
+        kv.max_seqlen_k,
         dropout_p=0.0,
         is_causal=True,
         return_debug_mask=False,

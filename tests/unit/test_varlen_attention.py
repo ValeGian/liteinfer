@@ -35,9 +35,15 @@ def _packed(prompt_lens: list[int], kv_heads: int = 8) -> tuple[torch.Tensor, Va
     keys = torch.randn(1, kv_heads, total, _HEAD_DIM, dtype=_DTYPE, device="cuda")
     values = torch.randn_like(keys)
 
-    boundaries = torch.tensor(prompt_lens, device="cuda").cumsum(0)
-    cu_seqlens = torch.cat([torch.zeros(1, device="cuda"), boundaries]).to(torch.int32)
-    return query, VarlenKV(keys, values, cu_seqlens, max(prompt_lens))
+    cu_seqlens = _prefix_sums(prompt_lens)
+    return query, VarlenKV(
+        keys, values, cu_seqlens, max(prompt_lens), cu_seqlens, max(prompt_lens)
+    )
+
+
+def _prefix_sums(lengths: list[int]) -> torch.Tensor:
+    boundaries = torch.tensor(lengths, device="cuda").cumsum(0)
+    return torch.cat([torch.zeros(1, device="cuda"), boundaries]).to(torch.int32)
 
 
 def _padded_reference(
@@ -85,7 +91,10 @@ def test_packed_attention_never_reads_across_a_sequence_boundary():
     query, kv = _packed(prompt_lens)
     alone = varlen_attention(
         query[:, :, :4, :],
-        VarlenKV(kv.keys[:, :, :4, :], kv.values[:, :, :4, :], kv.cu_seqlens[:2], 4),
+        VarlenKV(
+            kv.keys[:, :, :4, :], kv.values[:, :, :4, :],
+            kv.cu_seqlens_q[:2], 4, kv.cu_seqlens_k[:2], 4,
+        ),
         None,
         _HEAD_DIM**-0.5,
         1,
@@ -94,6 +103,46 @@ def test_packed_attention_never_reads_across_a_sequence_boundary():
     together = varlen_attention(query, kv, None, _HEAD_DIM**-0.5, 1)
 
     torch.testing.assert_close(together[:, :, :4, :], alone)
+
+
+def test_a_chunk_attends_to_its_cached_prefix_and_its_own_past():
+    """A chunk continuing a prompt has fewer queries than keys, and they are the *last* ones.
+
+    Flash aligns its causal diagonal to the bottom right in that case, which is
+    what makes every query see the whole prefix — but the op's signature does
+    not say so, so the alignment is pinned against `eager` under the padded
+    path's own mask. The second sequence brings its whole prompt, so the batch
+    also mixes a chunk with a sequence that has no prefix at all.
+    """
+    torch.manual_seed(0)
+    query_lens, context_lens = [3, 5], [9, 5]
+    query = torch.randn(1, _QUERY_HEADS, sum(query_lens), _HEAD_DIM, dtype=_DTYPE, device="cuda")
+    keys = torch.randn(1, _QUERY_HEADS, sum(context_lens), _HEAD_DIM, dtype=_DTYPE, device="cuda")
+    values = torch.randn_like(keys)
+    kv = VarlenKV(
+        keys, values,
+        _prefix_sums(query_lens), max(query_lens), _prefix_sums(context_lens), max(context_lens),
+    )
+
+    packed = varlen_attention(query, kv, None, _HEAD_DIM**-0.5, 1)
+
+    outputs, query_start, key_start = [], 0, 0
+    for query_len, context_len in zip(query_lens, context_lens, strict=True):
+        queries = slice(query_start, query_start + query_len)
+        context = slice(key_start, key_start + context_len)
+        mask = build_prefill_mask([query_len], _DTYPE, torch.device("cuda"), [context_len])
+        outputs.append(
+            eager_attention(
+                query[:, :, queries, :],
+                DenseKV(keys[:, :, context, :], values[:, :, context, :]),
+                mask,
+                _HEAD_DIM**-0.5,
+                1,
+            )
+        )
+        query_start += query_len
+        key_start += context_len
+    torch.testing.assert_close(packed, torch.cat(outputs, dim=2), rtol=0, atol=2**-6)
 
 
 def test_packed_attention_serves_grouped_query_heads():

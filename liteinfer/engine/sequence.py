@@ -41,6 +41,9 @@ class Sequence:
     output_token_ids: list[int] = field(default_factory=list)
     status: SequenceStatus = SequenceStatus.WAITING
     detokenizer: IncrementalDetokenizer = field(default_factory=IncrementalDetokenizer)
+    num_computed_tokens: int = 0
+    """Tokens whose K/V are in the cache. What is left of `len(self)` is what the
+    next step has to compute: the rest of the prompt, or the one sampled token."""
 
     @property
     def output_text(self) -> str:
@@ -53,6 +56,16 @@ class Sequence:
 
     def __len__(self) -> int:
         return len(self.prompt_token_ids) + len(self.output_token_ids)
+
+    @property
+    def num_uncomputed_tokens(self) -> int:
+        """Tokens a forward still has to run before this sequence can sample again."""
+        return len(self) - self.num_computed_tokens
+
+    @property
+    def is_prompt_computed(self) -> bool:
+        """Whether the whole prompt is cached, so each step computes one sampled token."""
+        return self.num_computed_tokens >= len(self.prompt_token_ids)
 
     @property
     def num_output_tokens(self) -> int:
