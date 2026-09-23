@@ -87,9 +87,15 @@ def test_asking_for_nothing_in_particular_returns_every_position(tiny_llama_dir:
 
 
 def test_the_sliced_logits_equal_the_row_they_were_sliced_from(tiny_llama_dir: Path):
-    """Projecting fewer positions must not change the ones that are projected."""
+    """Projecting fewer positions must not change the ones that are projected.
+
+    Not bit-exact: the LM head is a GEMM over 1 position in one call and all of
+    them in the other, and CPU BLAS blocks the reduction differently per shape,
+    so fp32 sums round differently (observed up to 1.5e-5 on CI runners). A
+    wrong row would differ at the scale of the logits themselves, far above atol.
+    """
     runner = _loaded_runner(tiny_llama_dir)
     sliced = _prefill_logits(runner, LAST_POSITION)[:, -1, :]
     whole = _prefill_logits(runner, None)[:, -1, :]
 
-    torch.testing.assert_close(sliced, whole, rtol=0, atol=0)
+    torch.testing.assert_close(sliced, whole, rtol=0, atol=1e-4)
