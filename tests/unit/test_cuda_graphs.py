@@ -80,6 +80,7 @@ def test_a_batch_wider_than_the_engine_allows_is_refused():
         graphs.run(
             torch.zeros(3, 1, dtype=torch.long),
             torch.zeros(3, 1, dtype=torch.long),
+            torch.zeros(1, 3, dtype=torch.long),
             torch.zeros(3, 4, dtype=torch.long),
             torch.zeros(3, dtype=torch.int32),
         )
@@ -107,6 +108,7 @@ def test_a_slot_table_wider_than_the_engine_allows_is_refused():
 
     with pytest.raises(ValueError, match="max_model_len=16"):
         graphs.run(
+            torch.zeros(1, 1, dtype=torch.long),
             torch.zeros(1, 1, dtype=torch.long),
             torch.zeros(1, 1, dtype=torch.long),
             torch.zeros(1, 20, dtype=torch.long),

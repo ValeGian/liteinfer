@@ -20,6 +20,13 @@ class EngineConfig:
     max_num_seqs: int = 32
     max_model_len: int = 4096
 
+    # Tokens one step may compute across every sequence it schedules — a second
+    # cap beside `max_num_seqs`, and both bind. A prompt larger than what is left
+    # of it is not deferred but chunked across steps. None caps nothing
+    # `max_num_seqs x max_model_len` does not already cap, so no prompt is ever
+    # chunked; see `token_budget` and `engine/continuous_scheduler.py`.
+    max_num_batched_tokens: int | None = None
+
     seed: int = 42
 
     # Attention kernel, or None for the fastest one this device can run —
@@ -72,6 +79,13 @@ class EngineConfig:
             raise ValueError("max_model_len must be >= 1")
         if self.block_size < 1:
             raise ValueError("block_size must be >= 1")
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens < self.max_num_seqs:
+            # Below this a full batch of decodes cannot all run in one step, and a
+            # chunked prompt can be starved of every token by the decodes ahead of it.
+            raise ValueError(
+                f"max_num_batched_tokens={self.max_num_batched_tokens} must be >= "
+                f"max_num_seqs={self.max_num_seqs}"
+            )
         if self.max_waiting_seqs < 1:
             raise ValueError("max_waiting_seqs must be >= 1")
         if self.paged_decode_splits is not None and self.paged_decode_splits < 1:
@@ -80,6 +94,13 @@ class EngineConfig:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
         if self.attn_implementation is not None:
             resolve(self.attn_implementation)  # raises on an unknown kernel name
+
+    @property
+    def token_budget(self) -> int:
+        """`max_num_batched_tokens`, with None resolved to the most a step can ever hold."""
+        if self.max_num_batched_tokens is not None:
+            return self.max_num_batched_tokens
+        return self.max_num_seqs * self.max_model_len
 
     def resolved_device(self) -> torch.device:
         """Return the concrete `torch.device` after resolving ``"auto"``."""

@@ -70,6 +70,35 @@ def _greedy_tokens(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) 
     return [list(seq.output_token_ids) for seq in seqs]
 
 
+def _decode_logits(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) -> torch.Tensor:
+    """Every decode step's logits over fixed input tokens, stacked as ``[steps, batch, vocab]``.
+
+    Fixed inputs rather than greedy ones, so the two runs stay comparable step by
+    step however far their logits drift.
+    """
+    seqs = _sequences(prompt_lens)
+    runner.prefill(seqs)
+    steps = []
+    for step in range(_DECODE_STEPS):
+        for seq in seqs:
+            seq.output_token_ids.append(3 + step % 50)
+        steps.append(runner.decode(seqs))
+    return torch.stack(steps)
+
+
+def test_a_replayed_decode_computes_the_logits_an_eager_one_does(tiny_llama_dir: Path):
+    """What the token test below cannot see: the tiny model's greedy output ignores attention.
+
+    It mostly repeats its input token, so a replay that wrote each step's K/V to
+    the wrong slot would still give identical tokens. The logits read the
+    history that write leaves behind.
+    """
+    eager = _decode_logits(_runner(tiny_llama_dir, capture=False, max_num_seqs=4), _PROMPT_LENS)
+    captured = _decode_logits(_runner(tiny_llama_dir, capture=True, max_num_seqs=4), _PROMPT_LENS)
+
+    torch.testing.assert_close(captured, eager, rtol=0, atol=1e-5)
+
+
 def test_a_replayed_decode_gives_the_same_tokens_as_an_eager_one(tiny_llama_dir: Path):
     """The whole claim: same answer, fewer launches.
 
