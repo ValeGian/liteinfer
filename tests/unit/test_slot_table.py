@@ -105,6 +105,6 @@ def test_packed_mapping_addresses_the_same_slots_as_the_padded_table() -> None:
     """Two layouts of one answer: the padded table's real columns, concatenated."""
     block_tables, counts = [[2], [5, 1]], [3, 6]
     padded = _table(block_tables, counts)
-    real = torch.cat([row[-count:] for row, count in zip(padded, counts)])
+    real = torch.cat([row[-count:] for row, count in zip(padded, counts, strict=True)])
 
     assert _mapping(block_tables, counts).tolist() == [real.tolist()]
