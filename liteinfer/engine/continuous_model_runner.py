@@ -246,7 +246,7 @@ class ContinuousModelRunner:
         """Every chunk end to end as `[1, total_tokens]`, positions restarting per chunk.
 
         The leading axis is 1 because the batch is the token run itself; where
-        each sequence begins lives in `cu_seqlens_q` on the payload, and in the
+        each sequence begins lives in `cu_seqlens` on the payload, and in the
         positions, which count from where each chunk starts in its prompt so RoPE
         sees every token where it sits.
         """

@@ -6,7 +6,7 @@
 # Python raises — it is only callable from inside another Triton function, which
 # is where the calls below are.
 # pyright: reportGeneralTypeIssues=false
-"""Decode attention that reads the KV pool where it lies, in Triton.
+"""Attention that reads the KV pool where it lies, in Triton.
 
 The dense kernels in `attention.py` want K and V as one contiguous
 ``[batch, kv_heads, keys, head_dim]`` tensor, so a paged cache has to copy every
@@ -25,9 +25,18 @@ the operation to a general kernel:
   to the longest in the batch and masks the difference away afterwards, having
   already paid to move it.
 
-Decode only: one query per sequence. That is what makes the whole history
-readable in a single pass with no causal mask — the newest token attends to
-everything before it, which is every token in the cache.
+A decode step is one query per sequence, and that is what makes the whole
+history readable in a single pass with no causal mask — the newest token
+attends to everything before it, which is every token in the cache.
+
+A prefill chunk continuing a cached prompt brings many queries per sequence,
+which are the *last* positions of its context: each reads the whole cached
+prefix and the chunk only up to itself. `paged_prefill` serves it with the same
+kernel, one program per block of queries rather than per sequence — the decode
+build is the one-query block, compiled without the causal mask, and is
+arithmetically the kernel it has always been. Every key before a block's first
+query is visible to every row in it, so the mask is applied only to the span
+the block covers.
 
 **Slot table, not block table.** vLLM's kernels take the block table and do the
 `block_idx * block_size + offset` arithmetic themselves; this one takes the slot
@@ -84,6 +93,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 # Tokens folded into the running softmax per iteration. 64 was the best of
 # {16, 32, 64, 128} on an A40; the tile has to be at least 16 for `tl.dot`, and
@@ -91,6 +101,18 @@ import triton.language as tl
 # that chose 64 is re-runnable, and the tests sweep the same values. A split
 # slice can be shorter than the tile, in which case the tile is masked down to it.
 _BLOCK_KV = 64
+
+# The tiles a prefill chunk is attended in: query tokens per program, and keys
+# per step of its loop. With a query-head group of 4, 16 queries are a 64-row
+# tile that `tl.dot` fills without padding. Swept over {8, 16, 32} x {32, 64,
+# 128} at Llama-3.2-1B's shapes on an A40 (`docs/benchmarks.md`, §2.10): 16 x 32
+# is fastest for every chunk of 512 tokens or more. Short chunks over a long
+# prefix would rather have 8 x 128 — 92 against 145 us for 64 queries over 4,096
+# keys — which a chooser keyed on the chunk length could take; 16 x 32 already
+# beats the copy-then-flash path there. Both stay parameters so the sweep is
+# re-runnable.
+_PREFILL_BLOCK_Q = 16
+_PREFILL_BLOCK_KV = 32
 
 # `tl.dot` needs tiles of at least 16 and `tl.arange` needs a power-of-two
 # length. Neither the query-head group (4 for Llama-3.2, 8 for Llama-3-70B) nor
@@ -140,37 +162,56 @@ def _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq, max_context, con
 
 
 @triton.jit
-def _load_query_group(
+def _load_query_block(
     query_ptr,
-    seq,
+    first_token,
+    num_queries,
+    query_block,
     kv_head,
-    query_stride_seq,
+    query_stride_token,
     query_stride_head,
     dims,
     is_real_dim,
     NUM_GROUPS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
 ):
-    """Load the queries of every head that shares one KV head, as one tile.
+    """Load `BLOCK_Q` of a sequence's query tokens for every head sharing one KV head, as one tile.
 
-    Returns the ``[QUERY_ROWS, HEAD_DIM_TILE]`` tile, the query-head index behind
-    each of its rows, and which of those rows is a real head rather than tile
-    padding.
+    Row ``r`` of the tile is query token ``r // NUM_GROUPS`` of the block and
+    query head ``r % NUM_GROUPS`` of the group, so a whole block attends to the
+    KV head's keys in one `tl.dot` — K and V are read once for all of them. At
+    ``BLOCK_Q=1`` that is exactly one decode token's head group.
+
+    Returns the ``[QUERY_ROWS, HEAD_DIM_TILE]`` tile; per row, the query's index
+    within its sequence, its token in the packed query tensor and its query
+    head; and which rows are real rather than tile padding.
 
     Zeroing the padded lanes is what makes the padding arithmetically free: a
     zero contributes nothing to the score dot however much rubbish sits opposite
     it in K, and the masked stores drop the padded outputs. Every other mask on
     these two axes is therefore about memory, not about answers.
     """
-    query_rows = tl.arange(0, QUERY_ROWS)
-    is_real_head = query_rows < NUM_GROUPS
-    head_offsets = kv_head * NUM_GROUPS + query_rows
+    rows = tl.arange(0, QUERY_ROWS)
+    query_index = query_block * BLOCK_Q + rows // NUM_GROUPS
+    is_real_row = (rows < BLOCK_Q * NUM_GROUPS) & (query_index < num_queries)
+    tokens = first_token + query_index
+    heads = kv_head * NUM_GROUPS + rows % NUM_GROUPS
     query = tl.load(
-        query_ptr + seq * query_stride_seq + head_offsets[:, None] * query_stride_head + dims[None, :],
-        mask=is_real_head[:, None] & is_real_dim[None, :],
+        query_ptr + tokens[:, None] * query_stride_token + heads[:, None] * query_stride_head + dims[None, :],
+        mask=is_real_row[:, None] & is_real_dim[None, :],
         other=0.0,
     )
-    return query, head_offsets, is_real_head
+    return query, query_index, tokens, heads, is_real_row
+
+
+@triton.jit
+def _empty_softmax_state(QUERY_ROWS: tl.constexpr, HEAD_DIM_TILE: tl.constexpr):
+    """Accumulator, denominator and maximum of a softmax that has seen no keys."""
+    accumulator = tl.zeros([QUERY_ROWS, HEAD_DIM_TILE], dtype=tl.float32)
+    running_sum = tl.zeros([QUERY_ROWS], dtype=tl.float32)
+    running_max = tl.full([QUERY_ROWS], float("-inf"), dtype=tl.float32)
+    return accumulator, running_sum, running_max
 
 
 @triton.jit
@@ -184,28 +225,34 @@ def _fold_keys_into_running_softmax(
     kv_head,
     first_key,
     last_key,
+    query_positions,
     dims,
     is_real_dim,
     scaling,
-    QUERY_ROWS: tl.constexpr,
+    accumulator,
+    running_sum,
+    running_max,
     BLOCK_KV: tl.constexpr,
-    HEAD_DIM_TILE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
-    """Attend `query` over the logical key positions ``[first_key, last_key)``.
+    """Fold the logical key positions ``[first_key, last_key)`` into a running softmax.
+
+    With `IS_CAUSAL`, row ``r`` also stops at its own position,
+    ``query_positions[r]``. That mask is only needed on the keys a query block
+    shares with its own positions — everything before the block's first query is
+    visible to every row in it — so callers fold that prefix without the mask
+    and only the block's own span with it. A decode token is the newest position
+    there is, so it never needs the mask at all.
 
     The accumulator is kept in fp32 and rescaled whenever a tile raises the
     running maximum — the online-softmax formulation FlashAttention uses, which
-    is what lets the pass finish without ever holding the scores. It comes back
-    unnormalised, alongside the maximum and the denominator it is relative to, so
-    a caller holding only a slice of the key axis can hand its slice on to be
-    weighed against the others.
+    is what lets the pass finish without ever holding the scores. The state
+    comes in and goes out unnormalised — accumulator, denominator, maximum — so
+    one call can continue another, and a caller holding only a slice of the key
+    axis can hand its slice on to be weighed against the others.
 
     `slot_ptr` addresses this sequence's slot for logical position 0.
     """
-    running_max = tl.full([QUERY_ROWS], float("-inf"), dtype=tl.float32)
-    running_sum = tl.zeros([QUERY_ROWS], dtype=tl.float32)
-    accumulator = tl.zeros([QUERY_ROWS, HEAD_DIM_TILE], dtype=tl.float32)
-
     for start in range(first_key, last_key, BLOCK_KV):
         offsets = start + tl.arange(0, BLOCK_KV)
         is_real_key = offsets < last_key
@@ -220,7 +267,13 @@ def _fold_keys_into_running_softmax(
         values = tl.load(value_pool_ptr + pool_offsets, mask=is_addressable, other=0.0)
 
         scores = tl.dot(query, tl.trans(keys), input_precision="ieee") * scaling
-        scores = tl.where(is_real_key[None, :], scores, float("-inf"))
+        is_visible = is_real_key[None, :]
+        if IS_CAUSAL:
+            # Never empties a real row's first tile: the masked span starts at the
+            # block's first query position, which every row in the block can see —
+            # so no row's running maximum is still -inf when it meets an all -inf tile.
+            is_visible = is_visible & (offsets[None, :] <= query_positions[:, None])
+        scores = tl.where(is_visible, scores, float("-inf"))
 
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(running_max, block_max)
@@ -234,6 +287,90 @@ def _fold_keys_into_running_softmax(
         running_max = new_max
 
     return accumulator, running_sum, running_max
+
+
+@triton.jit
+def _attend_query_block(
+    query_ptr,
+    key_pool_ptr,
+    value_pool_ptr,
+    slot_table_ptr,
+    out_ptr,
+    seq,
+    kv_head,
+    query_block,
+    first_token,
+    num_queries,
+    context_len,
+    query_stride_token,
+    query_stride_head,
+    pool_stride_slot,
+    pool_stride_head,
+    slot_table_stride_seq,
+    out_stride_token,
+    out_stride_head,
+    scaling,
+    max_context,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEAD_DIM_TILE: tl.constexpr,
+    IS_DECODE: tl.constexpr,
+):
+    """Attend one block of a sequence's queries over its keys for one KV head, in one pass.
+
+    The body both single-pass kernels share. The block's queries are the last
+    positions of the context, so every key before the block's first query is
+    visible to all of its rows and is folded without a mask; only the block's
+    own span is folded causally. A decode block is the one newest token, which
+    sees everything and is compiled without the mask.
+    """
+    dims = tl.arange(0, HEAD_DIM_TILE)
+    is_real_dim = dims < HEAD_DIM
+    query, query_index, tokens, heads, is_real_row = _load_query_block(
+        query_ptr,
+        first_token,
+        num_queries,
+        query_block,
+        kv_head,
+        query_stride_token,
+        query_stride_head,
+        dims,
+        is_real_dim,
+        NUM_GROUPS,
+        BLOCK_Q,
+        QUERY_ROWS,
+    )
+    first_query_position = context_len - num_queries
+    block_start = first_query_position + query_block * BLOCK_Q
+    last_key = first_query_position + tl.minimum((query_block + 1) * BLOCK_Q, num_queries)
+    query_positions = first_query_position + query_index
+    slots = _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq, max_context, context_len)
+
+    accumulator, running_sum, running_max = _empty_softmax_state(QUERY_ROWS, HEAD_DIM_TILE)
+    accumulator, running_sum, running_max = _fold_keys_into_running_softmax(
+        query, key_pool_ptr, value_pool_ptr, slots, pool_stride_slot, pool_stride_head, kv_head,
+        0, last_key if IS_DECODE else block_start,
+        query_positions, dims, is_real_dim, scaling,
+        accumulator, running_sum, running_max,
+        BLOCK_KV, False,
+    )
+    if not IS_DECODE:
+        accumulator, running_sum, running_max = _fold_keys_into_running_softmax(
+            query, key_pool_ptr, value_pool_ptr, slots, pool_stride_slot, pool_stride_head, kv_head,
+            block_start, last_key,
+            query_positions, dims, is_real_dim, scaling,
+            accumulator, running_sum, running_max,
+            BLOCK_KV, True,
+        )
+
+    tl.store(
+        out_ptr + tokens[:, None] * out_stride_token + heads[:, None] * out_stride_head + dims[None, :],
+        (accumulator / running_sum[:, None]).to(out_ptr.dtype.element_ty),
+        mask=is_real_row[:, None] & is_real_dim[None, :],
+    )
 
 
 @triton.jit
@@ -261,50 +398,68 @@ def _paged_decode_kernel(
 ):
     """One program per (sequence, KV head), folding a sequence's whole history in one pass.
 
+    Its own kernel rather than the prefill one with one query per sequence: the
+    body is shared, but this launch carries no query offsets, and decode pays
+    Triton's per-argument launch cost on every layer of every eager step.
+
     This is the shape the grid takes when it already covers the device. A narrow
     batch cannot fill it, and splits the key axis instead — see
     `_paged_decode_split_kernel`.
     """
     seq = tl.program_id(0)
-    kv_head = tl.program_id(1)
-
-    context_len = tl.load(context_lens_ptr + seq)
-    dims = tl.arange(0, HEAD_DIM_TILE)
-    is_real_dim = dims < HEAD_DIM
-    query, head_offsets, is_real_head = _load_query_group(
-        query_ptr,
-        seq,
-        kv_head,
-        query_stride_seq,
-        query_stride_head,
-        dims,
-        is_real_dim,
-        NUM_GROUPS,
-        QUERY_ROWS,
+    _attend_query_block(
+        query_ptr, key_pool_ptr, value_pool_ptr, slot_table_ptr, out_ptr,
+        seq, tl.program_id(1), 0, seq, 1, tl.load(context_lens_ptr + seq),
+        query_stride_seq, query_stride_head, pool_stride_slot, pool_stride_head,
+        slot_table_stride_seq, out_stride_seq, out_stride_head, scaling, max_context,
+        NUM_GROUPS, 1, QUERY_ROWS, BLOCK_KV, HEAD_DIM, HEAD_DIM_TILE, True,
     )
 
-    accumulator, running_sum, _ = _fold_keys_into_running_softmax(
-        query,
-        key_pool_ptr,
-        value_pool_ptr,
-        _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq, max_context, context_len),
-        pool_stride_slot,
-        pool_stride_head,
-        kv_head,
-        0,
-        context_len,
-        dims,
-        is_real_dim,
-        scaling,
-        QUERY_ROWS,
-        BLOCK_KV,
-        HEAD_DIM_TILE,
-    )
 
-    tl.store(
-        out_ptr + seq * out_stride_seq + head_offsets[:, None] * out_stride_head + dims[None, :],
-        (accumulator / running_sum[:, None]).to(out_ptr.dtype.element_ty),
-        mask=is_real_head[:, None] & is_real_dim[None, :],
+@triton.jit
+def _paged_prefill_kernel(
+    query_ptr,
+    key_pool_ptr,
+    value_pool_ptr,
+    slot_table_ptr,
+    context_lens_ptr,
+    query_start_loc_ptr,
+    out_ptr,
+    query_stride_token,
+    query_stride_head,
+    pool_stride_slot,
+    pool_stride_head,
+    slot_table_stride_seq,
+    out_stride_token,
+    out_stride_head,
+    scaling,
+    max_context,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEAD_DIM_TILE: tl.constexpr,
+):
+    """One program per (sequence, KV head, block of `BLOCK_Q` queries).
+
+    Sequence ``seq`` brings ``query_start_loc[seq + 1] - query_start_loc[seq]``
+    queries at the end of its context. The grid is sized for the longest, so a
+    program past the end of a shorter sequence's queries returns at once.
+    """
+    seq = tl.program_id(0)
+    query_block = tl.program_id(2)
+    first_token = tl.load(query_start_loc_ptr + seq)
+    num_queries = tl.load(query_start_loc_ptr + seq + 1) - first_token
+    if query_block * BLOCK_Q >= num_queries:
+        return
+    _attend_query_block(
+        query_ptr, key_pool_ptr, value_pool_ptr, slot_table_ptr, out_ptr,
+        seq, tl.program_id(1), query_block, first_token, num_queries,
+        tl.load(context_lens_ptr + seq),
+        query_stride_token, query_stride_head, pool_stride_slot, pool_stride_head,
+        slot_table_stride_seq, out_stride_token, out_stride_head, scaling, max_context,
+        NUM_GROUPS, BLOCK_Q, QUERY_ROWS, BLOCK_KV, HEAD_DIM, HEAD_DIM_TILE, False,
     )
 
 
@@ -338,11 +493,13 @@ def _paged_decode_split_kernel(
 ):
     """One program per (sequence, KV head, split), each folding its own slice of the keys.
 
-    The grid is `NUM_SPLITS` times wider than the unsplit pass, which is the
-    whole point: at batch 1 that pass is one program per KV head and leaves most
-    of the device idle. Each program writes its slice's softmax, normalised, plus
-    the log-sum-exp saying how much mass the slice carried —
-    `_combine_splits_kernel` needs both to weigh the slices against each other.
+    Decode only. The grid is `NUM_SPLITS` times wider than the single pass,
+    which is the whole point: at batch 1 that pass is one program per KV head and
+    leaves most of the device idle. A chunk supplies its own parallelism — a
+    program per block of queries — so it never needs this shape. Each program
+    writes its slice's softmax, normalised, plus the log-sum-exp saying how much
+    mass the slice carried; `_combine_splits_kernel` needs both to weigh the
+    slices against each other.
     """
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -355,18 +512,22 @@ def _paged_decode_split_kernel(
 
     dims = tl.arange(0, HEAD_DIM_TILE)
     is_real_dim = dims < HEAD_DIM
-    query, head_offsets, is_real_head = _load_query_group(
+    query, query_index, _, heads, is_real_row = _load_query_block(
         query_ptr,
         seq,
+        1,
+        0,
         kv_head,
         query_stride_seq,
         query_stride_head,
         dims,
         is_real_dim,
         NUM_GROUPS,
+        1,
         QUERY_ROWS,
     )
 
+    accumulator, running_sum, running_max = _empty_softmax_state(QUERY_ROWS, HEAD_DIM_TILE)
     accumulator, running_sum, running_max = _fold_keys_into_running_softmax(
         query,
         key_pool_ptr,
@@ -377,12 +538,15 @@ def _paged_decode_split_kernel(
         kv_head,
         first_key,
         last_key,
+        query_index,
         dims,
         is_real_dim,
         scaling,
-        QUERY_ROWS,
+        accumulator,
+        running_sum,
+        running_max,
         BLOCK_KV,
-        HEAD_DIM_TILE,
+        False,
     )
 
     # One split count serves the whole batch, so a sequence shorter than the
@@ -396,19 +560,19 @@ def _paged_decode_split_kernel(
     tl.store(
         partial_out_ptr
         + seq * partial_out_stride_seq
-        + head_offsets[:, None] * partial_out_stride_head
+        + heads[:, None] * partial_out_stride_head
         + split * partial_out_stride_split
         + dims[None, :],
         accumulator / denominator[:, None],
-        mask=is_real_head[:, None] & is_real_dim[None, :],
+        mask=is_real_row[:, None] & is_real_dim[None, :],
     )
     tl.store(
         partial_lse_ptr
         + seq * partial_lse_stride_seq
-        + head_offsets * partial_lse_stride_head
+        + heads * partial_lse_stride_head
         + split,
         log_sum_exp,
-        mask=is_real_head,
+        mask=is_real_row,
     )
 
 
@@ -659,3 +823,122 @@ def paged_decode(
         HEAD_DIM_TILE=_tile(head_dim),
     )
     return out
+
+
+def paged_prefill(
+    query: torch.Tensor,
+    key_pool: torch.Tensor,
+    value_pool: torch.Tensor,
+    slot_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+    scaling: float,
+    num_kv_groups: int,
+    block_kv: int = _PREFILL_BLOCK_KV,
+    block_q: int = _PREFILL_BLOCK_Q,
+) -> torch.Tensor:
+    """Attend each sequence's chunk of queries over the KV its slots address, causally.
+
+    Sequence ``i``'s queries are rows ``[query_start_loc[i], query_start_loc[i +
+    1])`` of `query`, and they are the *last* positions of its context: the
+    chunk's own K/V are already in the pool, written by the layer's payload just
+    before this call. So each query reads every cached key before the chunk and
+    the chunk's keys up to itself — a whole prompt is the case where the context
+    is the chunk. A decode step is the case of one query per sequence, which
+    `paged_decode` serves with the same kernel.
+
+    Args:
+        query: ``[total_queries, num_heads, head_dim]``, sequences end to end.
+        key_pool: this layer's flat key store, ``[num_slots, num_kv_heads, head_dim]``.
+        value_pool: the matching value store.
+        slot_table: ``[batch, max_context]`` physical slot per logical position,
+            right-aligned, padded columns pointing at the null block.
+        context_lens: ``[batch]`` tokens each sequence holds, its chunk included.
+        query_start_loc: ``[batch + 1]`` int32 prefix sums of the chunk lengths.
+        max_query_len: longest chunk, which sizes the grid and so is a host int.
+        scaling: softmax scale, normally ``head_dim ** -0.5``.
+        num_kv_groups: query heads per KV head.
+        block_kv: keys folded into the running softmax per iteration.
+        block_q: query tokens per program. Exposed so the choice can be swept.
+
+    Returns:
+        ``[total_queries, num_heads, head_dim]``, same dtype as ``query``.
+    """
+    _, num_heads, head_dim = query.shape
+    if key_pool.stride() != value_pool.stride():
+        raise ValueError("key and value pools must be laid out identically")
+    num_kv_heads = num_heads // num_kv_groups
+    batch = context_lens.shape[0]
+
+    out = torch.empty_like(query)
+    args = (
+        query, key_pool, value_pool, slot_table, context_lens, query_start_loc, out,
+        query.stride(0), query.stride(1), key_pool.stride(0), key_pool.stride(1),
+        slot_table.stride(0), out.stride(0), out.stride(1), scaling, slot_table.shape[1],
+    )
+    constants = {
+        "NUM_GROUPS": num_kv_groups,
+        "BLOCK_Q": block_q,
+        "QUERY_ROWS": _tile(block_q * num_kv_groups),
+        "HEAD_DIM": head_dim,
+        "HEAD_DIM_TILE": _tile(head_dim),
+    }
+    grid = (batch, num_kv_heads, int(triton.cdiv(max_query_len, block_q)))
+    _launch_fitting_shared_memory(_paged_prefill_kernel[grid], args, constants, block_kv, query)
+    return out
+
+
+def _launch_fitting_shared_memory(
+    kernel, args: tuple, constants: dict, block_kv: int, query: torch.Tensor
+) -> None:
+    """Launch at the key tile and pipeline depth that fit this device, found on first use."""
+    shape = (query.dtype, query.device.index, block_kv, *constants.values())
+    fitted = _FITTING_LAUNCH.get(shape)
+    if fitted is None:
+        _FITTING_LAUNCH[shape] = _find_fitting_launch(kernel, args, constants, block_kv, shape)
+        return
+    tile, num_stages = fitted
+    stages = {} if num_stages is None else {"num_stages": num_stages}
+    kernel(*args, BLOCK_KV=tile, **stages, **constants)
+
+
+# The key tile and pipeline depth that fit, per launch shape, from its first launch.
+_FITTING_LAUNCH: dict[tuple, tuple[int, int | None]] = {}
+
+# Pipeline depths tried at each key tile: Triton's default, then shallower.
+_STAGE_FALLBACKS: tuple[int | None, ...] = (None, 2, 1)
+
+
+def _find_fitting_launch(
+    kernel, args: tuple, constants: dict, block_kv: int, shape: tuple
+) -> tuple[int, int | None]:
+    """Launch at the largest key tile and deepest pipeline this device fits; return which fitted.
+
+    Every pipeline stage buffers another key tile of K and V in shared memory,
+    and a chunk's query tile is `BLOCK_Q x groups` rows against the head
+    dimension, so the defaults can overflow where decode's one-token tile never
+    does: 115 KiB against an A40's 99 KiB at fp32 with a 128-wide head, and a
+    256-wide head in fp32 fits only at 16 keys and one stage. Decode's launch
+    takes the defaults directly and never comes here. Shared memory
+    differs by device — 227 KiB on an H100 — and Triton only knows whether a
+    kernel fits once it has compiled it, which it reports by raising
+    `OutOfResources` before anything runs.
+
+    So the first launch of a shape searches — the requested tile at every depth,
+    then half the tile, down to the smallest `tl.dot` takes — and every later
+    launch reuses what fitted. The answer does not depend on either knob, only
+    how well the pool's latency is hidden, and a shape that fits at the
+    defaults compiles exactly as it would without this.
+    """
+    tile = block_kv
+    while tile >= _MIN_TILE:
+        for num_stages in _STAGE_FALLBACKS:
+            stages = {} if num_stages is None else {"num_stages": num_stages}
+            try:
+                kernel(*args, BLOCK_KV=tile, **stages, **constants)
+            except OutOfResources:
+                continue
+            return tile, num_stages
+        tile //= 2
+    raise OutOfResources(0, 0, f"shared memory: no key tile or pipeline depth fits {shape}")

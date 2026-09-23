@@ -117,7 +117,8 @@ One engine: continuous batching over a paged KV cache.
   `eager` writes it out in plain matmuls, which reads better and is the parity
   reference, but caps the prompt length that fits in memory. `paged` is the fast
   decode path: a Triton kernel that reads the KV pool through the slot table
-  instead of gathering it, so the decode step stops growing with context. The
+  instead of gathering it, so the decode step stops growing with context. With a
+  query dimension it also serves a prompt chunk that continues a cached one. The
   engine picks between them from the device.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
