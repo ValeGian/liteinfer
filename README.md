@@ -185,6 +185,15 @@ memory roofline where vLLM's whole step is 1.5× off, and that is fusion —
 [`docs/roadmap.md`](docs/roadmap.md) carries the numbers, including three
 optimisations that were built, measured and reverted.
 
+**Prompts of different lengths no longer pay for each other.** A prefill batch
+was padded to its longest prompt — on real prompt lengths, a batch of 32
+computed **13.4× the positions it kept**, and the mask that hid them also ruled
+FlashAttention out. Packed end to end with `cu_seqlens`, the same mixed-length
+workload runs **2,009 → 3,337 tok/s (1.7×)**, and **4.8×** when outputs are short
+enough that prefill is most of the work. On prompts that are all the same length
+it is 1.00×, which is why no number in this file moved until the benchmark
+grew a mixed-length shape to measure it on.
+
 **One of those reverts came back.** Split-K decode lost by 6% in #34 because the
 extra kernel launch it adds per layer cost more than the kernel saved, on a step
 that was then 47% host time. A captured step is 97.5% GPU, so the same kernel now

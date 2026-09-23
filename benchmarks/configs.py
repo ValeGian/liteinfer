@@ -30,6 +30,10 @@ class BenchmarkConfig:
     """Off by default for the same reason: every row stored before §3.2 was
     measured launching the decode forward kernel by kernel, and must go on
     meaning that."""
+    enable_packed_prefill: bool = False
+    """Off by default for the same reason again: every row stored before §3.6 was
+    measured left-padding each prefill batch to its longest prompt, and must go
+    on meaning that."""
     paged_decode_splits: int | None = 1
     """Programs sharing one sequence's decode key loop. One by default for the
     same reason again: every row stored before §2.7 ran the unsplit grid, and a
@@ -172,6 +176,34 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         paged_decode_splits=None,
         baseline="liteinfer-graphs-16k",
         description="Split decode where attention is most of the step: long context, narrow batch",
+    ),
+    # --- liteinfer: prefill packed instead of padded (§3.6) ---
+    BenchmarkConfig(
+        name="liteinfer-packed",
+        engine="liteinfer",
+        max_num_seqs=32,
+        max_model_len=2176,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        enable_packed_prefill=True,
+        paged_decode_splits=None,
+        baseline="liteinfer-graphs-mixed",
+        description=(
+            "Prefill as one flat token run, where FlashAttention's varlen entry can run: "
+            "CUDA, half precision, paged kernel. Measure it on a mixed-length dataset"
+        ),
+    ),
+    # The baseline it improves on: the same engine with the batch padded, at the
+    # context budget a mixed dataset needs (2,048 cap plus its output tokens).
+    BenchmarkConfig(
+        name="liteinfer-graphs-mixed",
+        engine="liteinfer",
+        max_num_seqs=32,
+        max_model_len=2176,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        paged_decode_splits=None,
+        description="Captured decode with a padded prefill, at a mixed dataset's context budget",
     ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(

@@ -12,7 +12,7 @@ import torch
 
 from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
-from liteinfer.models.attention import DenseKV, PagedKV
+from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
 
 _BLOCK_SIZE = 4
 _NUM_KV_HEADS = 2
@@ -156,3 +156,62 @@ def test_paged_payload_leaves_the_split_count_to_the_kernel_by_default():
     kv = payload.update(*_decode_token(len(request_ids)), _LAYER)
 
     assert kv.num_splits is None
+
+
+def _prompt_kv(lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """K/V for prompts laid end to end, as a packed prefill pass computes them."""
+    generator = torch.Generator().manual_seed(1)
+    shape = (1, _NUM_KV_HEADS, sum(lengths), _HEAD_DIM)
+    return torch.randn(shape, generator=generator), torch.randn(shape, generator=generator)
+
+
+def test_packed_prefill_payload_reports_where_each_prompt_starts():
+    """`cu_seqlens` is what replaces the padding a mask used to hide."""
+    cache = _cache()
+    request_ids, lengths = ["a", "b"], [2, 5]
+    for request_id, length in zip(request_ids, lengths, strict=True):
+        cache.register(request_id, length)
+    payload = cache.make_packed_prefill_payload(request_ids, lengths)
+
+    kv = payload.update(*_prompt_kv(lengths), _LAYER)
+
+    assert kv.cu_seqlens.tolist() == [0, 2, 7]
+
+
+def test_packed_prefill_payload_writes_the_same_pool_as_the_padded_one():
+    """Same prompts, same slots: the layout of the pass changes, the cache does not."""
+    lengths = [2, 5]
+    request_ids = ["a", "b"]
+    packed_cache, padded_cache = _cache(), _cache()
+    for cache in (packed_cache, padded_cache):
+        for request_id, length in zip(request_ids, lengths, strict=True):
+            cache.register(request_id, length)
+
+    keys, values = _prompt_kv(lengths)
+    packed_cache.make_packed_prefill_payload(request_ids, lengths).update(keys, values, _LAYER)
+
+    # The padded pass computes the same K/V left-padded, which is the same
+    # columns with zeros in front of the shorter prompt.
+    padded_keys = torch.zeros(len(lengths), _NUM_KV_HEADS, max(lengths), _HEAD_DIM)
+    padded_values = torch.zeros_like(padded_keys)
+    start = 0
+    for row, length in enumerate(lengths):
+        padded_keys[row, :, max(lengths) - length :] = keys[0, :, start : start + length]
+        padded_values[row, :, max(lengths) - length :] = values[0, :, start : start + length]
+        start += length
+    padded_cache.make_prefill_payload(request_ids, lengths).update(
+        padded_keys, padded_values, _LAYER
+    )
+
+    torch.testing.assert_close(
+        packed_cache.layer_storage(_LAYER)[0], padded_cache.layer_storage(_LAYER)[0]
+    )
+
+
+def test_packed_prefill_payload_returns_a_varlen_kv():
+    """The returned type is what selects the kernel, so it is part of the contract."""
+    cache = _cache()
+    cache.register("a", 3)
+    payload = cache.make_packed_prefill_payload(["a"], [3])
+
+    assert isinstance(payload.update(*_prompt_kv([3]), _LAYER), VarlenKV)

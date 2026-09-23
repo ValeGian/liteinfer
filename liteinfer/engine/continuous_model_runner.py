@@ -23,7 +23,7 @@ from liteinfer.engine.cuda_graphs import DecodeGraphs, graphs_are_enabled
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models import LAST_POSITION
-from liteinfer.models.attention import reads_paged_kv
+from liteinfer.models.attention import reads_paged_kv, varlen_unsupported_reason
 from liteinfer.models.loader import load_hf_model
 from liteinfer.models.paged_decode import choose_num_splits
 from liteinfer.tokenizer import Tokenizer
@@ -43,6 +43,36 @@ _CPU_NOMINAL_TOTAL_BYTES = 1 << 30
 _PROFILE_WARMUP_TOKENS = 16
 
 
+def _packing_is_enabled(
+    requested: bool | None, implementation: str, device: torch.device, dtype: torch.dtype
+) -> bool:
+    """Whether prefill packs its batch, from the config and what the device can run.
+
+    `None` packs wherever the preconditions hold, which is the same rule
+    `enable_cuda_graphs` follows. An explicit `True` that cannot run raises
+    rather than quietly padding: a benchmark row that asks for the packed path
+    has to get it, or hear why it could not.
+    """
+    if requested is False:
+        return False
+    reason = varlen_unsupported_reason(implementation, device, dtype)
+    if reason is None:
+        return True
+    if requested is True:
+        raise ValueError(f"enable_packed_prefill was asked for but {reason}")
+    return False
+
+
+def _last_token_indices(prompt_lens: list[int], device: torch.device) -> torch.Tensor:
+    """Where each prompt's last token sits in the packed run.
+
+    Sampling reads one row per sequence, and in a packed batch those rows are at
+    the end of each prompt rather than in a shared last column.
+    """
+    ends = torch.tensor(prompt_lens, device=device).cumsum(0)
+    return ends - 1
+
+
 def _head_dim(hf_config: PretrainedConfig) -> int:
     """Head dimension, which most configs state and the rest imply."""
     return getattr(
@@ -60,16 +90,30 @@ class ContinuousModelRunner:
         self._cache: ContinuousKVCache | None = None
         self._graphs: DecodeGraphs | None = None
         self._forward_bytes = 0
+        self._packed_prefill_enabled = False
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
+        # After the model, because the kernel is what decides whether a packed
+        # batch can be read at all, and `load_hf_model` is where it is resolved.
+        self._packed_prefill_enabled = _packing_is_enabled(
+            self.config.enable_packed_prefill,
+            self.attn_implementation,
+            self.device,
+            self.config.dtype,
+        )
         # Measured before the pool exists, because the pool gets whatever the
         # forward turns out not to need.
         self._forward_bytes = self._profile_forward_bytes()
         self._cache = ContinuousKVCache(self._create_block_pool())
         self._graphs = self._create_decode_graphs()
+
+    @property
+    def _packs_prefill(self) -> bool:
+        """Whether prefill goes in packed, resolved once at load rather than per step."""
+        return self._packed_prefill_enabled
 
     @property
     def attn_implementation(self) -> str:
@@ -115,6 +159,9 @@ class ContinuousModelRunner:
         for seq, prompt_len in zip(seqs, prompt_lens, strict=True):
             self._cache.register(seq.request_id, prompt_len)
 
+        if self._packs_prefill:
+            return self._packed_prefill(request_ids, prompt_lens, seqs)
+
         input_ids, position_ids = self._build_prefill_inputs(seqs, prompt_lens, max_prompt_len)
         build_prefill, _ = builders_for(type(self.model).__name__)
         attention_mask = build_prefill(prompt_lens, self.config.dtype, self.device)
@@ -127,6 +174,46 @@ class ContinuousModelRunner:
             logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]  # left-padded, so the last column is the last real token
+
+    def _packed_prefill(
+        self, request_ids: list[str], prompt_lens: list[int], seqs: list[Sequence]
+    ) -> torch.Tensor:
+        """Prefill the same prompts as one flat run of tokens, with no padding.
+
+        A padded batch computes `len(seqs) * max(prompt_lens)` positions to keep
+        `sum(prompt_lens)` of them. On prompts whose lengths vary — which is what
+        real traffic is — that ratio reaches 13.4x at 32 sequences, and it is
+        entirely wasted work plus a mask to hide it afterwards.
+        """
+        assert self._cache is not None and self.model is not None
+
+        input_ids, position_ids = self._build_packed_prefill_inputs(seqs, prompt_lens)
+        payload = self._cache.make_packed_prefill_payload(request_ids, prompt_lens)
+        out = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=payload,
+            attention_mask=None,
+            logits_positions=_last_token_indices(prompt_lens, self.device),
+        )
+        return out.logits[0]
+
+    def _build_packed_prefill_inputs(
+        self, seqs: list[Sequence], prompt_lens: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Every prompt end to end as `[1, total_tokens]`, positions restarting per prompt.
+
+        The leading axis is 1 because the batch is the token run itself; what the
+        batch axis used to carry now lives in `cu_seqlens` on the payload, and in
+        the positions, which restart at zero for each prompt so RoPE sees each
+        one from its own beginning.
+        """
+        token_ids = [token for seq in seqs for token in seq.prompt_token_ids]
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        position_ids = torch.cat(
+            [torch.arange(prompt_len, device=self.device) for prompt_len in prompt_lens]
+        ).unsqueeze(0)
+        return input_ids, position_ids
 
     @torch.inference_mode()
     def decode(self, seqs: list[Sequence]) -> torch.Tensor:

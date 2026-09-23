@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, slot_table
+from liteinfer.cache.block_pool import BlockPool, slot_mapping, slot_table
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
 
 CPU = torch.device("cpu")
@@ -13,6 +13,10 @@ BLOCK_SIZE = 4
 
 def _table(block_tables, counts):
     return slot_table(block_tables, counts, BLOCK_SIZE, CPU)
+
+
+def _mapping(block_tables, counts):
+    return slot_mapping(block_tables, counts, BLOCK_SIZE, CPU)
 
 
 def test_slots_follow_block_index_times_block_size() -> None:
@@ -77,3 +81,30 @@ def test_advance_allocates_a_block_only_when_the_last_one_fills() -> None:
     cache.advance(["r0"])                        # token 5 needs a second block
 
     assert len(cache._block_tables["r0"]) == blocks_after_prompt + 1
+
+
+# --- packed: the same addresses, laid end to end -----------------------------
+
+
+def test_packed_mapping_lays_sequences_end_to_end() -> None:
+    # Block 2 for three tokens, block 5 for two -> 8, 9, 10 then 20, 21.
+    assert _mapping([[2], [5]], [3, 2]).tolist() == [[8, 9, 10, 20, 21]]
+
+
+def test_packed_mapping_holds_one_slot_per_real_token() -> None:
+    """No padded columns, which is the whole difference from `slot_table`."""
+    assert _mapping([[1], [3, 6], [0]], [2, 7, 1]).shape == (1, 10)
+
+
+def test_packed_mapping_crosses_blocks_within_a_sequence() -> None:
+    # Blocks 0 then 3, five tokens -> 0..3 then 12, same as the padded table.
+    assert _mapping([[0, 3]], [5]).tolist() == [[0, 1, 2, 3, 12]]
+
+
+def test_packed_mapping_addresses_the_same_slots_as_the_padded_table() -> None:
+    """Two layouts of one answer: the padded table's real columns, concatenated."""
+    block_tables, counts = [[2], [5, 1]], [3, 6]
+    padded = _table(block_tables, counts)
+    real = torch.cat([row[-count:] for row, count in zip(padded, counts)])
+
+    assert _mapping(block_tables, counts).tolist() == [real.tolist()]

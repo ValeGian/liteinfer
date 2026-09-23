@@ -1,0 +1,28 @@
+{
+  "config": "liteinfer-packed",
+  "engine": "liteinfer",
+  "description": "Prefill as one flat token run; measure it on a mixed-length dataset",
+  "baseline": "liteinfer-graphs-mixed",
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-09-12T09:44:18+00:00",
+  "revision": "16a85ab-dirty",
+  "dataset": {
+    "path": "benchmarks/datasets/islmixed2048_osl16_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": null,
+    "target_osl": 16,
+    "max_isl": 2048,
+    "num_samples": 200,
+    "sha256": "d3de8f4e6ec9fb683be98e3316da7affe078e382b47d7b63dcf379259ba5f14e"
+  },
+  "summary": {
+    "output_tokens_per_s": 2422.1705741091864,
+    "requests_per_s": 151.38566088182415,
+    "wall_time_s": 1.3211290873587132
+  },
+  "raw": {
+    "wall_time_s": 1.3211290873587132,
+    "output_tokens": 3200
+  }
+}

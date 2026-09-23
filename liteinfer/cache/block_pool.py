@@ -109,6 +109,40 @@ class BlockPool:
         return self._keys[layer_idx], self._values[layer_idx]
 
 
+def slot_mapping(
+    block_tables: Sequence[Sequence[int]],
+    counts: Sequence[int],
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """One physical slot per real token, the sequences laid end to end.
+
+    Returns ``[1, sum(counts)]``, so it indexes a packed pass the way
+    `slot_table` indexes a padded one — same arithmetic, no padded columns and no
+    right-alignment, because a packed batch has nothing to align to. The leading
+    axis of 1 is the packed batch axis the layers still carry.
+
+    Built on the device from three vectors rather than a Python loop per
+    sequence: the request each token belongs to, its position within that
+    request, and the block table row to read. That is the same shape of
+    computation `slot_table` does, and it is why both live here.
+    """
+    width = max(len(table) for table in block_tables)
+    padded = [list(table) + [0] * (width - len(table)) for table in block_tables]
+
+    blocks = torch.tensor(padded, dtype=torch.long, device=device)
+    count = torch.tensor(counts, device=device)
+
+    owner = torch.repeat_interleave(torch.arange(len(counts), device=device), count)
+    # Position within the owning sequence: a running index minus where that
+    # sequence starts, which `cumsum` gives for every token at once.
+    starts = torch.cumsum(count, 0) - count
+    logical = torch.arange(int(count.sum()), device=device) - starts[owner]
+
+    slots = blocks[owner].gather(1, (logical // block_size).unsqueeze(1)).squeeze(1)
+    return (slots * block_size + logical % block_size).unsqueeze(0)
+
+
 def slot_table(
     block_tables: Sequence[Sequence[int]],
     counts: Sequence[int],

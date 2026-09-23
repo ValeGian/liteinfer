@@ -4,6 +4,27 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 12-09-2026 — §3.6 The prefill batch stops being padded
+
+- **PRs.** [#42](https://github.com/ValeGian/liteinfer/pull/42)
+- **What.** A prefill batch was left-padded to its longest prompt, so the pass computed `len(seqs) * max(prompt_lens)` positions to keep `sum(prompt_lens)` of them, then built a mask to hide the difference. Packed, the batch is one flat run of tokens with `cu_seqlens` marking the boundaries. On §8.7's mixed-length shape a batch of 32 computes **13.36x** the positions it keeps; on every fixed-ISL dataset the ratio is exactly 1.00, which is why nothing before §8.7 could see this.
+- **Measured**, both halves of every row in one session on one revision:
+
+  | throughput | padded | packed | |
+  |---|---:|---:|---:|
+  | mixed ≤2048 / OSL 128 | 2,009.2 tok/s | **3,336.5** | **1.66x** |
+  | mixed ≤2048 / OSL 16 | 504.5 tok/s | **2,422.2** | **4.80x** |
+  | fixed ISL 128 / OSL 256 | 3,371.2 tok/s | 3,367.3 | 1.00x |
+
+- **The ceiling was computed first and the result beat it**, which is the informative part. `EngineStats` already splits prefill wall from decode wall: prefill was **77.2%** of the OSL 16 run and 44.2% of the OSL 128 one, so removing 13.36x of padded arithmetic predicted 3.50x and 1.69x. Measured 4.80x and 1.66x. The estimate counted padded positions alone, and packing removes three more costs at once: the additive mask — which no flash kernel accepts, so a padded prefill runs on the memory-efficient backend, 3.27x slower at 2,048 tokens — the `_repeat_kv` copy of K and V per query head, and the attention those padded positions implied.
+- **It costs nothing where there is nothing to remove**, which the fixed-ISL row says: 1.00x. Decode is untouched either way — it is already packed, one query per sequence — so §3.2's captures and §2.7's split counts carry over and no latency number moves.
+- **The varlen entry point needed no new dependency.** `torch.ops.aten._flash_attention_forward` is what PyTorch's own SDPA calls once it has decided flash applies; going through it directly is what lets the call carry `cu_seqlens`, which SDPA's public signature has nowhere to put. It is a private op, so its answer is pinned against `eager` on mixed lengths, on grouped-query heads, and on the boundary case — two sequences in one run must answer what one sequence run alone answers.
+- **A bug that only a parity test could have caught.** `VarlenKV` names its fields `keys` and `values` exactly as the dense payloads do, so `eager_attention` accepted a packed batch: it attended across the boundary between two prompts and, with no mask, across each prompt's own future — returning plausible tokens rather than raising. The e2e suite caught it, liteinfer answering "the capital of France is the capital of France is" where `transformers` answered "Paris". No benchmark would ever have shown it. Packing is now gated on the kernel as well as the device (`handles_packed_prefill`), and the dense kernels reject a packed batch loudly.
+- **A measurement instruction that was wrong.** The roadmap said to measure this in `latency` mode, reading TTFT. Latency mode sets the batch width to 1, and a batch of one prompt has no padding — the mode could not have shown the effect at all. Padding is a cost of batching, so `throughput` is what measures it. Corrected in the item before it was retired here.
+- **Left behind for the chain.** §2.9 shrank to the decode write path, since `slot_mapping` now exists and prefill already writes through it. §3.5 shrank again: `_repeat_kv` now runs only in `eager` and `sdpa`, neither of which is a performance path.
+
+---
+
 ## 11-09-2026 — §8.7 A dataset whose prompts are not all the same length
 
 - **PRs.** [#41](https://github.com/ValeGian/liteinfer/pull/41)
