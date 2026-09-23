@@ -65,20 +65,25 @@ def test_a_budgeted_cuda_engine_generates_what_an_unbudgeted_one_does(tiny_llama
 
 
 _CHUNKED_PROMPT_LEN = 30
+_CHUNKS = [7, 16, 7]
 _DECODE_STEPS = 3
-# bf16 logits of a model whose attention outputs are small: two paths that sum
-# the same keys in a different order land within a few ulps at this magnitude.
-_TOLERANCE = {"rtol": 0, "atol": 2**-5}
+# How much more a chunked bf16 run may drift from single precision than the
+# whole-prompt bf16 run already does. The logits reach ~60, where one bf16 ulp is
+# 0.25, so any fixed tolerance is either looser than a real bug or tighter than
+# the rounding; a ratio to the path being matched is neither. Measured on the
+# tiny model: both runs sit 0.10-0.14 from the reference, a chunk that ignores
+# its prefix 3.19 on prefill and 0.26-0.34 on decode, a context one token short
+# 0.39 on prefill — so twice the whole run's error separates them.
+_DRIFT_ALLOWANCE = 2.0
 
 
-def _runner(model_dir: Path) -> ContinuousModelRunner:
+def _runner(model_dir: Path, dtype: torch.dtype = torch.bfloat16) -> ContinuousModelRunner:
     config = EngineConfig(
-        model=str(model_dir), device="cuda", dtype=torch.bfloat16,  # type: ignore[arg-type]
+        model=str(model_dir), device="cuda", dtype=dtype,  # type: ignore[arg-type]
         max_num_seqs=1, max_model_len=64,
     )
     runner = ContinuousModelRunner(config)
     runner.load_model()
-    assert runner._packs_prefill and runner.captured_decode_widths == [], "packed, graphs pending"
     return runner
 
 
@@ -92,35 +97,47 @@ def _sequence() -> Sequence:
     )
 
 
-def _prefill_logits(runner: ContinuousModelRunner, seq: Sequence, chunks: list[int]) -> torch.Tensor:
-    """Logits at the end of the prompt, prefilled in `chunks` packed passes."""
+def _run(model_dir: Path, chunks: list[int], dtype: torch.dtype = torch.bfloat16) -> list[torch.Tensor]:
+    """Logits at the prompt's end, then after each captured decode step over fixed tokens."""
+    runner, seq = _runner(model_dir, dtype), _sequence()
+    assert runner._packs_prefill == (dtype == torch.bfloat16), "bf16 packs; fp32 is the padded reference"
     for count in chunks:
         logits = runner.prefill([seq], [count])
-    return logits
-
-
-def _decode_logits(model_dir: Path, chunks: list[int]) -> list[torch.Tensor]:
-    """A few captured decode steps over fixed tokens, after prefilling in `chunks`."""
-    runner, seq = _runner(model_dir), _sequence()
-    _prefill_logits(runner, seq, chunks)
-    steps = []
+    steps = [logits.float()]
     for step in range(_DECODE_STEPS):
         seq.output_token_ids.append(3 + step)
-        steps.append(runner.decode([seq]))
+        steps.append(runner.decode([seq]).float())
     return steps
 
 
-def test_the_last_chunk_of_a_prompt_predicts_what_the_whole_prompt_does(tiny_llama_dir: Path):
-    whole = _prefill_logits(_runner(tiny_llama_dir), _sequence(), [_CHUNKED_PROMPT_LEN])
-    chunked = _prefill_logits(_runner(tiny_llama_dir), _sequence(), [7, 16, 7])
-
-    torch.testing.assert_close(chunked, whole, **_TOLERANCE)
+def _drift(run: list[torch.Tensor], reference: list[torch.Tensor], step: int) -> float:
+    return (run[step] - reference[step]).abs().max().item()
 
 
-@pytest.mark.parametrize("step", range(_DECODE_STEPS))
-def test_a_captured_decode_reads_what_the_chunks_wrote(tiny_llama_dir: Path, step: int):
+@pytest.fixture(scope="module")
+def runs(tiny_llama_dir: Path) -> dict[str, list[torch.Tensor]]:
+    """The single-precision reference, and the bf16 engine with the prompt whole and chunked.
+
+    In bf16 on CUDA the chunked run's later chunks go through the paged kernel
+    and the whole prompt through FlashAttention; in fp32 packing is off and the
+    prompt goes through `sdpa`, which is what makes it a reference for both.
+    """
+    return {
+        "reference": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN], torch.float32),
+        "whole": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN]),
+        "chunked": _run(tiny_llama_dir, _CHUNKS),
+    }
+
+
+def test_the_last_chunk_of_a_prompt_predicts_what_the_whole_prompt_does(runs):
+    reference = runs["reference"]
+
+    assert _drift(runs["chunked"], reference, 0) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, 0)
+
+
+@pytest.mark.parametrize("step", range(1, _DECODE_STEPS + 1))
+def test_a_captured_decode_reads_what_the_chunks_wrote(runs, step: int):
     """Graph-replayed decode walks the pool the packed chunks filled, so a misplaced token shows."""
-    whole = _decode_logits(tiny_llama_dir, [_CHUNKED_PROMPT_LEN])
-    chunked = _decode_logits(tiny_llama_dir, [7, 16, 7])
+    reference = runs["reference"]
 
-    torch.testing.assert_close(chunked[step], whole[step], **_TOLERANCE)
+    assert _drift(runs["chunked"], reference, step) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, step)

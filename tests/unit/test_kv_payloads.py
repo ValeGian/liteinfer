@@ -209,16 +209,24 @@ def _left_padded(keys: torch.Tensor, lengths: list[int]) -> torch.Tensor:
     return padded
 
 
+def _packed_whole_prompts(
+    cache: ContinuousKVCache, request_ids: list[str], lengths: list[int], keys, values
+) -> VarlenKV:
+    """What a packed pass over whole prompts hands attention: this pass's K/V and boundaries."""
+    kv = cache.make_packed_prefill_payload(request_ids, lengths).update(keys, values, _LAYER)
+    assert isinstance(kv, VarlenKV), "nothing was cached before the pass"
+    return kv
+
+
 def test_packed_prefill_payload_reports_where_each_prompt_starts():
-    """`cu_seqlens_q` marks where each prompt starts; a padded pass needs padding and a mask for that."""
+    """`cu_seqlens` marks where each prompt starts; a padded pass needs padding and a mask for that."""
     cache = _cache()
     request_ids, lengths = ["a", "b"], [2, 5]
     _registered(cache, request_ids, lengths)
-    payload = cache.make_packed_prefill_payload(request_ids, lengths)
 
-    kv = payload.update(*_prompt_kv(lengths), _LAYER)
+    kv = _packed_whole_prompts(cache, request_ids, lengths, *_prompt_kv(lengths))
 
-    assert kv.cu_seqlens_q.tolist() == [0, 2, 7]
+    assert kv.cu_seqlens.tolist() == [0, 2, 7]
 
 
 def test_a_whole_prompt_attends_to_the_keys_its_own_pass_computed():
@@ -227,7 +235,7 @@ def test_a_whole_prompt_attends_to_the_keys_its_own_pass_computed():
     _registered(cache, ["a"], [3])
     keys, values = _prompt_kv([3])
 
-    kv = cache.make_packed_prefill_payload(["a"], [3]).update(keys, values, _LAYER)
+    kv = _packed_whole_prompts(cache, ["a"], [3], keys, values)
 
     assert kv.keys is keys
 
@@ -267,7 +275,7 @@ _FIRST_CHUNK = [4, 2]
 _SECOND_CHUNK = [2, 1]
 
 
-def _chunked_packed(cache: ContinuousKVCache) -> VarlenKV:
+def _chunked_packed(cache: ContinuousKVCache) -> PagedKV:
     """Prefill `_CHUNKED_LENGTHS` in two packed passes; return what the second one hands attention."""
     request_ids = ["a", "b"]
     keys, values = _prompt_kv(_CHUNKED_LENGTHS)
@@ -278,9 +286,11 @@ def _chunked_packed(cache: ContinuousKVCache) -> VarlenKV:
     )
     cache.advance(request_ids, _SECOND_CHUNK)
     second = [slice(count, None) for count in _FIRST_CHUNK]
-    return cache.make_packed_prefill_payload(request_ids, _SECOND_CHUNK).update(
+    kv = cache.make_packed_prefill_payload(request_ids, _SECOND_CHUNK).update(
         _ragged_chunk(keys, second), _ragged_chunk(values, second), _LAYER
     )
+    assert isinstance(kv, PagedKV), "a continuing chunk reads the pool"
+    return kv
 
 
 def _ragged_chunk(keys: torch.Tensor, chunks: list[slice]) -> torch.Tensor:
@@ -292,24 +302,35 @@ def _ragged_chunk(keys: torch.Tensor, chunks: list[slice]) -> torch.Tensor:
     return torch.cat(pieces, dim=2)
 
 
+def test_a_continuing_chunk_hands_the_kernel_the_pool_rather_than_a_copy():
+    """The prefix stays where an earlier pass wrote it."""
+    cache = _cache()
+
+    kv = _chunked_packed(cache)
+
+    assert kv.key_pool.data_ptr() == cache.layer_storage(_LAYER)[0].data_ptr()
+
+
 def test_a_continuing_chunk_brings_only_its_own_queries():
     kv = _chunked_packed(_cache())
 
-    assert kv.cu_seqlens_q.tolist() == [0, 2, 3]
+    assert kv.query_start_loc is not None and kv.query_start_loc.tolist() == [0, 2, 3]
 
 
 def test_a_continuing_chunk_attends_to_everything_its_sequence_holds():
-    """The prefix an earlier pass wrote is part of the keys, bounded per sequence."""
+    """The prefix an earlier pass wrote is part of the context, bounded per sequence."""
     kv = _chunked_packed(_cache())
 
-    assert kv.cu_seqlens_k.tolist() == [0, 6, 9]
+    assert kv.context_lens.tolist() == [6, 3]
 
 
-def test_a_continuing_chunk_reads_back_the_prefix_an_earlier_pass_wrote():
-    """The keys are the whole prompt, as if it had been computed in one pass."""
+def test_a_continuing_chunk_addresses_the_prefix_an_earlier_pass_wrote():
+    """Read through its addresses, the pool holds the whole prompt, as if computed in one pass."""
     kv = _chunked_packed(_cache())
 
-    torch.testing.assert_close(kv.keys, _prompt_kv(_CHUNKED_LENGTHS)[0])
+    rows = [row[-length:] for row, length in zip(kv.slot_table, _CHUNKED_LENGTHS, strict=True)]
+    read_back = kv.key_pool[torch.cat(rows)].permute(1, 0, 2).unsqueeze(0)
+    torch.testing.assert_close(read_back, _prompt_kv(_CHUNKED_LENGTHS)[0])
 
 
 def test_a_padded_continuing_chunk_reads_back_the_whole_prompt_left_padded():
