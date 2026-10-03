@@ -124,13 +124,23 @@ def _warmup(adapter: adapters.Adapter, config: BenchmarkConfig, data: Dataset, m
 
 def _run_throughput(adapter: adapters.Adapter, data: Dataset) -> tuple[dict, dict]:
     prompts = [s.prompt for s in data.samples]
+    phases_before = adapter.step_phases()
     start = time.perf_counter()
     counts = adapter.generate(prompts, data.target_osl)
     wall_time_s = time.perf_counter() - start
 
     _check_lengths(counts, data.target_osl)
     summary = stats.throughput_summary(sum(counts), len(counts), wall_time_s)
-    return summary.as_dict(), {"wall_time_s": wall_time_s, "output_tokens": sum(counts)}
+    raw = {"wall_time_s": wall_time_s, "output_tokens": sum(counts)}
+    phases_after = adapter.step_phases()
+    if phases_before is not None and phases_after is not None:
+        # Which steps the timed run was made of. A change to how a step is run —
+        # one forward where prefill and decode meet (§1.3) — can only move a
+        # number in proportion to how many such steps the workload builds.
+        raw["step_phases"] = {
+            phase: count - phases_before.get(phase, 0) for phase, count in phases_after.items()
+        }
+    return summary.as_dict(), raw
 
 
 def _run_latency(adapter: adapters.Adapter, data: Dataset) -> tuple[dict, dict]:

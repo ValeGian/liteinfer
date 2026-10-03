@@ -212,9 +212,10 @@ is no longer what the numbers show.
 
 **Batching works at both tiers.** Static batching converts B=1 → B=4 at 3.84×
 against vLLM's 3.84× on the same transition. Continuous batching converts
-B=4 → B=32 at 5.01× against vLLM's 6.17×. Whatever the two-pass prefill+decode
-step (§1.3) costs, it is a modest residual rather than a dominant term:
-continuous ITL (15.4 ms) sits level with static paged (15.0 ms).
+B=4 → B=32 at 5.01× against vLLM's 6.17×. The two-pass prefill+decode step was
+once the suspect for that gap; §1.3 measured that the throughput harness almost
+never builds such a step, so it is not the cause. Continuous ITL (15.4 ms) sits
+level with static paged (15.0 ms).
 
 **Paging cost ~8-10%, and paying it back is what §2.3 did.** Paged reached 0.92×
 of native-eager on throughput at B=1, 0.90× at B=4, and 0.90× on ITL, because the
@@ -1422,6 +1423,79 @@ At the mixed dataset's median prompt of 18 tokens it is 3.3x faster, and within
 4% at the rest — which says one kernel for every row is affordable, and leaves
 the engine-level measurement to the stage that would make the switch.
 
+### One forward for a step that admits while others decode (§1.3)
+
+A step that admitted prompts while other sequences decoded ran two forwards: a
+prefill pass and a decode pass, each paying its own ~700 launches. Now a packed
+engine runs it as one forward, every row read out of the pool by `paged_prefill`
+— a sampled token is a chunk of one. A step of decodes alone still takes the
+captured decode graph; padded engines still run two passes.
+
+**One attention launch, not two, measured per layer** at Llama-3.2-1B's shapes
+(32 query heads, 8 KV heads, head dim 64, bf16) on an A40, each variant through
+a captured graph, five repeats of 500 replays, best kept. "Two" is
+`paged_prefill` over the prompt rows plus `paged_decode` over the decode rows,
+at the split count the engine would choose:
+
+| step | one launch | two launches | one / two |
+|---|---:|---:|---:|
+| 1 fresh x 18 + 31 decode @ 150 | **24.0 us** | 26.7 us | 0.90x |
+| 2 fresh x 200 + 30 decode @ 500 | **67.9 us** | 77.0 us | 0.88x |
+| 1 fresh x 1,500 + 31 decode @ 1,000 | 256.0 us | 257.0 us | 1.00x |
+| chunk 256 over 1,744 + 31 decode @ 2,000 | 306.7 us | 304.3 us | 1.01x |
+| 16k: chunk 512 over 8,192 + 1 decode @ 16,000 | 719.3 us | **601.7 us** | 1.20x |
+| 16k: chunk 512 over 8,192 + 3 decode @ 16,000 | 770.8 us | **712.8 us** | 1.08x |
+| 16k: fresh 64 + 7 decode @ 16,000 | 629.0 us | **416.5 us** | **1.51x** |
+
+At a 32-wide batch one launch is as fast or faster, and a second launch is not
+free where a mixed pass runs eager: launched back to back, one call costs 52.9 us
+of wall and two cost 100.6 us at 31 decode rows (152.3 us at 3, where the decode
+rows split), so 0.75-1.6 ms more per step over 16 layers. At 16k with a narrow
+batch the decode rows lose `paged_decode`'s split-K, about 3.4 ms per step on the
+worst shape — still under the ~7.5 ms graphed decode pass the step no longer runs,
+so a smaller win rather than a loss. Filed as §2.12.
+
+**The throughput harness almost never builds such a step.** Every request is
+offered at once and asks for the same output length, so the engine admits in
+waves: a wave starts together, finishes together, and the next is admitted into
+an empty batch. Throughput results now store the timed run's steps by phase
+(`raw.step_phases`); from the stored rows:
+
+| dataset | budget | mixed steps |
+|---|---:|---:|
+| mixed ≤2048 / OSL 128 | none (`liteinfer-packed`) | 0 of 896 |
+| mixed ≤2048 / OSL 128 | 2,048 (`liteinfer-onepass-budget`) | 12 of 896 (1.3%) |
+| ISL 128 / OSL 256 | none | 0 of 1,792 |
+| ISL 128 / OSL 256 | 2,048 | 18 of 1,792 (1.0%) |
+
+A smaller budget staggers more — an unstored run at 512 tokens reached 4.7% —
+but not by enough to change the conclusion. A budget is what staggers a wave at
+all, so the paired rows run under one (`liteinfer-packed-budget` before, measured
+from master plus the config field; `liteinfer-onepass-budget` after, from the
+branch), on one A40, 200 samples:
+
+| shape | two forwards | one forward | |
+|---|---:|---:|---:|
+| mixed ≤2048 / OSL 128 | 3,164.0 tok/s | 3,194.7 | 1.01x |
+| ISL 128 / OSL 256 | 3,181.9 tok/s | 3,223.3 | 1.01x |
+
+The report marks the pair as different revisions, which they are. Inside
+run-to-run variance, as the step counts predict: 12-18 saved decode passes of
+~7 ms against 8-16 s runs. No regression, and no measurable win either; the
+workload this serves — requests arriving while others decode, where most steps
+admit — is not one the harness can offer yet (§8.8). The budget itself costs
+little: unbudgeted `liteinfer-packed` at the same revision reads 3,192.0 and
+3,281.8 tok/s on the two shapes, 1.00x and 1.02x of the budgeted rows.
+
+Latency mode never mixes, and checks that the decode-only route did not move.
+`liteinfer-packed` at ISL 128 / OSL 256, master (not stored) against the stored
+row: ITL p50 6.64 → 6.63 ms, p99 6.76 → 6.67, TTFT p50 16.2 → 15.3 ms.
+
+The same session refreshed `liteinfer-packed` and its baseline
+`liteinfer-graphs-mixed` together, so §3.6's delta keeps comparing one revision:
+1.65x at OSL 128 (1.66x when §3.6 landed) and 4.46x at OSL 16 (4.80x), the
+second a 1.5 s run measured beside two others on the same host.
+
 ### A stable run is not a comparable one
 
 Two latency rows from the §1.5 re-measurement came back saying `paged-attn` was
@@ -1486,8 +1560,8 @@ Ordered by cost, largest first.
 | Gap | Measured | Root cause | Roadmap |
 |---|---|---|---|
 | 1.3x slower than vLLM per decode step | ITL 6.6 ms vs 5.2 ms; 1.86x the memory roofline vs vLLM's 1.47x | Unfused elementwise work — ~45 kernels per layer where ten would do | [§3.1](roadmap.md#31-fuse-the-forwards-elementwise-work) |
-| Prefill is two passes when a batch mixes admission with decode | not isolated; a step that admits while others decode issues one forward for each | The runner has a `prefill` and a `decode` entry, and nothing that mixes them | [§1.3](roadmap.md#13-one-forward-for-a-mixed-batch) |
-| Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Two-pass step when prefill and decode coexist | [§1.3](roadmap.md#13-one-forward-for-a-mixed-batch) |
+| A mixed step's benefit is unmeasured | 1.01x, inside variance; 1-5% of throughput steps are mixed | The harness offers every request at once with one output length, so admission comes in waves | [§8.8](roadmap.md#88-open-loop-throughput-requests-that-arrive-over-time) |
+| Continuous batching scales slightly below vLLM | 5.01x for 8x width vs vLLM's 6.17x | Not the two-pass step, which the throughput harness almost never builds (§1.3); unexplained | — |
 | KV-cache benefit unquantified across shapes | 1.21x at ISL 128 / OSL 256 only | Single measured shape, and not re-measurable: the no-cache and DynamicCache configs are `historical`, so the number is frozen at the engine of the day they were deleted | — |
 | No prefix-cache benefit | not measured | Prefix caching not implemented | [§2.2](roadmap.md#22-prefix-sharing) |
 

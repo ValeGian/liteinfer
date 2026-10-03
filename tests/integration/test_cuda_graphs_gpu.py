@@ -60,11 +60,11 @@ def _sequences(prompt_lens: tuple[int, ...]) -> list[Sequence]:
 def _greedy_tokens(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) -> list[list[int]]:
     """Decode greedily for a fixed number of steps and return each sequence's tokens."""
     seqs = _sequences(prompt_lens)
-    logits = runner.prefill(seqs)
+    logits = runner.execute(seqs)
     for i, seq in enumerate(seqs):
         seq.output_token_ids.append(int(logits[i].argmax()))
     for _ in range(_DECODE_STEPS):
-        logits = runner.decode(seqs)
+        logits = runner.execute(seqs)
         for i, seq in enumerate(seqs):
             seq.output_token_ids.append(int(logits[i].argmax()))
     return [list(seq.output_token_ids) for seq in seqs]
@@ -77,12 +77,12 @@ def _decode_logits(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) 
     step however far their logits drift.
     """
     seqs = _sequences(prompt_lens)
-    runner.prefill(seqs)
+    runner.execute(seqs)
     steps = []
     for step in range(_DECODE_STEPS):
         for seq in seqs:
             seq.output_token_ids.append(3 + step % 50)
-        steps.append(runner.decode(seqs))
+        steps.append(runner.execute(seqs))
     return torch.stack(steps)
 
 
@@ -132,16 +132,16 @@ def test_a_narrowing_batch_captures_each_width_it_visits(tiny_llama_dir: Path):
     """Sequences finish at different times, so the batch drains through widths."""
     runner = _runner(tiny_llama_dir, capture=True, max_num_seqs=4)
     seqs = _sequences(_PROMPT_LENS)
-    runner.prefill(seqs)
+    runner.execute(seqs)
     for seq in seqs:
         seq.output_token_ids.append(3)
 
     while len(seqs) > 1:
-        runner.decode(seqs)
+        runner.execute(seqs)
         for seq in seqs:
             seq.output_token_ids.append(3)
         runner.deregister_sequence(seqs.pop())  # retire one, as the scheduler would
-    runner.decode(seqs)
+    runner.execute(seqs)
 
     assert sorted(runner.captured_decode_widths) == [1, 2, 3]
 

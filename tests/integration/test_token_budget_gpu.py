@@ -2,8 +2,8 @@
 
 On CUDA the engine packs prefill and replays decode from captured graphs, so a
 chunk continuing a prompt goes through a path the CPU tests never reach:
-FlashAttention's varlen entry with fewer queries than keys, reading its prefix
-back out of the pool. Every test here runs the same prompts with and without a
+`paged_prefill`, reading its prefix where it lies in the pool, and — for a
+chunk of one token — the captured decode graph. Every test here runs the same prompts with and without a
 budget small enough to split them.
 """
 
@@ -20,6 +20,7 @@ from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
+from tests.integration.sequences import prompt_text
 
 pytestmark = pytest.mark.gpu
 
@@ -30,12 +31,8 @@ _SLOTS = 3
 _BUDGET = 8
 
 
-def _prompt(length: int, offset: int) -> str:
-    return " ".join(f"tok{2 + (offset + i) % 200}" for i in range(length))
-
-
 def _generate(model_dir: Path, max_num_batched_tokens: int | None) -> list[list[int]]:
-    prompts = [_prompt(length, 11 * i) for i, length in enumerate(_PROMPT_LENS)]
+    prompts = [prompt_text(length, 11 * i) for i, length in enumerate(_PROMPT_LENS)]
 
     async def _run():
         llm = AsyncLLM(
@@ -66,6 +63,9 @@ def test_a_budgeted_cuda_engine_generates_what_an_unbudgeted_one_does(tiny_llama
 
 _CHUNKED_PROMPT_LEN = 30
 _CHUNKS = [7, 16, 7]
+# Ends on a one-token chunk, which brings one token like a decode step and is
+# served by the captured decode graph rather than the packed prefill.
+_CHUNKS_ENDING_ON_ONE = [7, 22, 1]
 _DECODE_STEPS = 3
 # How much more a chunked bf16 run may drift from single precision than the
 # whole-prompt bf16 run already does. The logits reach ~60, where one bf16 ulp is
@@ -102,11 +102,11 @@ def _run(model_dir: Path, chunks: list[int], dtype: torch.dtype = torch.bfloat16
     runner, seq = _runner(model_dir, dtype), _sequence()
     assert runner._packs_prefill == (dtype == torch.bfloat16), "bf16 packs; fp32 is the padded reference"
     for count in chunks:
-        logits = runner.prefill([seq], [count])
+        logits = runner.execute([seq], [count])
     steps = [logits.float()]
     for step in range(_DECODE_STEPS):
         seq.output_token_ids.append(3 + step)
-        steps.append(runner.decode([seq]).float())
+        steps.append(runner.execute([seq]).float())
     return steps
 
 
@@ -126,18 +126,21 @@ def runs(tiny_llama_dir: Path) -> dict[str, list[torch.Tensor]]:
         "reference": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN], torch.float32),
         "whole": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN]),
         "chunked": _run(tiny_llama_dir, _CHUNKS),
+        "chunked_to_one": _run(tiny_llama_dir, _CHUNKS_ENDING_ON_ONE),
     }
 
 
-def test_the_last_chunk_of_a_prompt_predicts_what_the_whole_prompt_does(runs):
+@pytest.mark.parametrize("chunked", ["chunked", "chunked_to_one"])
+def test_the_last_chunk_of_a_prompt_predicts_what_the_whole_prompt_does(runs, chunked: str):
     reference = runs["reference"]
 
-    assert _drift(runs["chunked"], reference, 0) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, 0)
+    assert _drift(runs[chunked], reference, 0) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, 0)
 
 
+@pytest.mark.parametrize("chunked", ["chunked", "chunked_to_one"])
 @pytest.mark.parametrize("step", range(1, _DECODE_STEPS + 1))
-def test_a_captured_decode_reads_what_the_chunks_wrote(runs, step: int):
+def test_a_captured_decode_reads_what_the_chunks_wrote(runs, step: int, chunked: str):
     """Graph-replayed decode walks the pool the packed chunks filled, so a misplaced token shows."""
     reference = runs["reference"]
 
-    assert _drift(runs["chunked"], reference, step) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, step)
+    assert _drift(runs[chunked], reference, step) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, step)

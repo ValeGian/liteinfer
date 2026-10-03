@@ -12,37 +12,39 @@ import torch
 
 
 class Phase(str, Enum):
+    """What a step's forward carried: prompt tokens, sampled tokens, or both."""
+
     PREFILL = "prefill"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 @dataclass(frozen=True)
 class StepMetrics:
-    """Snapshot of one engine step."""
+    """Snapshot of one engine step, which is one forward wherever prefill is packed."""
 
     step_idx: int
-    phase: Phase
 
     num_seqs: int
-    input_tokens: int  # Total tokens in the forward-pass input across the batch.
-    new_tokens: int    # Total tokens sampled (and appended to outputs) this step.
+    input_tokens: int   # Total tokens in the forward-pass input across the batch.
+    prompt_tokens: int  # How many of `input_tokens` are prompt; the rest are sampled tokens.
+    new_tokens: int     # Total tokens sampled (and appended to outputs) this step.
 
     wall_time_s: float
     peak_gpu_mem_bytes: int | None = None
 
     @property
+    def phase(self) -> Phase:
+        """Read off the token counts rather than stored beside them, so the two cannot disagree."""
+        if self.prompt_tokens == 0:
+            return Phase.DECODE
+        if self.prompt_tokens == self.input_tokens:
+            return Phase.PREFILL
+        return Phase.MIXED
+
+    @property
     def throughput_tokens_per_s(self) -> float:
         return (self.input_tokens + self.new_tokens) / self.wall_time_s if self.wall_time_s > 0 else 0.0
-
-    @property
-    def decode_throughput_tokens_per_s(self) -> float:
-        return self.new_tokens / self.wall_time_s if self.wall_time_s > 0 else 0.0
-
-    @property
-    def prefill_throughput_tokens_per_s(self) -> float:
-        if self.phase != Phase.PREFILL:
-            return 0.0
-        return self.input_tokens / self.wall_time_s if self.wall_time_s > 0 else 0.0
 
 
 @dataclass
@@ -81,15 +83,18 @@ class TimeBreakdown:
 
 @dataclass
 class EngineStats:
-    """Cumulative stats + per-step log. Subscribe via `on_step`."""
+    """Cumulative stats + per-step log. Subscribe via `on_step`.
+
+    Totals are over every step and nothing is split by phase: a step that admits
+    beside running sequences computes prompt and sampled tokens in one forward,
+    and its wall time cannot be divided between them. Each step's
+    `prompt_tokens` and `new_tokens` are exact, and are what to sum for either
+    kind of work.
+    """
 
     steps: list[StepMetrics] = field(default_factory=list)
     total_input_tokens: int = 0
     total_new_tokens: int = 0
-    total_prefill_input_tokens: int = 0
-    total_prefill_wall_s: float = 0.0
-    total_decode_new_tokens: int = 0
-    total_decode_wall_s: float = 0.0
     total_wall_s: float = 0.0
     num_requests_finished: int = 0
     time: TimeBreakdown = field(default_factory=TimeBreakdown)
@@ -100,12 +105,6 @@ class EngineStats:
         self.total_input_tokens += step.input_tokens
         self.total_new_tokens += step.new_tokens
         self.total_wall_s += step.wall_time_s
-        if step.phase == Phase.PREFILL:
-            self.total_prefill_input_tokens += step.input_tokens
-            self.total_prefill_wall_s += step.wall_time_s
-        elif step.phase == Phase.DECODE:
-            self.total_decode_new_tokens += step.new_tokens
-            self.total_decode_wall_s += step.wall_time_s
         for listener in self.listeners:
             listener(step)
 
@@ -115,18 +114,6 @@ class EngineStats:
     @property
     def avg_throughput_tokens_per_s(self) -> float:
         return (self.total_input_tokens + self.total_new_tokens) / self.total_wall_s if self.total_wall_s > 0 else 0.0
-
-    @property
-    def avg_decode_throughput_tokens_per_s(self) -> float:
-        if self.total_decode_wall_s <= 0:
-            return 0.0
-        return self.total_decode_new_tokens / self.total_decode_wall_s
-
-    @property
-    def avg_prefill_throughput_tokens_per_s(self) -> float:
-        if self.total_prefill_wall_s <= 0:
-            return 0.0
-        return self.total_prefill_input_tokens / self.total_prefill_wall_s
 
 
 class StepTimer:

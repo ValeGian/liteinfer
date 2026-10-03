@@ -1,13 +1,13 @@
 {
   "config": "liteinfer-packed",
   "engine": "liteinfer",
-  "description": "Prefill as one flat token run; measure it on a mixed-length dataset",
+  "description": "Prefill as one flat token run, where FlashAttention's varlen entry can run: CUDA, half precision, paged kernel. Measure it on a mixed-length dataset",
   "baseline": "liteinfer-graphs-mixed",
   "mode": "throughput",
   "model": "unsloth/Llama-3.2-1B-Instruct",
   "max_num_seqs": 32,
-  "timestamp": "2026-09-12T09:43:41+00:00",
-  "revision": "16a85ab",
+  "timestamp": "2026-10-03T14:14:33+00:00",
+  "revision": "7cb46af",
   "dataset": {
     "path": "benchmarks/datasets/islmixed2048_osl128_n200_unsloth_llama_3_2_1b_instruct.json",
     "target_isl": null,
@@ -17,12 +17,16 @@
     "sha256": "d3de8f4e6ec9fb683be98e3316da7affe078e382b47d7b63dcf379259ba5f14e"
   },
   "summary": {
-    "output_tokens_per_s": 3336.4725947625343,
-    "requests_per_s": 26.0661921465823,
-    "wall_time_s": 7.672773947007954
+    "output_tokens_per_s": 3191.9610595491918,
+    "requests_per_s": 24.93719577772806,
+    "wall_time_s": 8.020147966220975
   },
   "raw": {
-    "wall_time_s": 7.672773947007954,
-    "output_tokens": 25600
+    "wall_time_s": 8.020147966220975,
+    "output_tokens": 25600,
+    "step_phases": {
+      "prefill": 7,
+      "decode": 889
+    }
   }
 }

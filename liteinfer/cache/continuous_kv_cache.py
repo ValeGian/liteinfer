@@ -1,3 +1,4 @@
+# pyright: reportPrivateImportUsage=false
 """Per-sequence paged KV cache for continuous batching.
 
 Sequences are keyed by ``request_id`` and can register or deregister at any
@@ -20,8 +21,9 @@ made rather than on the first layer, so the forward contains no host-side work.
 Prefill payloads
     Store the tokens this pass computed. When no sequence had anything cached
     before the pass, those K/V are the whole context and are returned as they
-    are. When one did — a prompt chunked across steps — attention must also see
-    the prefix a previous pass wrote. The packed payload then hands the paged
+    are. When one did — a prompt chunked across steps, or a sampled token sharing
+    a packed pass with new prompts — attention must also see the prefix a
+    previous pass wrote. The packed payload then hands the paged
     kernel the pool and every token's address, as decode does; the padded one,
     serving the dense kernels, reads the context back out of the pool
     left-padded.
@@ -44,11 +46,18 @@ right-aligned slot table, which only the reads still need.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Protocol
+from typing import Protocol
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, slot_mapping, slot_table
+from liteinfer.cache.block_pool import (
+    BlockPool,
+    BlockPoolExhaustedError,
+    PackedAddresses,
+    packed_addresses,
+    slot_mapping,
+    slot_table,
+)
 from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
 
 
@@ -122,14 +131,34 @@ class ContinuousKVCache:
         Called before the payload is made, because the payload addresses each
         sequence's newest tokens and those must already have somewhere to live.
         Allocation is host-side bookkeeping, and it stays out of the forward.
+
+        All or nothing: when the pool cannot hold every sequence's tokens, it
+        raises `BlockPoolExhaustedError` before anything changes. A step carries
+        running sequences and newly admitted ones in one pass, so a caller can
+        then drop the newcomers and keep the rest rather than lose the whole step,
+        and a cache left half-advanced would account for tokens no pass wrote.
         """
         block_size = self._pool.block_size
-        for request_id, count in zip(request_ids, counts, strict=True):
+        windows = list(zip(request_ids, counts, strict=True))
+        needed = sum(self._blocks_short_of(request_id, count) for request_id, count in windows)
+        if needed > self._pool.num_free_blocks:
+            raise BlockPoolExhaustedError(
+                f"KV block pool exhausted: this step needs {needed} more blocks and "
+                f"{self._pool.num_free_blocks} of {self._pool.num_blocks} are free. "
+                "Increase num_gpu_blocks or reduce max_num_seqs / max_model_len."
+            )
+        for request_id, count in windows:
             total = self._token_counts[request_id] + count
             table = self._block_tables[request_id]
             while len(table) * block_size < total:
                 table.append(self._pool.allocate())
             self._token_counts[request_id] = total
+
+    def _blocks_short_of(self, request_id: str, count: int) -> int:
+        """Blocks a sequence must be given before it can hold `count` more tokens."""
+        total = self._token_counts[request_id] + count
+        held = len(self._block_tables[request_id])
+        return max(0, -(-total // self._pool.block_size) - held)
 
     # ------------------------------------------------------------------
     # Payload factory
@@ -154,15 +183,24 @@ class ContinuousKVCache:
         boundaries to respect rather than padding to mask. With nothing cached
         before the pass those are the K/V it computed; with a prefix cached, the
         pool itself and the addresses of every token each sequence holds.
+
+        The payload carries the run's `PackedAddresses`, whose positions and
+        boundaries the caller also needs for RoPE and for picking each
+        sequence's last token, so they are built once per pass.
         """
-        write_slots = self.slot_mapping_for(request_ids, counts)
-        queries = _Boundaries.of(counts, self._pool.device)
+        addresses = packed_addresses(
+            [self._block_tables[r] for r in request_ids],
+            self._window_starts(request_ids, counts),
+            counts,
+            self._pool.block_size,
+            self._pool.device,
+        )
         if not self._has_history(request_ids, counts):
-            return _PackedPrefillPayload(self, write_slots, queries)
+            return _PackedPrefillPayload(self, addresses, max(counts))
         return _PackedChunkPayload(
             self,
-            write_slots,
-            queries,
+            addresses,
+            max(counts),
             self.slot_table_for(request_ids),
             self.context_lens_for(request_ids),
         )
@@ -303,17 +341,6 @@ class _PrefillPayload:
         return DenseKV(*self._cache.gather(layer_idx, self._context_slots))
 
 
-class _Boundaries(NamedTuple):
-    """Where each sequence starts in a packed run, in the two forms the flash kernel reads."""
-
-    cu_seqlens: torch.Tensor
-    max_seqlen: int
-
-    @classmethod
-    def of(cls, lengths: list[int], device: torch.device) -> _Boundaries:
-        return cls(_cumulative_lengths(lengths, device), max(lengths))
-
-
 class _PackedPrefillPayload:
     """Prefill payload for whole prompts packed end to end, with no padding anywhere.
 
@@ -325,11 +352,11 @@ class _PackedPrefillPayload:
     """
 
     def __init__(
-        self, cache: ContinuousKVCache, write_slots: torch.Tensor, boundaries: _Boundaries
+        self, cache: ContinuousKVCache, addresses: PackedAddresses, max_query_len: int
     ) -> None:
         self._cache = cache
-        self._write_slots = write_slots
-        self._boundaries = boundaries
+        self.addresses = addresses
+        self._max_query_len = max_query_len
 
     def update(
         self,
@@ -338,9 +365,9 @@ class _PackedPrefillPayload:
         layer_idx: int,
     ) -> VarlenKV:
         """Store every prompt token; return the K/V this pass computed, plus the boundaries."""
-        self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
+        self._cache.scatter(layer_idx, self.addresses.slots, key_states, value_states)
         return VarlenKV(
-            key_states, value_states, self._boundaries.cu_seqlens, self._boundaries.max_seqlen
+            key_states, value_states, self.addresses.query_start_loc, self._max_query_len
         )
 
 
@@ -357,14 +384,14 @@ class _PackedChunkPayload:
     def __init__(
         self,
         cache: ContinuousKVCache,
-        write_slots: torch.Tensor,
-        queries: _Boundaries,
+        addresses: PackedAddresses,
+        max_query_len: int,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
     ) -> None:
         self._cache = cache
-        self._write_slots = write_slots
-        self._queries = queries
+        self.addresses = addresses
+        self._max_query_len = max_query_len
         self._slots = slots
         self._context_lens = context_lens
 
@@ -375,24 +402,16 @@ class _PackedChunkPayload:
         layer_idx: int,
     ) -> PagedKV:
         """Store this pass's tokens; return where every token each sequence holds lives."""
-        self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
+        self._cache.scatter(layer_idx, self.addresses.slots, key_states, value_states)
         key_pool, value_pool = self._cache.layer_storage(layer_idx)
         return PagedKV(
             key_pool,
             value_pool,
             self._slots,
             self._context_lens,
-            query_start_loc=self._queries.cu_seqlens,
-            max_query_len=self._queries.max_seqlen,
+            query_start_loc=self.addresses.query_start_loc,
+            max_query_len=self._max_query_len,
         )
-
-
-def _cumulative_lengths(lengths: list[int], device: torch.device) -> torch.Tensor:
-    """`[0, l0, l0 + l1, ...]` as int32, which is the layout the flash kernel reads."""
-    boundaries = [0]
-    for length in lengths:
-        boundaries.append(boundaries[-1] + length)
-    return torch.tensor(boundaries, dtype=torch.int32, device=device)
 
 
 class _DecodePayload:

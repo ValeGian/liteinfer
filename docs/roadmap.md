@@ -121,43 +121,6 @@ listed.
 
 ## 1. Batching and scheduling
 
-### 1.3 One forward for a mixed batch
-- **Status.** `planned` — the stage the rest of the chain exists to reach.
-- **Stage 6 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ (all five landed) → §1.3 → §3.9.
-- **PRs.** _none yet_
-- **Why.** A step that admits new sequences while others decode issues **two**
-  forward passes, and each pass costs its own ~700 kernel launches whatever it
-  carries. Merging them halves that in the common case and lets a waiting request
-  start generating without waiting for a decode step to end. It also bounds peak
-  activation memory: a chunk size caps how many prefill tokens enter one pass, so
-  prompt length stops setting the largest allocation.
-- **Scope.** `ContinuousModelRunner.prefill`/`decode` become one `execute` over
-  the packed buffer. The scheduler already says what to run — since §1.7 its
-  output is `num_scheduled_tokens` per request, and the engine's `_by_phase` is
-  the one place that still splits it in two — and since §2.10 the attention
-  kernel takes per-request query counts: `paged_prefill` with `query_start_loc`,
-  of which a decode row is the one-query case. What is left here is the runner:
-  one input build, one forward, one sample.
-- **One kernel for every row is already affordable.** Whole prompts still go to
-  FlashAttention's varlen entry, and only a chunk continuing a cached prompt
-  reads the pool. Measured per layer on an A40, the paged kernel over whole
-  prompts is **0.30x** of flash at 32 x 18 tokens (the mixed dataset's median),
-  0.74x at 512, 0.94x at 2,048 and 1.04x at 4,096 — so this stage can route every
-  row through it and delete `varlen_attention` with `VarlenKV`, after an engine
-  throughput run on the mixed dataset says the same.
-- **Pre-reqs.** All landed: §1.7 (the budget), §3.6 and §2.9 (the layout), §2.10
-  (the kernel).
-- **It costs some of §3.2, and §3.8 is the repair.** A mixed pass is not a uniform
-  decode batch, so the captured graph does not cover it — roughly one step in
-  eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
-  batches, which is what §3.8 exists to be.
-- **Parity test.** Logits, not greedy tokens: the tiny test model's greedy output
-  barely depends on attention, and §1.7's greedy parity tests passed with every
-  attention bug planted to check them. The one-pass engine's logits against the
-  two-pass engine's, both measured against a single-precision reference the way
-  `test_token_budget_gpu.py` does, on a workload that forces admissions
-  mid-generation — the case this exists to serve.
-
 ### 1.6 What is left of the loop outside the forward
 - **Status.** `planned` — follow-up to §1.5, and small.
 - **PRs.** _none yet_
@@ -176,6 +139,25 @@ listed.
 - **Size it first.** 4% of the loop is the whole prize, so this is worth doing
   only if it is genuinely small. Measure against `TimeBreakdown`'s stage timings
   rather than in isolation.
+
+### 1.8 Admit by what the pool can hold
+- **Status.** `planned` — raised in review of §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
+- **PRs.** _none yet_
+- **Why.** The scheduler admits by slots and by the token budget, never by free
+  KV blocks, so a step can be scheduled that the pool cannot hold. Since §1.3,
+  `advance` refuses such a step whole and the engine fails its least invested
+  tier — every sequence the step would have started, even where one fewer would
+  have fitted, and without retrying them once blocks free up. Before §1.3 a
+  refused prefill pass failed every prompt in it, so this is not a regression,
+  but it is a request failed for want of waiting.
+- **Scope.** `ContinuousScheduler.schedule()` asks the cache how many blocks a
+  grant needs (`_blocks_short_of` already computes it) and stops admitting when
+  the free pool would run out, leaving the rest waiting. Running sequences that
+  outgrow the pool still need an answer — vLLM preempts and recomputes — and
+  that is the larger half; without it, a decoding sequence the pool cannot grow
+  is still failed.
+- **Parity test.** A pool too small for every waiting prompt at once completes
+  all of them, in more steps.
 
 ---
 
@@ -232,6 +214,25 @@ listed.
   pair is one more compiled kernel, so the chooser should return few of them.
 - **Parity test.** Already there: the kernel tests sweep both tiles against
   `eager`, so a chooser can only change speed.
+
+### 2.12 Split the one-query rows of a mixed pass
+- **Status.** `planned` — follow-up to §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
+- **PRs.** _none yet_
+- **Why.** A mixed pass reads every row through `paged_prefill`, which has no
+  split-K, so its decode rows lose the parallelism `paged_decode` buys a narrow
+  batch. At a 32-wide batch and contexts up to 2,000 that costs nothing
+  (0.88x-1.01x of a separate decode launch per layer); at 16k context it does: **1.08x-1.51x** per
+  layer for 1-7 decode rows beside a chunk, about 3.4 ms over 16 layers on the
+  worst shape. Still well under the graphed decode pass §1.3 removed, so not a
+  regression against two passes — but money left on the table where long
+  context meets a narrow batch.
+- **Scope.** Either split the key loop for one-query rows inside `paged_prefill`,
+  or give those rows a second launch per layer. The second is simpler and cost
+  48-100 us of host time per layer when measured, which is why §1.3 did not take
+  it at short context; choose by the split count `choose_num_splits` would pick
+  for the decode rows, so it only applies where splitting pays.
+- **Measure it** per layer through a captured graph, as §1.3 did
+  (`docs/benchmarks.md`, §1.3), then in the engine on a long-context packed row.
 
 ---
 
@@ -344,7 +345,7 @@ listed.
 
 ### 3.8 Capture mixed batches by splitting the graph at attention
 - **Status.** `planned` — **low value today and not for a general reason**, which
-  is the part worth keeping. Re-price it when §1.3 lands.
+  is the part worth keeping. Re-priced after §1.3: still low.
 - **PRs.** _none yet_
 - **Why the question comes up.** §3.2 captures the decode forward whole, which
   works because a decode batch is uniform: one query per sequence, and the only
@@ -372,11 +373,14 @@ listed.
   here would buy about 1.6x on TTFT at ISL 128 and nothing beyond, for one capture
   per (prompt-length bucket x batch width) — and unlike decode's slot-table
   padding, padding a prompt wastes real compute.
-- **§1.3 is what changes the arithmetic, and it partly undoes §3.2.** Chunked
-  prefill merges prefill and decode into one pass, and a mixed pass is not a
-  uniform decode batch, so `DecodeGraphs` would not cover it. At OSL 256 with 32
-  slots that is roughly one step in eight, so the loss is modest — but §1.3 should
-  not land without a plan for capturing mixed batches, and this is that plan.
+- **§1.3 did not undo §3.2.** A mixed step was an eager prefill pass plus a
+  graphed decode pass; it is now one eager pass, and every step that was a
+  uniform decode batch still is one and still replays its graph. What a mixed
+  pass costs uncaptured is its own launches, which the eager prefill pass paid
+  before. In the throughput harness mixed steps are also rare — **1.0% to 1.3%**
+  of steps under a 2,048-token budget, none without one, because every
+  request arrives at once and asks for the same output length. That changes
+  under open-loop arrivals (§8.8), where most steps admit: re-price this there.
 - **It is also half of §3.1.** vLLM's piecewise mode requires inductor
   compilation, so its pieces are fused *and* captured; the two wins arrive
   together. liteinfer has no compilation step, which is why §3.2 could only take
@@ -384,24 +388,38 @@ listed.
 - **Scope.** A compilation step this engine does not have yet, so the honest
   prerequisite is either `torch.compile` on the pieces between attention calls —
   which runs into the same in-place pool write that measured 0.06x in §3.1 — or
-  hand-partitioned capture of the non-attention spans. Neither is small; both are
-  worth less than §1.4 until §1.3 exists.
+  hand-partitioned capture of the non-attention spans. Neither is small, and
+  neither is worth building before §8.8 says how many steps it would cover.
 
 ### 3.9 Retire the padded path
 - **Status.** `planned` — the closing stage; nothing to build, everything to delete.
-- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ (all five landed) → §1.3 → §3.9.
+- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ → ~~§1.3~~ (all six landed) → §3.9.
 - **PRs.** _none yet_
 - **Why.** Padding is currently undone by five mechanisms that exist only to
   cancel each other: left-padded inputs, a right-aligned slot table, a null block
-  absorbing pad positions, two mask builders, and two runner entry points. Once
-  §1.3 lands, every one of them has a packed equivalent and the engine keeps both.
+  absorbing pad positions, two mask builders, and a two-pass route inside the
+  runner's one entry point. Since §1.3 every one of them has a packed equivalent,
+  and the engine keeps both.
   Keeping a slower general path "just in case" is how the codebase stops being
   readable.
 - **Scope.** Delete `build_prefill_mask` and the padded input builders, drop the
   slot table's right-alignment and the null block if decode capture no longer
-  needs it, collapse `prefill()`/`decode()` into the single entry §1.3 leaves, and
-  then simplify what the choice left behind — a dispatcher with one entry is the
-  shape to look for.
+  needs it, collapse `_padded_forward`'s two passes inside `execute` into the
+  packed route §1.3 left, and then simplify what the choice left behind — a
+  dispatcher with one entry is the shape to look for.
+- **`varlen_attention` goes too, if an engine run agrees.** A packed pass with
+  nothing cached still goes to FlashAttention's varlen entry; every other packed
+  pass already reads through `paged_prefill`. Per layer, `paged_prefill` over
+  whole prompts is 0.30x of flash at 32 x 18 tokens and within 4% up to 4,096
+  (§2.10), so routing every packed pass through it would delete
+  `varlen_attention`, `VarlenKV` and `_PackedPrefillPayload` — after a throughput
+  run on the mixed dataset, the prefill-heaviest shape at OSL 16, shows no loss.
+  §1.3 kept varlen so its own number measured one change.
+- **The activation profile has to follow.** `_profile_forward_bytes` sizes the
+  pool from a *padded* `sdpa` forward over `max_num_seqs x max_model_len` with a
+  full `[B, 1, L, L]` mask, even on an engine that packs. That over-reserves
+  today, which is safe; with the padded path gone it is the wrong basis, and the
+  worst case to profile becomes one packed pass of `token_budget` tokens.
 - **What stays.** `eager` and `sdpa` keep a packed per-sequence loop. They are the
   correctness reference and the CPU path, not performance paths, and should not
   pretend otherwise. `eager` in particular is the oracle the fused kernels are
@@ -476,7 +494,7 @@ listed.
 ### 6.2 Live dashboard runner
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Why.** `EngineStats` records a `StepMetrics` per forward pass (§6.3) and a
+- **Why.** `EngineStats` records a `StepMetrics` per step (§6.3) and a
   `TimeBreakdown` per loop (§6.4), and nothing consumes either.
 - **Scope.** `python -m liteinfer.dashboard` printing rolling
   prefill/decode tok/s, batch width and KV usage from the stats stream.
@@ -485,8 +503,10 @@ listed.
 
 ## 7. Hygiene / housekeeping
 
-- Trim `EngineStats`: six derived throughput properties, the `on_step`
-  listener and four running totals have no callers outside their own tests.
+- Trim `EngineStats`: the two overall throughput properties and the `on_step`
+  listener have no callers outside their own tests. §1.3 removed the per-phase
+  totals and averages, whose meaning a mixed step broke; `on_step` is what §6.2
+  plans to read, so decide it with §6.2.
 - Fix the five `reportOptionalMemberAccess` errors pyright reports on package
   code: `hf_config` and `tokenizer` are declared optional because they are
   assigned in `load_model` rather than `__init__`, so every read of them is an
@@ -547,3 +567,23 @@ listed.
 - **Watch the pool.** vLLM sizes its own KV cache from `gpu_memory_utilization`;
   at a 16k budget the two engines must be given the same ceiling or the row
   measures the cache, not the decode.
+
+### 8.8 Open-loop throughput: requests that arrive over time
+- **Status.** `planned` — what §1.3's claim is waiting on ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
+- **PRs.** _none yet_
+- **Why.** Throughput mode submits every request at once, and every request
+  asks for the same output length, so the engine admits in waves: a wave starts
+  together and finishes together, and the next one is admitted into an empty
+  batch. No step ever holds prompts beside decodes unless a token budget splits a
+  wave, and even then 1.0%-1.3% of steps do at a 2,048-token budget. A server sees the opposite — requests
+  arrive while others decode, so most steps admit — and that is the workload
+  §1.3 (one forward per mixed step), §3.8 (capturing mixed passes) and chunking
+  itself exist to serve. None of them can show a number here.
+- **Scope.** A `--request-rate` on throughput mode: Poisson arrivals at a fixed
+  rate and seed, so a run is reproducible, recording per-request TTFT and e2e as
+  latency mode does. That second half needs §6.1's per-request timings, or the
+  harness timing its own stream events. A rate is part of the shape, like
+  `max_isl`, so it travels in the result's key.
+- **First use.** Re-measure `liteinfer-packed-budget` against
+  `liteinfer-onepass-budget` there. The before is `historical` by then, so the
+  comparison has to be run from §1.3's parent revision.

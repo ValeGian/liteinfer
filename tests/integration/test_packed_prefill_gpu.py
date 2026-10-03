@@ -52,11 +52,11 @@ def _greedy_tokens(runner: ContinuousModelRunner) -> list[list[int]]:
         )
         for i, prompt_len in enumerate(_PROMPT_LENS)
     ]
-    logits = runner.prefill(seqs)
+    logits = runner.execute(seqs)
     for i, seq in enumerate(seqs):
         seq.output_token_ids.append(int(logits[i].argmax()))
     for _ in range(_DECODE_STEPS):
-        logits = runner.decode(seqs)
+        logits = runner.execute(seqs)
         for i, seq in enumerate(seqs):
             seq.output_token_ids.append(int(logits[i].argmax()))
     return [list(seq.output_token_ids) for seq in seqs]

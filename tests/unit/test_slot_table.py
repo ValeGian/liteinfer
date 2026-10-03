@@ -1,10 +1,11 @@
+# pyright: reportPrivateImportUsage=false
 """Logical token positions map to physical pool slots."""
 
 from __future__ import annotations
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, slot_mapping, slot_table
+from liteinfer.cache.block_pool import BlockPool, packed_addresses, slot_mapping, slot_table
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
 
 CPU = torch.device("cpu")
@@ -172,3 +173,25 @@ def test_single_token_windows_are_addressed_as_a_longer_window_would_address_the
     as_pairs = _mapping(block_tables, [2, 2], starts=[start - 1 for start in starts])[0, 1::2]
 
     assert _mapping(block_tables, [1, 1], starts=starts).tolist() == [as_pairs.tolist()]
+
+
+def _addresses(starts, counts):
+    # Three sequences, two blocks each, so windows straddle block boundaries.
+    return packed_addresses([[2, 5], [1, 7], [3, 6]], starts, counts, BLOCK_SIZE, CPU)
+
+
+def test_packed_positions_count_from_where_each_window_starts() -> None:
+    assert _addresses([5, 0, 3], [3, 2, 1]).positions.tolist() == [[5, 6, 7, 0, 1, 3]]
+
+
+def test_packed_slots_follow_each_window_into_its_own_blocks() -> None:
+    # Positions 5-7 in block 5, 0-1 in block 1, 3 in block 3: 5*4+1.., 1*4+0.., 3*4+3.
+    assert _addresses([5, 0, 3], [3, 2, 1]).slots.tolist() == [[21, 22, 23, 4, 5, 15]]
+
+
+def test_packed_query_starts_are_the_running_sum_of_the_counts() -> None:
+    assert _addresses([5, 0, 3], [3, 2, 1]).query_start_loc.tolist() == [0, 3, 5, 6]
+
+
+def test_packed_query_starts_are_int32_as_the_kernels_read_them() -> None:
+    assert _addresses([0, 0, 0], [2, 2, 2]).query_start_loc.dtype == torch.int32

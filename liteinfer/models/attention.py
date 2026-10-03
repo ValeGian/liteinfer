@@ -17,7 +17,8 @@ engine can serve, not just how fast it serves it.
 Both of those want K and V as one contiguous tensor, which for a paged cache
 means copying every sequence's history out of the pool before every decode
 step. `paged` takes the slot table instead and reads the pool in place: every
-decode step, and every packed prefill chunk that continues a cached prompt. A
+decode step, and every packed pass in which some row has history — a chunk that
+continues a cached prompt, or a step mixing sampled tokens with new prompts. A
 prefill with nothing cached before it goes to `varlen` (packed) or `sdpa`
 (padded), because its keys are the tensors the pass has just computed and
 nothing is paged yet. See `models/paged_decode.py`.
@@ -226,8 +227,9 @@ def paged_attention(
     prefill with nothing cached before it returns the K and V the pass just
     computed — packed if the batch was packed, padded if it was padded — and
     there is nothing paged about them yet. Everything else reads the pool: a
-    decode step one query per sequence, and a packed chunk continuing a cached
-    prompt many, through the same kernel.
+    decode step one query per sequence, and a packed pass with history any
+    number per row — chunks, sampled tokens and whole prompts side by side —
+    through the same kernel.
     """
     if isinstance(kv, DenseKV):
         return sdpa_attention(query, kv, attention_mask, scaling, num_kv_groups)

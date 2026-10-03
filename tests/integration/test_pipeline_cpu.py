@@ -16,9 +16,9 @@ import pytest
 import torch
 
 from liteinfer import AsyncLLM, EngineOverloaded
-from liteinfer.engine.metrics import Phase
 from liteinfer.sampling.params import SamplingParams
 from tests.integration import tiny_llama
+from tests.integration.sequences import prompt_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -200,23 +200,15 @@ def test_continuous_pipeline_stops_on_eos(tiny_llama_dir: Path) -> None:
 
     async def _run_test():
         async with _async_llm(tiny_llama_dir) as llm:
-            original_prefill = llm.engine.model_runner.prefill
-            original_decode = llm.engine.model_runner.decode
+            original_execute = llm.engine.model_runner.execute
 
-            def _prefill_forcing_eos(seqs, num_tokens=None):
-                logits = original_prefill(seqs, num_tokens)
+            def _execute_forcing_eos(seqs, num_tokens=None):
+                logits = original_execute(seqs, num_tokens)
                 forced = torch.full((logits.shape[0], tiny_llama.VOCAB_SIZE), float("-inf"))
                 forced[:, tiny_llama.EOS_ID] = 0.0
                 return forced
 
-            def _decode_forcing_eos(seqs):
-                logits = original_decode(seqs)
-                forced = torch.full((logits.shape[0], tiny_llama.VOCAB_SIZE), float("-inf"))
-                forced[:, tiny_llama.EOS_ID] = 0.0
-                return forced
-
-            llm.engine.model_runner.prefill = _prefill_forcing_eos  # type: ignore[method-assign]
-            llm.engine.model_runner.decode = _decode_forcing_eos  # type: ignore[method-assign]
+            llm.engine.model_runner.execute = _execute_forcing_eos  # type: ignore[method-assign]
 
             return await llm.generate("tok2 tok3", SamplingParams(max_tokens=20, temperature=0.0))
 
@@ -289,7 +281,7 @@ def test_a_prompt_with_no_tokens_does_not_fail_the_requests_beside_it(tiny_llama
 def test_a_failing_forward_pass_raises_to_the_caller(tiny_llama_dir: Path) -> None:
     async def run() -> None:
         async with AsyncLLM(str(tiny_llama_dir), device="cpu", dtype=torch.float32) as llm:
-            llm.engine.model_runner.prefill = _raise_boom
+            llm.engine.model_runner.execute = _raise_boom
             with pytest.raises(RuntimeError, match="boom"):
                 await asyncio.wait_for(
                     llm.generate(["tok5"], SamplingParams(max_tokens=2)), timeout=20
@@ -515,13 +507,9 @@ _BUDGET = 5
 _BUDGET_BLOCK_SIZE = 4
 
 
-def _prompt(length: int, offset: int) -> str:
-    return " ".join(f"tok{2 + (offset + i) % 200}" for i in range(length))
-
-
 def _budgeted_generate(model_dir: Path, max_num_batched_tokens: int | None):
     """Greedy completions of `_BUDGET_PROMPT_LENS`, and the step log that produced them."""
-    prompts = [_prompt(length, 7 * i) for i, length in enumerate(_BUDGET_PROMPT_LENS)]
+    prompts = [prompt_text(length, 7 * i) for i, length in enumerate(_BUDGET_PROMPT_LENS)]
 
     async def _run_test():
         llm = AsyncLLM(
@@ -570,6 +558,6 @@ def test_no_forward_pass_computes_more_tokens_than_the_budget(tiny_llama_dir: Pa
 def test_every_prompt_token_is_computed_exactly_once(tiny_llama_dir: Path) -> None:
     """A chunk continues where the cache left off; it neither skips nor recomputes."""
     _, steps = _budgeted_generate(tiny_llama_dir, _BUDGET)
-    prefill_tokens = sum(step.input_tokens for step in steps if step.phase is Phase.PREFILL)
+    prefill_tokens = sum(step.prompt_tokens for step in steps)
 
     assert prefill_tokens == sum(_BUDGET_PROMPT_LENS)
