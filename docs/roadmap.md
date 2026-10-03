@@ -419,7 +419,7 @@ listed.
 - **Why.** `eager` and `sdpa` batch a decode step by gathering each row's whole
   context and hiding the columns past its length, and that bound — an `arange`
   and a compare — is rebuilt in every layer from `context_lens`. Measured on the
-  `sdpa` fallback at ISL 128: ITL 15.3 → 15.7 ms against the padded path it
+  `sdpa` fallback at ISL 128: ITL 14.86 → 15.59 ms against the padded path it
   replaced, which built its mask once per step.
 - **Scope.** Build the bound once per step inside `models/attention.py`, keyed on
   the step's `context_lens` tensor, so every layer after the first reuses it.
