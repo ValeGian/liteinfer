@@ -140,6 +140,25 @@ listed.
   only if it is genuinely small. Measure against `TimeBreakdown`'s stage timings
   rather than in isolation.
 
+### 1.8 Admit by what the pool can hold
+- **Status.** `planned` — raised in review of §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
+- **PRs.** _none yet_
+- **Why.** The scheduler admits by slots and by the token budget, never by free
+  KV blocks, so a step can be scheduled that the pool cannot hold. Since §1.3,
+  `advance` refuses such a step whole and the engine fails its least invested
+  tier — every sequence the step would have started, even where one fewer would
+  have fitted, and without retrying them once blocks free up. Before §1.3 a
+  refused prefill pass failed every prompt in it, so this is not a regression,
+  but it is a request failed for want of waiting.
+- **Scope.** `ContinuousScheduler.schedule()` asks the cache how many blocks a
+  grant needs (`_blocks_short_of` already computes it) and stops admitting when
+  the free pool would run out, leaving the rest waiting. Running sequences that
+  outgrow the pool still need an answer — vLLM preempts and recomputes — and
+  that is the larger half; without it, a decoding sequence the pool cannot grow
+  is still failed.
+- **Parity test.** A pool too small for every waiting prompt at once completes
+  all of them, in more steps.
+
 ---
 
 ## 2. KV cache implementations
@@ -358,8 +377,8 @@ listed.
   graphed decode pass; it is now one eager pass, and every step that was a
   uniform decode batch still is one and still replays its graph. What a mixed
   pass costs uncaptured is its own launches, which the eager prefill pass paid
-  before. In the throughput harness mixed steps are also rare — **1.0% to 4.7%**
-  of steps under a 512- to 2,048-token budget, none without one, because every
+  before. In the throughput harness mixed steps are also rare — **1.0% to 1.3%**
+  of steps under a 2,048-token budget, none without one, because every
   request arrives at once and asks for the same output length. That changes
   under open-loop arrivals (§8.8), where most steps admit: re-price this there.
 - **It is also half of §3.1.** vLLM's piecewise mode requires inductor
@@ -548,7 +567,7 @@ listed.
   asks for the same output length, so the engine admits in waves: a wave starts
   together and finishes together, and the next one is admitted into an empty
   batch. No step ever holds prompts beside decodes unless a token budget splits a
-  wave, and even then 1.0%-4.7% of steps do. A server sees the opposite — requests
+  wave, and even then 1.0%-1.3% of steps do at a 2,048-token budget. A server sees the opposite — requests
   arrive while others decode, so most steps admit — and that is the workload
   §1.3 (one forward per mixed step), §3.8 (capturing mixed passes) and chunking
   itself exist to serve. None of them can show a number here.
