@@ -1586,19 +1586,26 @@ the first half's session and 17.4 in this one, so the pair bounds the change
 rather than explaining all of it. The stored `liteinfer-paged-prefill` rows stay
 #46's, to be re-measured from master once both halves land (§8.9).
 
-**The dense fallback**, `liteinfer-sdpa` (padded, from #46's branch) against
-`liteinfer-sdpa-packed`, two reps each on one A40 per shape:
+**The dense fallback**, `liteinfer-sdpa` (padded, from #46's committed head)
+against `liteinfer-sdpa-packed` (this branch's committed head), interleaved three
+times each on one A40 per shape, median output tok/s:
 
 | shape | padded | packed | |
 |---|---:|---:|---:|
-| ISL 128 / OSL 256 | 1,686.0 tok/s | 1,670.8 | 0.99x |
-| mixed ≤2048 / OSL 128 | 833.0 tok/s | 1,011.6 | **1.21x** |
+| ISL 128 / OSL 256 | 1,749.9 tok/s | 1,703.4 | 0.97x |
+| mixed ≤2048 / OSL 128 | 851.5 tok/s | 1,016.3 | **1.19x** |
 
-Latency at ISL 128: TTFT p50 15.6 → 16.6 ms (1.06x), p99 17.4 → 19.4 (1.12x),
-ITL p50 15.3 → 15.7 (1.03x) — the metrics that got worse. A prompt's K/V are
-read back out of the pool before attention where the padded pass attended to
-the tensors it had just computed, and the decode key bound is rebuilt per layer
-where the padded mask was built once per step. Stored: the first rep of each.
+Latency at ISL 128: TTFT p50 15.30 → 16.59 ms (1.08x), p99 17.58 → 19.33
+(1.10x), ITL p50 14.86 → 15.59 (1.05x) — the metrics that got worse. A prompt's
+K/V are read back out of the pool before attention where the padded pass
+attended to the tensors it had just computed, and the decode key bound is
+rebuilt per layer where the padded mask was built once per step (§3.11). The
+stored rows are these runs — the median rep for throughput — which replaced
+`liteinfer-sdpa`'s 2026-09-09 rows: that row is `historical` now, so this was
+the last revision that could measure it. The dashboard's `liteinfer-sdpa`
+against `liteinfer-continuous` delta therefore spans revisions; the §3.3 numbers
+above are as measured then. The dense loop on CPU, the only engine CPU users
+get, is not measured here.
 
 **A loop on decode was measured and rejected.** The first version looped over
 sequences for every pass, as the roadmap planned. On decode that is 32
