@@ -197,7 +197,7 @@ listed.
   `eager`, so a chooser can only change speed.
 
 ### 2.12 Split the one-query rows of a mixed pass
-- **Status.** `planned` — follow-up to §1.3.
+- **Status.** `planned` — follow-up to §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
 - **PRs.** _none yet_
 - **Why.** A mixed pass reads every row through `paged_prefill`, which has no
   split-K, so its decode rows lose the parallelism `paged_decode` buys a narrow
@@ -534,7 +534,7 @@ listed.
   measures the cache, not the decode.
 
 ### 8.8 Open-loop throughput: requests that arrive over time
-- **Status.** `planned` — what §1.3's claim is waiting on.
+- **Status.** `planned` — what §1.3's claim is waiting on ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
 - **PRs.** _none yet_
 - **Why.** Throughput mode submits every request at once, and every request
   asks for the same output length, so the engine admits in waves: a wave starts
