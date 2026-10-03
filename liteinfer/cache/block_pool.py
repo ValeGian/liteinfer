@@ -39,9 +39,6 @@ class BlockPool:
     what lets the caches read and write a whole batch with one indexing op
     instead of a Python loop over blocks (see ``slot_table``).
 
-    Block 0 is a *null block*: never allocated, it absorbs the reads and writes
-    that padded batch positions generate, so neither caller needs to mask them.
-
     A single free-list tracks which block indices are available. Allocating
     block B means all layers can write K/V into that block's slots. Freeing
     block B returns it to the free-list regardless of which layers wrote to it.
@@ -63,11 +60,10 @@ class BlockPool:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
-        # One extra block backs the null block, so num_blocks stays the usable count.
-        shape = (num_layers, (num_blocks + 1) * block_size, num_kv_heads, head_dim)
+        shape = (num_layers, num_blocks * block_size, num_kv_heads, head_dim)
         self._keys = torch.zeros(shape, dtype=dtype, device=device)
         self._values = torch.zeros(shape, dtype=dtype, device=device)
-        self._free_blocks: list[int] = list(range(1, num_blocks + 1))
+        self._free_blocks: list[int] = list(range(num_blocks))
 
     @property
     def nbytes(self) -> int:
@@ -99,102 +95,90 @@ class BlockPool:
         """Return block_idx to the free-list."""
         self._free_blocks.append(block_idx)
 
-    def _block(self, store: torch.Tensor, layer_idx: int, block_idx: int) -> torch.Tensor:
-        start = block_idx * self.block_size
-        return store[layer_idx, start : start + self.block_size].transpose(0, 1)
-
-    def get_key_block(self, layer_idx: int, block_idx: int) -> torch.Tensor:
-        """Return a view of the key block: ``[num_kv_heads, block_size, head_dim]``."""
-        return self._block(self._keys, layer_idx, block_idx)
-
     def slots(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return this layer's flat key/value stores: ``[num_slots, num_kv_heads, head_dim]``."""
         return self._keys[layer_idx], self._values[layer_idx]
 
 
-def _window_blocks(
-    block_tables: Sequence[Sequence[int]],
-    starts: Sequence[int],
-    counts: Sequence[int],
-    block_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The block rows each window of tokens touches, plus its count and where it begins.
+def _padded_blocks(block_tables: Sequence[Sequence[int]], device: torch.device) -> torch.Tensor:
+    """Every sequence's block table as one ``[B, max_blocks]`` tensor, in one transfer.
 
-    Sequence ``i``'s window is its logical positions ``[starts[i], starts[i] +
-    counts[i])``, and ``counts[i]`` must be at least 1. Only the blocks that
-    window covers are padded on the host and moved: a window that is one
-    sequence's newest few tokens needs one or two blocks, not the whole table,
-    and the whole table is what makes the read table cost 3.4 ms to build at 128
-    sequences of 4,000 tokens.
-
-    Returns ``[B, width]`` block indices padded with the null block, then ``[B]``
-    counts, ``[B]`` offsets of each window's first token from the start of its
-    first block, and ``[B]`` starts. The three vectors travel as one tensor —
-    each transfer from pageable memory blocks, so two small ones cost twice what
-    one does.
+    Padded on the host and moved once: a row-by-row copy costs one
+    host-to-device transfer per sequence — and those are pageable, so each one
+    blocks — where this costs one for the batch. The padding is block 0, which
+    is a real block; no answer depends on it, because every read is bounded by
+    its sequence's context length.
     """
-    first_blocks = [start // block_size for start in starts]
-    rows = [
-        table[first : (start + count - 1) // block_size + 1]
-        for table, first, start, count in zip(block_tables, first_blocks, starts, counts, strict=True)
-    ]
-    width = max(len(row) for row in rows)
-    padded = [list(row) + [0] * (width - len(row)) for row in rows]
-    offsets = [start - first * block_size for start, first in zip(starts, first_blocks, strict=True)]
-    blocks = torch.tensor(padded, dtype=torch.long, device=device)
-    count, offset, start = torch.tensor(
-        [list(counts), offsets, list(starts)], dtype=torch.long, device=device
-    )
-    return blocks, count, offset, start
+    width = max(len(table) for table in block_tables)
+    padded = [list(table) + [0] * (width - len(table)) for table in block_tables]
+    return torch.tensor(padded, dtype=torch.long, device=device)
 
 
-def slot_mapping(
+def _slots_of(blocks: torch.Tensor, max_total: int, block_size: int) -> torch.Tensor:
+    """``[B, max_total]`` slot per logical position, read off padded block tables.
+
+    Left-aligned: column ``p`` of row ``i`` is position ``p`` of sequence ``i``,
+    so a kernel reads its sequence's first ``context_len`` columns and nothing
+    past them. One gather for the whole batch.
+    """
+    columns = torch.arange(max_total, device=blocks.device)
+    return blocks[:, columns // block_size] * block_size + columns % block_size
+
+
+def slot_table(
     block_tables: Sequence[Sequence[int]],
-    counts: Sequence[int],
+    totals: Sequence[int],
     block_size: int,
     device: torch.device,
-    starts: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """One physical slot per token, the sequences laid end to end.
+    """Map each sequence's logical positions ``[0, totals[i])`` to physical pool slots.
 
-    Sequence ``i`` contributes its logical positions ``[starts[i], starts[i] +
-    counts[i])``, from 0 when ``starts`` is omitted. That one shape covers every
-    packed address the engine needs: a whole prompt (start 0), a chunk of one
-    that continues where the cache left off, and a decode step, which is the
-    batch where every count is 1.
-
-    Returns ``[1, sum(counts)]``, so it indexes a packed pass the way
-    `slot_table` indexes a padded one — same arithmetic, no padded columns and no
-    right-alignment, because a packed batch has nothing to align to. The leading
-    axis of 1 is the packed batch axis the layers still carry.
-
-    Built on the device from three vectors rather than a Python loop per
-    sequence: the request each token belongs to, its position within that
-    request's window, and the block row to read. That is the same shape of
-    computation `slot_table` does, and it is why both live here. The total comes
-    from the Python counts, so nothing here waits on the device.
-
-    A batch of single-token windows — every decode step — is answered on the
-    host instead; see `_single_token_slots`.
+    Returns ``[B, max(totals)]``, left-aligned: a row's columns past its total
+    hold whatever the padding addresses, and are never read. ``max(totals)``
+    comes from the Python counts, because reading it off the device would sync
+    the whole queue to learn something already known.
     """
-    starts = [0] * len(counts) if starts is None else starts
-    if all(count == 1 for count in counts):
-        return _single_token_slots(block_tables, starts, block_size, device)
-    return packed_addresses(block_tables, starts, counts, block_size, device).slots
+    return _slots_of(_padded_blocks(block_tables, device), max(totals), block_size)
+
+
+def newest_slots(
+    block_tables: Sequence[Sequence[int]],
+    positions: Sequence[int],
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """The slot of one position per sequence, as ``[1, B]`` — where a decode step writes.
+
+    Computed on the host: the device path is about ten kernel launches and
+    three transfers whatever the batch holds, which measured 0.28 ms at batch 1
+    — about 5% of a captured decode step, paid on every one. For one token per
+    sequence the answer is B integers the host can compute from the block
+    tables it already holds, in one transfer: 0.021 ms at batch 1 and 0.048 ms
+    at 128. The leading axis of 1 is the packed batch axis the layers carry.
+    """
+    slots = [
+        table[position // block_size] * block_size + position % block_size
+        for table, position in zip(block_tables, positions, strict=True)
+    ]
+    return torch.tensor([slots], dtype=torch.long, device=device)
 
 
 class PackedAddresses(NamedTuple):
-    """Where every token of a packed run lives, and where each sequence's run begins."""
+    """Where every token of a packed run lives, what each sequence reads, and where it begins."""
 
     slots: torch.Tensor
-    """``[1, total]`` physical slot per token, the `slot_mapping` of the run."""
+    """``[1, total]`` physical slot per token of the run — where the pass writes."""
     positions: torch.Tensor
     """``[1, total]`` logical position per token, which is what RoPE reads."""
     query_start_loc: torch.Tensor
     """``[B + 1]`` int32 prefix sums of the counts: sequence ``i`` owns
     ``[query_start_loc[i], query_start_loc[i + 1])``, so its last token is one
     before the next sequence's first."""
+    slot_table: torch.Tensor
+    """``[B, max_context]`` left-aligned slot per position of each sequence's whole
+    context, the run's tokens included — what attention reads."""
+    context_lens: torch.Tensor
+    """``[B]`` int32 tokens each sequence holds once the run is written."""
 
 
 def packed_addresses(
@@ -204,89 +188,29 @@ def packed_addresses(
     block_size: int,
     device: torch.device,
 ) -> PackedAddresses:
-    """Every address a packed pass needs, built once from one transfer.
+    """Every address a packed pass needs, from one transfer of the block tables.
 
     Sequence ``i`` contributes its logical positions ``[starts[i], starts[i] +
-    counts[i])``. Each token's slot and position both follow from the sequence
-    that owns it and its index within that sequence's window, so the two are
-    read off the same vectors rather than built twice: the owner comes from
-    `repeat_interleave`, the index from a running index minus where the window
-    starts in the run, which `cumsum` gives for every token at once. The total
-    comes from the Python counts, so nothing here waits on the device.
+    counts[i])``, the newest tokens of a context of ``starts[i] + counts[i]``.
+    The read table covers that whole context, and the write slots are a gather
+    out of it: token ``j`` of the run is at its owner's row, its position's
+    column. The owner comes from `repeat_interleave`, the position from a
+    running index minus where the owner's run starts — `cumsum` gives that for
+    every token at once — plus the owner's start. The total and the widest
+    context come from the Python counts, so nothing here waits on the device.
     """
-    blocks, count, offsets, window_starts = _window_blocks(
-        block_tables, starts, counts, block_size, device
-    )
+    blocks = _padded_blocks(block_tables, device)
+    count, start = torch.tensor([list(counts), list(starts)], dtype=torch.long, device=device)
     total = sum(counts)
-    owner = torch.repeat_interleave(
-        torch.arange(len(counts), device=device), count, output_size=total
-    )
+    owner = torch.repeat_interleave(torch.arange(len(counts), device=device), count, output_size=total)
     run_ends = torch.cumsum(count, 0)
-    index = torch.arange(total, device=device) - (run_ends - count)[owner]
+    positions = torch.arange(total, device=device) - (run_ends - count)[owner] + start[owner]
 
-    local = index + offsets[owner]
-    slots = blocks[owner].gather(1, (local // block_size).unsqueeze(1)).squeeze(1)
+    table = _slots_of(blocks, max(s + c for s, c in zip(starts, counts, strict=True)), block_size)
     return PackedAddresses(
-        slots=(slots * block_size + local % block_size).unsqueeze(0),
-        positions=(index + window_starts[owner]).unsqueeze(0),
+        slots=table[owner, positions].unsqueeze(0),
+        positions=positions.unsqueeze(0),
         query_start_loc=torch.nn.functional.pad(run_ends, (1, 0)).to(torch.int32),
+        slot_table=table,
+        context_lens=(start + count).to(torch.int32),
     )
-
-
-def _single_token_slots(
-    block_tables: Sequence[Sequence[int]],
-    positions: Sequence[int],
-    block_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """`slot_mapping` for one token per sequence, as ``[1, B]``, computed in Python.
-
-    The device path above is about ten kernel launches and three transfers
-    whatever the batch holds, which measured 0.28 ms at batch 1 — about 5% of a
-    captured decode step, paid on every one. For one token per sequence the
-    answer is B integers the host can compute from the block tables it already
-    holds, in one transfer: 0.021 ms at batch 1 and 0.048 ms at 128.
-    """
-    slots = [
-        table[position // block_size] * block_size + position % block_size
-        for table, position in zip(block_tables, positions, strict=True)
-    ]
-    return torch.tensor([slots], dtype=torch.long, device=device)
-
-
-def slot_table(
-    block_tables: Sequence[Sequence[int]],
-    counts: Sequence[int],
-    block_size: int,
-    device: torch.device,
-    starts: Sequence[int] | None = None,
-) -> torch.Tensor:
-    """Map each sequence's logical token positions to physical pool slots.
-
-    Row ``i`` holds positions ``[starts[i], starts[i] + counts[i])``, from 0 when
-    ``starts`` is omitted. Returns ``[B, max(counts)]``, right-aligned so it
-    matches the left-padding the attention masks expect; each window's newest
-    token is therefore the last column, and padded columns point into the null
-    block.
-
-    The block tables are padded on the host and moved in a single transfer. A
-    row-by-row copy costs one host-to-device transfer per sequence — and those
-    are pageable, so each one blocks — where this costs one for the batch, plus
-    one for the counts and offsets.
-    ``max(counts)`` comes from the Python counts for the same reason: reading it
-    off the device would sync the whole queue to learn something already known.
-    """
-    is_windowed = starts is not None
-    starts = starts if is_windowed else [0] * len(counts)
-    max_count = max(counts)
-    blocks, count, offsets, _ = _window_blocks(block_tables, starts, counts, block_size, device)
-
-    local = torch.arange(max_count, device=device) - (max_count - count).unsqueeze(1)
-    is_real = local >= 0
-    local = local.clamp(min=0)
-    if is_windowed:
-        # Skipped for the whole history — every decode step's read — where every
-        # offset is zero and the add is a launch that changes nothing.
-        local = local + offsets.unsqueeze(1)
-    slots = blocks.gather(1, local // block_size) * block_size + local % block_size
-    return torch.where(is_real, slots, 0)

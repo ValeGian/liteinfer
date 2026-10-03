@@ -55,12 +55,6 @@ class EngineConfig:
     # `models/paged_decode.py`.
     paged_decode_splits: int | None = None
 
-    # Prefill a batch as one flat run of tokens instead of left-padding every
-    # prompt to the longest. None packs wherever the attention kernel can read a
-    # packed batch, which is the paged one; True asks for it and fails rather
-    # than padding. See `models/attention.handles_packed_prefill`.
-    enable_packed_prefill: bool | None = None
-
     collect_stats: bool = True
 
     # KV block pool.

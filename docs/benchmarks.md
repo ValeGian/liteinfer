@@ -88,10 +88,9 @@ same clock, with no per-token callbacks that each would implement differently.
 `benchmarks/configs.py` is the matrix; each entry names the config it improves
 on, and the report renders that as a 1:1 delta.
 
-Everything above `liteinfer-continuous` was measured and then **removed from the
-codebase** — the engine now has a single execution path. Their entries stay in
-the matrix, flagged `historical`, so the progression still renders; `bench run`
-refuses to run them.
+Rows marked removed were measured and then **removed from the codebase** — the
+engine has a single execution path. Their entries stay in the matrix, flagged
+`historical`, so the progression still renders; `bench run` refuses to run them.
 
 | Config | What it added | Baseline | |
 |---|---|---|---|
@@ -102,17 +101,24 @@ refuses to run them.
 | `liteinfer-eager-b4` | Static batching, B=4 | `liteinfer-eager` | removed |
 | `liteinfer-native-eager-b4` | Static batching, B=4, plain tensors | `liteinfer-native-eager` | removed |
 | `liteinfer-paged-b4` | Static batching, B=4, paged | `liteinfer-paged` | removed |
-| `liteinfer-continuous` | Continuous batching, up to 32 | `liteinfer-paged-b4` | eager kernel |
-| `liteinfer-sdpa` | Attention through PyTorch SDPA | `liteinfer-continuous` | fallback |
-| `liteinfer-paged-attn` | Decode attention reads the KV pool in-kernel | `liteinfer-sdpa` | **ships** |
-| `vllm`, `vllm-b4`, `vllm-continuous` | Reference, matched batch widths | — | |
+| `liteinfer-continuous` | Continuous batching, up to 32, padded prefill, `eager` | `liteinfer-paged-b4` | removed |
+| `liteinfer-sdpa` | Attention through PyTorch SDPA, padded prefill | `liteinfer-continuous` | removed |
+| `liteinfer-paged-attn` | Decode attention reads the KV pool in-kernel | `liteinfer-sdpa` | |
+| `liteinfer-graphs` | Decode replayed from a CUDA graph | `liteinfer-paged-attn` | |
+| `liteinfer-splitk` | Narrow batches split their key loop | `liteinfer-graphs` | |
+| `liteinfer-graphs-mixed` | `liteinfer-splitk` with a padded prefill, at a mixed dataset's budget | — | removed |
+| `liteinfer-packed` | Prefill packed end to end, through FlashAttention's varlen entry | `liteinfer-graphs-mixed` | removed |
+| `liteinfer-packed-budget`, `liteinfer-onepass-budget` | A 2,048-token step budget; then one forward per mixed step | `liteinfer-packed` | removed |
+| `liteinfer-paged-prefill` | Every packed pass through `paged_prefill` | `liteinfer-packed` | **ships** |
+| `liteinfer-sdpa-packed` | SDPA over a packed batch | `liteinfer-sdpa` | fallback |
+| `vllm`, `vllm-b4`, `vllm-continuous`, `vllm-b128` | Reference, matched batch widths | — | |
 
-`liteinfer-paged-attn` is the engine as it ships on CUDA: `EngineConfig()`
+`liteinfer-paged-prefill` is the engine as it ships on CUDA: `EngineConfig()`
 resolves its attention kernel from the device and picks the paged one wherever it
-can run. `liteinfer-sdpa` is what that choice falls back to — off CUDA, or
-without a Triton install — so both rows describe shipping configurations rather
-than one being an experiment. Every row above them is a design that was measured
-and then removed, kept so the progression still renders.
+can run, captures decode, and lets the kernel choose its split count.
+`liteinfer-sdpa-packed` is what that choice falls back to — off CUDA, or without
+a Triton install — so both rows describe shipping configurations rather than one
+being an experiment.
 
 Each row pins its kernel by name, so the matrix measures the kernel the row
 claims and not whatever this machine would have chosen.
@@ -1550,6 +1556,62 @@ rest of §3.9 makes one. The remainder is Triton's launch path against an aten o
 against `sdpa` over 20 tokens still matches exactly. The GPU parity references
 for chunked and mixed steps are pinned to fp32 `eager`, which no longer shares a
 kernel with the runs it judges.
+
+### The padded path is gone (§3.9, second half)
+
+Every pass is now packed or a decode step. Deleted: the padded prefill and its
+input builders, both mask builders, the two-pass route inside `execute`, the
+gathering payloads, the null block and the right-aligned slot table. What a
+packed pass reads and where it writes now come from one transfer of the block
+tables (`packed_addresses`) instead of five. `eager` and `sdpa` read the same
+`PagedKV` the paged kernel does: a decode step batched, each row bounded by its
+context length, and a packed pass one sequence at a time inside attention.
+
+**The paged engine**, `liteinfer-paged-prefill` on #46's branch against this
+one, interleaved three times each on one A40 per shape, 200 samples, median
+output tok/s:
+
+| shape | before | after | |
+|---|---:|---:|---:|
+| ISL 128 / OSL 256 | 3,239.5 tok/s | 3,319.3 | 1.025x |
+| mixed ≤2048 / OSL 128 | 3,188.5 tok/s | 3,269.6 | 1.025x |
+| mixed ≤2048 / OSL 16 | 2,347.6 tok/s | 2,372.1 | 1.01x |
+
+One after rep at OSL 16 read 1,704 tok/s against 2,375 and 2,372 beside it, a
+1.5 s run. Latency, one request at a time at ISL 128 / OSL 256: TTFT p50
+**17.4 → 16.0 ms** (0.92x), p99 19.9 → 18.2, ITL p50 6.63 → 6.50. The TTFT gain
+is the address build: §3.9's first half had cost ~0.25 ms of it. The same row on
+the same code read 16.4 ms in that session and 17.4 in this one, so only
+back-to-back pairs compare. The stored `liteinfer-paged-prefill` rows stay #46's.
+
+**The dense fallback**, `liteinfer-sdpa` (padded, from #46's branch) against
+`liteinfer-sdpa-packed`, two reps each on one A40 per shape:
+
+| shape | padded | packed | |
+|---|---:|---:|---:|
+| ISL 128 / OSL 256 | 1,686.0 tok/s | 1,670.8 | 0.99x |
+| mixed ≤2048 / OSL 128 | 833.0 tok/s | 1,011.6 | **1.21x** |
+
+Latency at ISL 128: TTFT p50 15.6 → 16.6 ms (1.06x), p99 17.4 → 19.4 (1.12x),
+ITL p50 15.3 → 15.7 (1.03x) — the metrics that got worse. A prompt's K/V are
+read back out of the pool before attention where the padded pass attended to
+the tensors it had just computed, and the decode key bound is rebuilt per layer
+where the padded mask was built once per step. Stored: the first rep of each.
+
+**A loop on decode was measured and rejected.** The first version looped over
+sequences for every pass, as the roadmap planned. On decode that is 32
+sequences x ~6 launches per layer where the padded path made one batched call:
+**454 tok/s against 1,724 (0.26x)** at ISL 128 and 0.56x on mixed lengths.
+Gathering the whole left-aligned table and bounding each row by its context
+length is the rule the paged kernel applies, and needs none of what was deleted.
+Packed passes keep the loop: batching them would mean padding their queries.
+
+**The activation profile** now runs one packed pass of `token_budget` tokens as
+whole `max_model_len` prompts, through the kernel the engine serves with. At
+32 x 4,096 on Llama-3.2-1B it reserves **8.03 GiB** under `paged` and `sdpa`,
+against 9.03 for the padded `sdpa` forward it replaces. Under `eager` the padded
+forward did not fit at all — the pool was sized with no measured activations —
+and the per-sequence one measures 8.03 GiB too.
 
 ### A stable run is not a comparable one
 

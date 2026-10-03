@@ -59,19 +59,3 @@ def test_a_split_count_below_one_is_refused(tiny_llama_dir: Path) -> None:
     with pytest.raises(ValueError, match="paged_decode_splits must be >= 1"):
         _runner(tiny_llama_dir, paged_decode_splits=0)
 
-
-def test_a_dense_kernel_pads_by_default(tiny_llama_dir: Path) -> None:
-    """Only the paged kernel reads a packed batch, so the CPU fallback pads rather than fails."""
-    runner = _runner(tiny_llama_dir)
-
-    runner.load_model()
-
-    assert not runner._packs_prefill
-
-
-def test_asking_a_dense_kernel_to_pack_is_refused(tiny_llama_dir: Path) -> None:
-    """A row that asks for the packed path has to get it, or hear why it could not."""
-    runner = _runner(tiny_llama_dir, attn_implementation="sdpa", enable_packed_prefill=True)
-
-    with pytest.raises(ValueError, match="padded batch"):
-        runner.load_model()

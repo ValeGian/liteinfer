@@ -15,6 +15,16 @@ Engine = Literal["liteinfer", "vllm"]
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
+    """One row of the matrix, pinned so a stored result keeps meaning what it measured.
+
+    Rows stored before §3.9 ran a padded prefill, which the engine no longer has.
+    The decode-side rows stay runnable: on the fixed-ISL datasets they were
+    measured on, padding computed nothing a packed pass does not, so a re-run
+    measures a packed prefill doing the same work. Rows whose claim rested on
+    padding — the dense engines, and the padded baseline on mixed lengths — are
+    `historical`.
+    """
+
     name: str
     engine: Engine
     description: str
@@ -30,10 +40,6 @@ class BenchmarkConfig:
     """Off by default for the same reason: every row stored before §3.2 was
     measured launching the decode forward kernel by kernel, and must go on
     meaning that."""
-    enable_packed_prefill: bool = False
-    """Off by default for the same reason again: every row stored before §3.6 was
-    measured left-padding each prefill batch to its longest prompt, and must go
-    on meaning that."""
     paged_decode_splits: int | None = 1
     """Programs sharing one sequence's decode key loop. One by default for the
     same reason again: every row stored before §2.7 ran the unsplit grid, and a
@@ -108,6 +114,7 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
     # --- liteinfer: continuous batching (§1.2) ---
     BenchmarkConfig(
         name="liteinfer-continuous",
+        historical=True,
         engine="liteinfer",
         max_num_seqs=32,
         baseline="liteinfer-paged-b4",
@@ -116,6 +123,7 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
     # --- liteinfer: fused attention kernel (§3.3) ---
     BenchmarkConfig(
         name="liteinfer-sdpa",
+        historical=True,
         engine="liteinfer",
         max_num_seqs=32,
         attn_implementation="sdpa",
@@ -191,7 +199,6 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         max_model_len=2176,
         attn_implementation="paged",
         enable_cuda_graphs=True,
-        enable_packed_prefill=True,
         paged_decode_splits=None,
         baseline="liteinfer-graphs-mixed",
         description=(
@@ -211,6 +218,7 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         enable_cuda_graphs=True,
         paged_decode_splits=None,
         description="Captured decode with a padded prefill, at a mixed dataset's context budget",
+        historical=True,
     ),
     # --- liteinfer: one forward for a step that admits while others decode (§1.3) ---
     BenchmarkConfig(
@@ -220,7 +228,6 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         max_model_len=2176,
         attn_implementation="paged",
         enable_cuda_graphs=True,
-        enable_packed_prefill=True,
         paged_decode_splits=None,
         max_num_batched_tokens=2048,
         baseline="liteinfer-packed",
@@ -237,7 +244,6 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         max_model_len=2176,
         attn_implementation="paged",
         enable_cuda_graphs=True,
-        enable_packed_prefill=True,
         paged_decode_splits=None,
         max_num_batched_tokens=2048,
         baseline="liteinfer-packed-budget",
@@ -255,12 +261,23 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         max_model_len=2176,
         attn_implementation="paged",
         enable_cuda_graphs=True,
-        enable_packed_prefill=True,
         paged_decode_splits=None,
         baseline="liteinfer-packed",
         description=(
             "Packed prefill read through paged_prefill even with nothing cached, instead "
             "of FlashAttention's varlen entry. Measure it on a mixed-length dataset"
+        ),
+    ),
+    # --- liteinfer: the dense kernels without a padded batch (§3.9) ---
+    BenchmarkConfig(
+        name="liteinfer-sdpa-packed",
+        engine="liteinfer",
+        max_num_seqs=32,
+        attn_implementation="sdpa",
+        baseline="liteinfer-sdpa",
+        description=(
+            "SDPA over a packed batch, one attention call per sequence, instead of a "
+            "padded batch and a mask"
         ),
     ),
     # --- vLLM reference points, matched on batch size ---

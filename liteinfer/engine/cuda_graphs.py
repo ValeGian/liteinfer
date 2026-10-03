@@ -20,8 +20,8 @@ What is *not* frozen is anything the kernels read out of device memory — and t
 is where the context length lives. `paged_decode` bounds its loop by
 `context_lens`, a tensor, so one capture serves every context length and the slot
 table can be a single fixed ``[max_num_seqs, max_model_len]`` buffer. Its unused
-columns are never even read: the kernel starts at ``max_context - context_len``,
-so a wide table costs nothing and needs no zeroing between steps.
+columns are never even read: the table is left-aligned and the kernel stops at
+``context_len``, so a wide table costs nothing and needs no zeroing between steps.
 
 That is why this is worth doing now and measured 1.06x when it was first tried.
 Until §2.3 the decode read *gathered* each sequence's KV history into a
@@ -32,9 +32,9 @@ pool where it lies and skips what `context_lens` excludes, so there are no KV
 buckets here, and no padded rows to discard either — capturing per exact batch
 width means every row of every capture is a real sequence.
 
-Which is also the precondition. The dense kernels take an additive mask whose
-width follows the batch's longest context, and a capture cannot hold a shape that
-changes every step; only the paged kernel takes its bounds as a tensor.
+Which is also the precondition. The dense kernels slice each sequence's context
+on the host, a shape that changes every step and a capture cannot hold; only the
+paged kernel takes its bounds as a tensor.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ import torch
 
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
 from liteinfer.models import LAST_POSITION
-from liteinfer.models.attention import reads_paged_kv
+from liteinfer.models.attention import reads_pool_in_place
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,11 +76,11 @@ def unsupported_reason(device: torch.device, attn_implementation: str) -> str | 
     """Why the decode forward cannot be captured here, or `None` if it can."""
     if device.type != "cuda":
         return f"CUDA graphs need a CUDA device and this is {device}"
-    if not reads_paged_kv(attn_implementation):
+    if not reads_pool_in_place(attn_implementation):
         return (
-            f"attn_implementation={attn_implementation!r} builds an attention mask whose "
-            "width follows the batch's longest context, and a capture freezes every shape; "
-            "only the paged kernel takes its context lengths as a tensor"
+            f"attn_implementation={attn_implementation!r} slices each sequence's context "
+            "on the host, and a capture freezes every shape; only the paged kernel takes "
+            "its context lengths as a tensor"
         )
     return None
 
@@ -200,8 +200,8 @@ class DecodeGraphs:
         """Copy this step's inputs into the buffers the capture was recorded against."""
         width = slots.shape[1]
         if width > self._slots.shape[1]:
-            # A negative slice would silently keep only the last `max_model_len`
-            # columns, which is the newest tokens of the wrong sequences.
+            # The copy below would fail on its shapes anyway; this names the
+            # config that made the table too wide for the buffer.
             raise ValueError(
                 f"slot table is {width} columns wide but the engine was built for "
                 f"max_model_len={self._slots.shape[1]}"
@@ -210,16 +210,16 @@ class DecodeGraphs:
         self._position_ids[:batch_size].copy_(position_ids)
         self._write_slots[:, :batch_size].copy_(write_slots)
         self._context_lens[:batch_size].copy_(context_lens)
-        # The slot table is right-aligned, so it lands in the table's last columns
-        # and every row keeps its own alignment — right-alignment composes, which
-        # is what lets one fixed-width buffer serve every context. The columns in
-        # front are the padding the kernel starts after, so they are left as they
-        # are rather than cleared.
-        self._slots[:batch_size, -width:].copy_(slots)
+        # The slot table is left-aligned, so it lands in the buffer's first
+        # columns and every row keeps its own alignment, which is what lets one
+        # fixed-width buffer serve every context. The columns after are past
+        # every context the kernel reads, so they are left as they are rather
+        # than cleared.
+        self._slots[:batch_size, :width].copy_(slots)
 
     def _forward(self, batch_size: int) -> torch.Tensor:
         """The decode forward over the static buffers, at one batch width."""
-        payload = self._cache.make_paged_decode_payload(
+        payload = self._cache.make_decode_payload(
             self._write_slots[:, :batch_size],
             self._slots[:batch_size],
             self._context_lens[:batch_size],
@@ -229,7 +229,6 @@ class DecodeGraphs:
             input_ids=self._input_ids[:batch_size],
             position_ids=self._position_ids[:batch_size],
             past_key_values=payload,
-            attention_mask=None,
             logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]

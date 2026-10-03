@@ -205,8 +205,8 @@ def test_a_replayed_split_decode_matches_an_unsplit_one(tiny_llama_dir: Path):
     assert split == unsplit
 
 
-def test_capture_is_off_when_a_gathering_kernel_is_pinned(tiny_llama_dir: Path):
-    """`sdpa` needs a mask as wide as the batch's longest context, which a graph cannot hold."""
+def test_capture_is_off_when_a_dense_kernel_is_pinned(tiny_llama_dir: Path):
+    """`sdpa` slices each sequence's context on the host, a shape a graph cannot hold."""
     config = EngineConfig(
         model=str(tiny_llama_dir),
         device="cuda",
@@ -219,3 +219,23 @@ def test_capture_is_off_when_a_gathering_kernel_is_pinned(tiny_llama_dir: Path):
     runner.load_model()
 
     assert runner.captured_decode_widths == []
+
+
+def test_a_short_sequence_replayed_after_a_long_one_ignores_the_columns_it_left(tiny_llama_dir: Path):
+    """The capture's slot buffer keeps whatever a longer context last wrote past a short one's.
+
+    Those stale columns name the long sequence's slots, so reading one would
+    show in the short sequence's logits; a fresh runner has nothing stale.
+    """
+    reused = _runner(tiny_llama_dir, capture=True, max_num_seqs=1)
+    long_run = _sequences((40,))
+    reused.execute(long_run)
+    for step in range(_DECODE_STEPS):
+        long_run[0].output_token_ids.append(3 + step)
+        reused.execute(long_run)
+    reused.deregister_sequence(long_run[0])
+
+    after_long = _decode_logits(reused, (4,))
+    fresh = _decode_logits(_runner(tiny_llama_dir, capture=True, max_num_seqs=1), (4,))
+
+    torch.testing.assert_close(after_long, fresh, rtol=0, atol=1e-5)

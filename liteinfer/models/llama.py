@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from liteinfer.models.attention import UNIVERSAL_IMPLEMENTATION, DenseKV, resolve
+from liteinfer.models.attention import UNIVERSAL_IMPLEMENTATION, resolve
+
+if TYPE_CHECKING:
+    from liteinfer.cache.continuous_kv_cache import KVPayload
 
 
 @dataclass
@@ -23,7 +25,6 @@ class CausalLMOutput:
     """Minimal forward output. Mirrors the fields liteinfer reads."""
 
     logits: torch.Tensor
-    past_key_values: Cache | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +143,7 @@ class LlamaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None,
+        past_key_values: KVPayload,
     ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         hidden_shape = (batch, seq_len, -1, self.head_dim)
@@ -155,15 +155,10 @@ class LlamaAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
-        # The cache decides what the kernel reads: K and V as tensors, or the
-        # pool plus the addresses to walk it (see `cache/continuous_kv_cache.py`).
-        # `is not None` rather than truthiness: an empty Cache is falsy.
-        if past_key_values is None:
-            kv = DenseKV(k, v)
-        else:
-            kv = past_key_values.update(k, v, self.layer_idx)
-
-        attn_output = self.attention(q, kv, attention_mask, self.scaling, self.num_kv_groups)
+        # The payload stores this pass's K/V and says where every token each
+        # sequence holds lives (see `cache/continuous_kv_cache.py`).
+        kv = past_key_values.update(k, v, self.layer_idx)
+        attn_output = self.attention(q, kv, self.scaling, self.num_kv_groups)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch, seq_len, -1)
         return self.o_proj(attn_output)
 
@@ -180,15 +175,13 @@ class LlamaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None,
+        past_key_values: KVPayload,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
             past_key_values=past_key_values,
         )
         hidden_states = residual + hidden_states
@@ -219,8 +212,7 @@ class LlamaModel(nn.Module):
         self,
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor,
-        past_key_values: Cache,
-        attention_mask: torch.Tensor,
+        past_key_values: KVPayload,
     ) -> CausalLMOutput:
         inputs_embeds = self.embed_tokens(input_ids)
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
@@ -230,12 +222,11 @@ class LlamaModel(nn.Module):
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
                 past_key_values=past_key_values,
             )
 
         hidden_states = self.norm(hidden_states)
-        return CausalLMOutput(logits=hidden_states, past_key_values=past_key_values)
+        return CausalLMOutput(logits=hidden_states)
 
 
 class LlamaForCausalLM(nn.Module):
@@ -259,32 +250,29 @@ class LlamaForCausalLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         position_ids: torch.LongTensor,
-        past_key_values: Cache,
-        attention_mask: torch.Tensor,
+        past_key_values: KVPayload,
         logits_positions: slice | torch.Tensor | None = None,
     ) -> CausalLMOutput:
         """Run the model and project the selected positions to vocabulary logits.
 
         `logits_positions` says which positions need logits; `None` computes them
-        all, which is what a language model is expected to do and what the
-        `transformers` parity tests compare against. A padded batch wants the same
-        column from every row, which is a slice; a packed one wants a different
-        index per sequence, which is a tensor of them.
+        all, which is what a language model is expected to do. A decode batch
+        wants the one column of every row, which is `models.LAST_POSITION`; a
+        packed one wants each sequence's last token, a different index per
+        sequence, which is a tensor of them.
 
-        Passing `models.LAST_POSITION` instead is not a micro-optimisation. The head's
-        output is `batch x positions x vocab`, which at batch 8 and a 2,048-token
-        prompt is 3.91 GiB — **96% of the whole prefill's peak allocation** — and
-        an inference pass reads one row of it per sequence. Slicing the hidden
-        states first is what keeps the rest from being computed and stored at all.
+        Selecting is not a micro-optimisation. The head's output is `positions x
+        vocab`, which for 8 prompts of 2,048 tokens is 3.91 GiB, and an inference
+        pass reads one row of it per sequence. Slicing the hidden states first is
+        what keeps the rest from being computed and stored at all.
         """
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
         )
         hidden_states = outputs.logits
         if logits_positions is not None:
             hidden_states = hidden_states[:, logits_positions, :]
         logits = self.lm_head(hidden_states)
-        return CausalLMOutput(logits=logits, past_key_values=outputs.past_key_values)
+        return CausalLMOutput(logits=logits)

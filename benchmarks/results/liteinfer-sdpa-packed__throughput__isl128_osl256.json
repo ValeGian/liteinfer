@@ -1,0 +1,32 @@
+{
+  "config": "liteinfer-sdpa-packed",
+  "engine": "liteinfer",
+  "description": "SDPA over a packed batch, one attention call per sequence, instead of a padded batch and a mask",
+  "baseline": "liteinfer-sdpa",
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-10-03T19:33:30+00:00",
+  "revision": "364b983-dirty",
+  "dataset": {
+    "path": "/home/valerio/workspace/liteinfer/benchmarks/datasets/isl128_osl256_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": 128,
+    "target_osl": 256,
+    "max_isl": null,
+    "num_samples": 200,
+    "sha256": "d97d71495aff03159e2deb9e9a6e918dc6698b03311bd955a7d6f8b306273cb8"
+  },
+  "summary": {
+    "output_tokens_per_s": 1655.8961869460147,
+    "requests_per_s": 6.46834448025787,
+    "wall_time_s": 30.91981272958219
+  },
+  "raw": {
+    "wall_time_s": 30.91981272958219,
+    "output_tokens": 51200,
+    "step_phases": {
+      "prefill": 7,
+      "decode": 1785
+    }
+  }
+}

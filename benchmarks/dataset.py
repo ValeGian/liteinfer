@@ -13,11 +13,10 @@ the length it actually has; `target_isl` is the length that was asked for.
 
 **Mixed** (`target_isl=None`) keeps whole turns instead, so the run carries the
 corpus's own length spread — median 17 tokens, mean 74, p99 1,286. That
-distinction is not cosmetic: a batch is left-padded to its longest prompt, so
-at a fixed ISL padding wastes *exactly nothing*, while on the real spread a
-batch of 32 computes 11.64x the positions it keeps. Every liteinfer row measured
-before this existed was measured on the one workload where that cost is
-invisible (§3.6, §8.7).
+distinction is not cosmetic: a batch left-padded to its longest prompt wastes
+*exactly nothing* at a fixed ISL, while on the real spread a batch of 32 would
+compute 11.64x the positions it keeps — so a change to how batches are laid out
+shows only here (§3.6, §8.7).
 """
 
 from __future__ import annotations

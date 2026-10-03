@@ -391,70 +391,11 @@ listed.
   hand-partitioned capture of the non-attention spans. Neither is small, and
   neither is worth building before §8.8 says how many steps it would cover.
 
-### 3.9 Retire the padded path
-- **Status.** `in-progress` — the first half (every packed pass through `paged_prefill`) is measured and passed its gate; the padded path's deletion follows.
-- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ → ~~§1.3~~ (all six landed) → §3.9.
-- **PRs.** [#46](https://github.com/ValeGian/liteinfer/pull/46) (first half)
-- **Why.** Padding is currently undone by five mechanisms that exist only to
-  cancel each other: left-padded inputs, a right-aligned slot table, a null block
-  absorbing pad positions, two mask builders, and a two-pass route inside the
-  runner's one entry point. Since §1.3 every one of them has a packed equivalent,
-  and the engine keeps both.
-  Keeping a slower general path "just in case" is how the codebase stops being
-  readable.
-- **Scope.** Delete `build_prefill_mask` and the padded input builders, drop the
-  slot table's right-alignment and the null block if decode capture no longer
-  needs it, collapse `_padded_forward`'s two passes inside `execute` into the
-  packed route §1.3 left, and then simplify what the choice left behind — a
-  dispatcher with one entry is the shape to look for.
-- **First half: `varlen_attention` goes, because an engine run agreed.** Built as its
-  own PR so its number measures one change: every packed pass, nothing cached or
-  not, reads through `paged_prefill`, and `varlen_attention`, `VarlenKV` and
-  `_PackedPrefillPayload` are deleted. Per layer, `paged_prefill` over whole
-  prompts is 0.30x of flash at 32 x 18 tokens and within 4% up to 4,096 (§2.10).
-  The gate is `liteinfer-paged-prefill` against `liteinfer-packed` in throughput
-  mode on the mixed dataset, at OSL 16 (the prefill-heaviest shape) and OSL 128.
-  Packing then needs only the paged kernel, so fp32 on CUDA packs too, and the
-  GPU parity references are pinned to `eager` to stay independent of it.
-  `liteinfer-packed` and `liteinfer-onepass-budget` both measured varlen on
-  their whole-prompt passes, so both are `historical`; §8.8 re-runs the latter
-  from §1.3's parent revision anyway. Measured: 1.04x at OSL 16, 0.99x at OSL
-  128, 1.00x at ISL 128 — no loss. What got worse is single-request TTFT at ISL
-  128, **15.4 → 16.4 ms (1.07x)**, a fixed host cost that 512-token prompts hide:
-  ~0.25 ms of payload building and the rest Triton's launch path (§3.10).
-- **The read table is built twice for a whole prompt.** `make_packed_prefill_payload`
-  moves the block table once for the write slots (`packed_addresses`) and again
-  for the right-aligned read table (`slot_table_for`), plus a transfer for the
-  context lengths — the 0.25 ms above. Left-aligned, the write slots are one
-  gather out of the read table, so one transfer serves both; fold it into the
-  realignment rather than special-casing whole prompts now.
-- **The activation profile has to follow.** `_profile_forward_bytes` sizes the
-  pool from a *padded* `sdpa` forward over `max_num_seqs x max_model_len` with a
-  full `[B, 1, L, L]` mask, even on an engine that packs. That over-reserves
-  today, which is safe; with the padded path gone it is the wrong basis, and the
-  worst case to profile becomes one packed pass of `token_budget` tokens.
-- **What stays.** `eager` and `sdpa` keep a packed per-sequence loop. They are the
-  correctness reference and the CPU path, not performance paths, and should not
-  pretend otherwise. `eager` in particular is the oracle the fused kernels are
-  checked against, and it is what caught §3.6 attending across prompt boundaries
-  when no benchmark did.
-- **Price the loop before landing it, because it is not free.** A per-sequence
-  loop wastes launches where padding wastes arithmetic, and at short prompts the
-  launches cost more. Measured on 32 mixed prompts, padded batch against one
-  forward per sequence: **273.2 ms vs 448.5** and 276.5 vs 426.9 where the longest
-  prompt was ~320 tokens, but 571.2 vs **456.0** where it was 657. So retiring the
-  padded layout makes the dense paths slower on exactly the workloads they serve
-  — short prompts, many of them — unless the loop is replaced by something
-  better. Say what it costs rather than discovering it afterwards.
-- **The rule this follows** is "Shipping an improvement", step 6: confirm the
-  superseded configs' results are stored, flag them `historical`, delete the code,
-  then collapse the abstraction.
-
 ### 3.10 Cut the host cost of launching a Triton kernel in an eager pass
-- **Status.** `planned` — raised by §3.9's first half.
+- **Status.** `planned` — raised by §3.9 ([#46](https://github.com/ValeGian/liteinfer/pull/46)).
 - **PRs.** _none yet_
 - **Why.** Every pass that is not a captured decode step launches its Triton
-  kernels through `JITFunction.run`, which binds ~21 arguments and computes a
+  kernels through `JITFunction.run`, which binds ~20 arguments and computes a
   specialization key over every integer before its cache lookup — about 10-20 us
   per launch on Triton 3.7 against ~5 us for an aten op. Over 16 layers that is a
   visible share of a short prefill: routing whole prompts through `paged_prefill`
@@ -464,11 +405,13 @@ listed.
 - **Scope.** Find out first how much of the residual is launch and how much is
   the kernel's own time on a tiny chunk, per layer, in latency mode. A cached
   `CompiledKernel` handle is the obvious lever, but it is valid per
-  specialization — `max_context` and `total_tokens` change every step — and its
+  specialization — the query count and the slot table's stride change every step — and its
   `run` convention is private and has moved between 3.x minors. Fewer constexprs
   do not shorten the key, which covers every argument.
-- **After §3.9**, so the payload's own cost is gone first and this measures only
-  the launch.
+- **The payload's cost is already gone.** §3.9 builds a packed pass's addresses
+  from one transfer instead of five — paged TTFT at ISL 128 read 17.4 → 16.0 ms
+  back to back — so what this measures is the launch alone. Compare within one
+  session: the same row on the same code has read 16.4 and 17.4 ms in two.
 
 ---
 

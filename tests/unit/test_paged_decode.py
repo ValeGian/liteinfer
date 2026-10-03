@@ -2,8 +2,9 @@
 """The fused paged decode kernel must answer what the dense kernels answer.
 
 Everything here runs on GPU: the kernel is Triton, and Triton is CUDA-only.
-The reference is `eager_attention` over the same K/V gathered out of the pool
-by hand — the path the paged kernel exists to replace.
+The reference is `eager_attention` over the same pool and addresses — it copies
+each sequence's context out and attends in plain matmuls, which is the work the
+paged kernel exists to avoid.
 """
 
 from __future__ import annotations
@@ -11,8 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from liteinfer.engine.attention_mask import build_continuous_decode_mask
-from liteinfer.models.attention import DenseKV, eager_attention
+from liteinfer.models.attention import PagedKV, eager_attention
 from liteinfer.models.paged_decode import _MAX_SPLITS, choose_num_splits, paged_decode
 
 pytestmark = pytest.mark.gpu
@@ -50,13 +50,13 @@ class _PagedBatch:
         self.value_pool = randn(NUM_SLOTS, num_kv_heads, head_dim)
         self.query = randn(len(context_lens), num_heads, head_dim)
 
-        # Right-aligned, exactly as `cache.block_pool.slot_table` builds it:
-        # a sequence's real tokens are its last `context_len` columns, and the
-        # padding in front of them points at the null block.
+        # Left-aligned, exactly as `cache.block_pool.slot_table` builds it: a
+        # sequence's tokens are its first `context_len` columns, and the columns
+        # after them are never read.
         max_context = max(context_lens)
         self.slot_table = torch.zeros(len(context_lens), max_context, dtype=torch.long, device=device)
         for row, context_len in enumerate(context_lens):
-            self.slot_table[row, max_context - context_len :] = torch.randint(
+            self.slot_table[row, :context_len] = torch.randint(
                 1, NUM_SLOTS, (context_len,), generator=generator, device=device
             )
 
@@ -74,14 +74,15 @@ class _PagedBatch:
         )
 
     def dense(self) -> torch.Tensor:
-        """The same attention through the gather the paged kernel avoids."""
-        keys = self.key_pool[self.slot_table].permute(0, 2, 1, 3)
-        values = self.value_pool[self.slot_table].permute(0, 2, 1, 3)
-        mask = build_continuous_decode_mask(self.context_lens, self.dtype, self.device)
-        out = eager_attention(
-            self.query.unsqueeze(2), DenseKV(keys, values), mask, self.scaling, self.num_kv_groups
+        """The same attention through the copy the paged kernel avoids."""
+        kv = PagedKV(
+            self.key_pool,
+            self.value_pool,
+            self.slot_table,
+            torch.tensor(self.context_lens, dtype=torch.int32, device=self.device),
+            host_context_lens=tuple(self.context_lens),
         )
-        return out.squeeze(2)
+        return eager_attention(self.query.unsqueeze(2), kv, self.scaling, self.num_kv_groups).squeeze(2)
 
 
 def test_paged_decode_matches_the_dense_kernel_in_float32():
@@ -130,20 +131,22 @@ def test_paged_decode_matches_the_dense_kernel_without_grouped_query_heads():
 
 
 def test_paged_decode_never_reads_a_slot_outside_the_context():
-    """What the padding columns point at must not reach the answer.
+    """What the columns past a sequence's context point at must not reach the answer.
 
-    The dense path gathers those columns and masks them away afterwards. The
-    paged kernel stops at `context_lens`, so filling them with real slots must
-    change nothing — which is what makes the decode mask unnecessary.
+    The kernel stops at `context_lens`, so filling those columns with real slots
+    must change nothing — which is what lets the table be as wide as the
+    batch's longest context, and lets a captured buffer keep stale columns.
     """
     batch = _PagedBatch([200, 65, 3], torch.float32)
-    with_null_padding = batch.paged()
-    is_padding = batch.slot_table == 0
+    with_zero_padding = batch.paged()
+    columns = torch.arange(batch.slot_table.shape[1], device=batch.device)
+    lengths = torch.tensor(batch.context_lens, device=batch.device)
+    is_padding = columns.unsqueeze(0) >= lengths.unsqueeze(1)
     batch.slot_table[is_padding] = torch.randint(
         1, NUM_SLOTS, (int(is_padding.sum()),), device=batch.device
     )
 
-    torch.testing.assert_close(batch.paged(), with_null_padding, rtol=0, atol=0)
+    torch.testing.assert_close(batch.paged(), with_zero_padding, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("head_dim", [96, 80, 48, 24])

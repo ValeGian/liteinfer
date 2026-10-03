@@ -21,7 +21,7 @@ class Phase(str, Enum):
 
 @dataclass(frozen=True)
 class StepMetrics:
-    """Snapshot of one engine step, which is one forward wherever prefill is packed."""
+    """Snapshot of one engine step, which is one forward."""
 
     step_idx: int
 
