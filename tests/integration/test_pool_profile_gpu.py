@@ -1,9 +1,9 @@
 """The activation budget is measured, not guessed.
 
-`schedule()` prefills every admitted sequence in one pass, so the widest forward
-this config allows is `max_num_seqs x max_model_len` tokens. Running it once at
-load is what turns the KV pool's share from a fraction someone picked into what
-this device had left — see §2.6.
+`schedule()` hands out up to `token_budget` tokens a step, so the widest forward
+this config allows is that many prompt tokens in one packed pass. Running it once
+at load is what turns the KV pool's share from a fraction someone picked into
+what this device had left — see §2.6.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def _runner(model_dir: Path, **overrides) -> ContinuousModelRunner:
     return runner
 
 
-def test_the_widest_prefill_is_measured_rather_than_guessed(tiny_llama_dir: Path) -> None:
+def test_the_widest_step_is_measured_rather_than_guessed(tiny_llama_dir: Path) -> None:
     """A real forward, run before the pool exists, is what replaces the fraction."""
     runner = _runner(tiny_llama_dir)
 

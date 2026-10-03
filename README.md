@@ -107,19 +107,20 @@ One engine: continuous batching over a paged KV cache.
   decoding sequence, as much of a waiting prompt as fits (a longer one is
   chunked across steps), admitted into free slots. Finished sequences are
   evicted individually.
-- **`ContinuousModelRunner`** — runs one step's forward: prompts and sampled tokens together, in one pass wherever prefill is packed.
+- **`ContinuousModelRunner`** — runs one step's forward: prompts and sampled tokens together, in one pass.
   `torch.compile`, CUDA graph capture and tensor parallelism plug in here.
 - **`ContinuousKVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
-  `slot_mapping` and `slot_table` map logical token positions to physical slots,
-  so a whole batch is read or written with a single indexing op.
+  `packed_addresses`, `newest_slots` and `slot_table` map logical token positions
+  to physical slots, so a whole batch is read or written with a single indexing op.
 - **`models/attention.py`** — the attention kernel, one per
-  `attn_implementation`. `sdpa` (default) never materialises the score matrix;
-  `eager` writes it out in plain matmuls, which reads better and is the parity
-  reference, but caps the prompt length that fits in memory. `paged` is the fast
-  decode path: a Triton kernel that reads the KV pool through the slot table
-  instead of gathering it, so the decode step stops growing with context. With a
-  query dimension it also serves a prompt chunk that continues a cached one. The
-  engine picks between them from the device.
+  `attn_implementation`, each reading the pool through the same addresses.
+  `paged` (the default on CUDA) is a Triton kernel that reads the KV pool in
+  place — one query per sequence for a decode step, any number for a packed
+  pass — so the decode step stops growing with context. `sdpa` (the default
+  elsewhere) and `eager` copy each sequence's context out and attend one
+  sequence at a time: `sdpa` never materialises the score matrix, `eager` writes
+  it out in plain matmuls and is the parity reference. The engine picks between
+  them from the device.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
 without touching the engine. `stats` records a `StepMetrics` per step.

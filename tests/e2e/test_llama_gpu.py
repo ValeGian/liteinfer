@@ -184,7 +184,7 @@ def test_sdpa_matches_eager_on_one_prompt(fp32_kernel_outputs) -> None:
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-def test_sdpa_matches_eager_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
+def test_sdpa_matches_eager_on_a_batch_of_unequal_lengths(fp32_kernel_outputs) -> None:
     """Prompts of different lengths are where a mask-handling difference would show."""
     assert (
         fp32_kernel_outputs["sdpa"]["unequal_lengths_batch"]
@@ -204,7 +204,7 @@ def test_paged_matches_sdpa_on_one_prompt(fp32_kernel_outputs) -> None:
 @pytest.mark.e2e
 @pytest.mark.slow
 def test_paged_matches_sdpa_on_a_batch_of_unequal_lengths(fp32_kernel_outputs) -> None:
-    """The paged kernel packs and builds no mask, so a batch of unequal lengths is its risk case."""
+    """The paged kernel bounds each row by its context length alone, so unequal lengths are its risk case."""
     assert (
         fp32_kernel_outputs["paged"]["unequal_lengths_batch"]
         == fp32_kernel_outputs["sdpa"]["unequal_lengths_batch"]

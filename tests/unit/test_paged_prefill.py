@@ -3,8 +3,8 @@
 
 A chunk's queries are the last positions of its sequence's context: each reads
 the whole cached prefix and its own chunk only up to itself. The reference is
-`eager_attention` over the same K/V gathered out of the pool by hand, under the
-padded path's own chunk mask — the path this kernel exists to replace.
+`eager_attention` over the same pool and addresses, which copies each
+sequence's context out and applies the causal rule in plain matmuls.
 """
 
 from __future__ import annotations
@@ -12,8 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from liteinfer.engine.attention_mask import build_prefill_mask
-from liteinfer.models.attention import DenseKV, eager_attention
+from liteinfer.models.attention import PagedKV, eager_attention
 from liteinfer.models.paged_decode import paged_decode, paged_prefill
 
 pytestmark = pytest.mark.gpu
@@ -48,23 +47,25 @@ class _ChunkBatch:
         self.value_pool = randn(NUM_SLOTS, num_kv_heads, head_dim)
         self.query = randn(sum(query_lens), num_heads, head_dim)
 
-        # Right-aligned, exactly as `cache.block_pool.slot_table` builds it.
+        # Left-aligned, exactly as `cache.block_pool.slot_table` builds it.
         max_context = max(context_lens)
         self.slot_table = torch.zeros(len(context_lens), max_context, dtype=torch.long, device=device)
         for row, context_len in enumerate(context_lens):
-            self.slot_table[row, max_context - context_len :] = torch.randint(
+            self.slot_table[row, :context_len] = torch.randint(
                 1, NUM_SLOTS, (context_len,), generator=generator, device=device
             )
 
+    def _query_start_loc(self) -> torch.Tensor:
+        return torch.tensor([0, *self.query_lens], device=self.device).cumsum(0).to(torch.int32)
+
     def paged(self, **kwargs) -> torch.Tensor:
-        starts = torch.tensor([0, *self.query_lens], device=self.device).cumsum(0)
         return paged_prefill(
             self.query,
             self.key_pool,
             self.value_pool,
             self.slot_table,
             torch.tensor(self.context_lens, dtype=torch.int32, device=self.device),
-            starts.to(torch.int32),
+            self._query_start_loc(),
             max(self.query_lens),
             self.scaling,
             self.num_kv_groups,
@@ -72,19 +73,20 @@ class _ChunkBatch:
         )
 
     def dense(self) -> torch.Tensor:
-        """Each sequence attended on its own, over its gathered context, and packed again."""
-        outputs, first = [], 0
-        max_context = self.slot_table.shape[1]
-        for row, (query_len, context_len) in enumerate(zip(self.query_lens, self.context_lens, strict=True)):
-            slots = self.slot_table[row, max_context - context_len :]
-            keys = self.key_pool[slots].permute(1, 0, 2).unsqueeze(0)
-            values = self.value_pool[slots].permute(1, 0, 2).unsqueeze(0)
-            query = self.query[first : first + query_len].permute(1, 0, 2).unsqueeze(0)
-            mask = build_prefill_mask([query_len], self.dtype, self.device, [context_len])
-            out = eager_attention(query, DenseKV(keys, values), mask, self.scaling, self.num_kv_groups)
-            outputs.append(out.squeeze(0).permute(1, 0, 2))
-            first += query_len
-        return torch.cat(outputs)
+        """Each sequence attended on its own, over its copied-out context, and packed again."""
+        kv = PagedKV(
+            self.key_pool,
+            self.value_pool,
+            self.slot_table,
+            torch.tensor(self.context_lens, dtype=torch.int32, device=self.device),
+            query_start_loc=self._query_start_loc(),
+            max_query_len=max(self.query_lens),
+            host_context_lens=tuple(self.context_lens),
+            host_query_lens=tuple(self.query_lens),
+        )
+        # The layers speak `[1, heads, tokens, dim]`; the kernel's layout is token-first.
+        query = self.query.permute(1, 0, 2).unsqueeze(0)
+        return eager_attention(query, kv, self.scaling, self.num_kv_groups).squeeze(0).permute(1, 0, 2)
 
 
 def _assert_matches_in_float32(actual: torch.Tensor, expected: torch.Tensor) -> None:

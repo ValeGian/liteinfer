@@ -4,6 +4,18 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ---
 
+## 03-10-2026 — §3.9 The padded path is retired
+
+- **PRs.** [#46](https://github.com/ValeGian/liteinfer/pull/46) (first half), #NN
+- **What.** Every pass is packed or a decode step, on every kernel and device. Deleted: `_padded_forward`/`_padded_prefill` and the padded input builders, `engine/attention_mask.py` with both mask builders, `DenseKV`, `_PrefillPayload` and the gathering decode payload with `ContinuousKVCache.gather`, `EngineConfig.enable_packed_prefill` and the packing precondition, the null block, and the slot table's right-alignment. Kernels take `(query, kv: PagedKV, scaling, num_kv_groups)` — no mask — and the Triton kernels lost `max_context`, which only right-alignment needed. `models/llama.py` lost its mask argument and the `transformers` `Cache` type it never used.
+- **One transfer per packed pass.** `packed_addresses` builds the write slots, the left-aligned read table, positions, `query_start_loc` and context lengths from one transfer of the block tables, where the first half paid five; a decode step writes through `newest_slots` (host-computed) and reads through `slot_table`. Paged TTFT at ISL 128: 17.4 → 16.0 ms back to back; throughput 1.01-1.025x.
+- **The dense kernels read the pool too.** A decode step gathers every row's context at once and bounds it by its length; a packed pass loops per sequence inside attention, slicing on `PagedKV.host_context_lens`/`host_query_lens`. A loop on decode was measured first and rejected at 0.26x. `sdpa` against its padded self: 0.99x at ISL 128, **1.21x** on mixed lengths; worse: TTFT 15.6 → 16.6 ms, ITL 15.3 → 15.7 ms.
+- **The profile follows.** One packed pass of `token_budget` tokens as whole `max_model_len` prompts, through the engine's own kernel via a `ProfilePayload` that addresses the pass's own K/V: 8.03 GiB at 32 x 4,096 against 9.03 padded, and `eager`, whose padded profile ran out of memory, now measures.
+- **Bookkeeping.** `liteinfer-continuous`, `liteinfer-sdpa` and `liteinfer-graphs-mixed` claimed something only a padded prefill had, and are `historical`; `liteinfer-sdpa-packed` is the fallback's row. Decode-side rows on fixed-ISL datasets stay runnable — padding there computed nothing a packed pass does not — and `BenchmarkConfig` says so.
+- **Parity.** Full GPU suite on an A40. New: a decode row ignores what its table's columns past its context address; a chunk answers what the same rows of the whole prompt answer; a sequence never sees another's keys; a short sequence replayed after a long one ignores the columns the long one left in the capture's buffer; the profile payload reads back exactly its pass's K/V.
+
+---
+
 ## 03-10-2026 — §3.9, first half: every packed pass reads through one kernel
 
 - **PRs.** [#46](https://github.com/ValeGian/liteinfer/pull/46) (first half)

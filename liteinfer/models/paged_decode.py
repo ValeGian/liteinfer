@@ -20,10 +20,9 @@ the operation to a general kernel:
 * **Grouped-query heads are never expanded.** One program owns one KV head and
   every query head that shares it, so K and V are read once per group instead
   of once per query head (`_repeat_kv` in the dense path materialises that copy).
-* **Padding is never read.** ``context_lens`` says how many tokens each sequence
-  really has, so the loop stops there. The dense path pads every sequence out
-  to the longest in the batch and masks the difference away afterwards, having
-  already paid to move it.
+* **Nothing past a context is read.** ``context_lens`` says how many tokens each
+  sequence really has, so the loop stops there, and the slot table's columns
+  past it — the width of the batch's longest context — are never touched.
 
 A decode step is one query per sequence, and that is what makes the whole
 history readable in a single pass with no causal mask — the newest token
@@ -152,13 +151,13 @@ _MIN_TILES_TO_SPLIT = 4
 
 
 @triton.jit
-def _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq, max_context, context_len):
+def _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq):
     """Address of this sequence's slot for logical position 0.
 
-    The slot table is right-aligned (see `cache/block_pool.slot_table`), so a
-    sequence's real tokens are its *last* `context_len` columns.
+    The slot table is left-aligned (see `cache/block_pool.slot_table`), so a
+    sequence's tokens are its first `context_len` columns.
     """
-    return slot_table_ptr + seq * slot_table_stride_seq + (max_context - context_len)
+    return slot_table_ptr + seq * slot_table_stride_seq
 
 
 @triton.jit
@@ -310,7 +309,6 @@ def _attend_query_block(
     out_stride_token,
     out_stride_head,
     scaling,
-    max_context,
     NUM_GROUPS: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
@@ -347,7 +345,7 @@ def _attend_query_block(
     block_start = first_query_position + query_block * BLOCK_Q
     last_key = first_query_position + tl.minimum((query_block + 1) * BLOCK_Q, num_queries)
     query_positions = first_query_position + query_index
-    slots = _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq, max_context, context_len)
+    slots = _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq)
 
     accumulator, running_sum, running_max = _empty_softmax_state(QUERY_ROWS, HEAD_DIM_TILE)
     accumulator, running_sum, running_max = _fold_keys_into_running_softmax(
@@ -389,7 +387,6 @@ def _paged_decode_kernel(
     out_stride_seq,
     out_stride_head,
     scaling,
-    max_context,
     NUM_GROUPS: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
     BLOCK_KV: tl.constexpr,
@@ -411,7 +408,7 @@ def _paged_decode_kernel(
         query_ptr, key_pool_ptr, value_pool_ptr, slot_table_ptr, out_ptr,
         seq, tl.program_id(1), 0, seq, 1, tl.load(context_lens_ptr + seq),
         query_stride_seq, query_stride_head, pool_stride_slot, pool_stride_head,
-        slot_table_stride_seq, out_stride_seq, out_stride_head, scaling, max_context,
+        slot_table_stride_seq, out_stride_seq, out_stride_head, scaling,
         NUM_GROUPS, 1, QUERY_ROWS, BLOCK_KV, HEAD_DIM, HEAD_DIM_TILE, True,
     )
 
@@ -433,7 +430,6 @@ def _paged_prefill_kernel(
     out_stride_token,
     out_stride_head,
     scaling,
-    max_context,
     NUM_GROUPS: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
@@ -458,7 +454,7 @@ def _paged_prefill_kernel(
         seq, tl.program_id(1), query_block, first_token, num_queries,
         tl.load(context_lens_ptr + seq),
         query_stride_token, query_stride_head, pool_stride_slot, pool_stride_head,
-        slot_table_stride_seq, out_stride_token, out_stride_head, scaling, max_context,
+        slot_table_stride_seq, out_stride_token, out_stride_head, scaling,
         NUM_GROUPS, BLOCK_Q, QUERY_ROWS, BLOCK_KV, HEAD_DIM, HEAD_DIM_TILE, False,
     )
 
@@ -483,7 +479,6 @@ def _paged_decode_split_kernel(
     partial_lse_stride_seq,
     partial_lse_stride_head,
     scaling,
-    max_context,
     NUM_GROUPS: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
     BLOCK_KV: tl.constexpr,
@@ -532,7 +527,7 @@ def _paged_decode_split_kernel(
         query,
         key_pool_ptr,
         value_pool_ptr,
-        _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq, max_context, context_len),
+        _sequence_slots(slot_table_ptr, seq, slot_table_stride_seq),
         pool_stride_slot,
         pool_stride_head,
         kv_head,
@@ -719,7 +714,7 @@ def paged_decode(
         key_pool: this layer's flat key store, ``[num_slots, num_kv_heads, head_dim]``.
         value_pool: the matching value store.
         slot_table: ``[batch, max_context]`` physical slot per logical position,
-            right-aligned, padded columns pointing at the null block.
+            left-aligned; columns past a row's context are never read.
         context_lens: ``[batch]`` real cached tokens per sequence.
         scaling: softmax scale, normally ``head_dim ** -0.5``.
         num_kv_groups: query heads per KV head.
@@ -769,7 +764,6 @@ def paged_decode(
             out.stride(0),
             out.stride(1),
             scaling,
-            max_context,
             **tiles,
         )
         return out
@@ -802,7 +796,6 @@ def paged_decode(
         partial_lse.stride(0),
         partial_lse.stride(1),
         scaling,
-        max_context,
         NUM_SPLITS=num_splits,
         **tiles,
     )
@@ -853,7 +846,7 @@ def paged_prefill(
         key_pool: this layer's flat key store, ``[num_slots, num_kv_heads, head_dim]``.
         value_pool: the matching value store.
         slot_table: ``[batch, max_context]`` physical slot per logical position,
-            right-aligned, padded columns pointing at the null block.
+            left-aligned; columns past a row's context are never read.
         context_lens: ``[batch]`` tokens each sequence holds, its chunk included.
         query_start_loc: ``[batch + 1]`` int32 prefix sums of the chunk lengths.
         max_query_len: longest chunk, which sizes the grid and so is a host int.
@@ -875,7 +868,7 @@ def paged_prefill(
     args = (
         query, key_pool, value_pool, slot_table, context_lens, query_start_loc, out,
         query.stride(0), query.stride(1), key_pool.stride(0), key_pool.stride(1),
-        slot_table.stride(0), out.stride(0), out.stride(1), scaling, slot_table.shape[1],
+        slot_table.stride(0), out.stride(0), out.stride(1), scaling,
     )
     constants = {
         "NUM_GROUPS": num_kv_groups,

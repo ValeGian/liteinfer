@@ -54,7 +54,6 @@ class LiteInferAdapter:
             max_model_len=self._config.max_model_len,
             attn_implementation=self._config.attn_implementation,
             enable_cuda_graphs=self._config.enable_cuda_graphs,
-            enable_packed_prefill=self._config.enable_packed_prefill,
             paged_decode_splits=self._config.paged_decode_splits,
             max_num_batched_tokens=self._config.max_num_batched_tokens,
         )

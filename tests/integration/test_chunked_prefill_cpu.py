@@ -5,9 +5,9 @@ mostly repeats its input token whatever attention returns, so its greedy output
 cannot see a chunk that attends to the wrong keys. Its logits can, and in single
 precision on CPU the two paths should agree to rounding.
 
-CPU runs the padded path: a continuing chunk reads its prefix back through the
-right-aligned table and is masked by an offset causal diagonal. The packed path
-is checked the same way in `test_token_budget_gpu.py`.
+On CPU a continuing chunk reads its prefix back out of the pool through the
+dense loop, causal from where the chunk starts. The paged kernel is checked the
+same way in `test_token_budget_gpu.py`.
 """
 
 from __future__ import annotations

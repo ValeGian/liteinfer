@@ -4,7 +4,7 @@
 ``execute(seqs, num_tokens)`` runs one step: the next ``num_tokens`` of each
 sequence, which is a chunk of its prompt (the whole prompt unless the
 scheduler's token budget split it) or the one token it last sampled. A step
-holding both is one forward wherever prefill is packed.
+holding both is one forward.
 """
 
 from __future__ import annotations
@@ -16,14 +16,13 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload, ProfilePayload
+from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, ProfilePayload
 from liteinfer.config import EngineConfig
-from liteinfer.engine.attention_mask import builders_for
 from liteinfer.engine.cuda_graphs import DecodeGraphs, graphs_are_enabled
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models import LAST_POSITION
-from liteinfer.models.attention import handles_packed_prefill, reads_paged_kv
+from liteinfer.models.attention import reads_pool_in_place
 from liteinfer.models.loader import load_hf_model
 from liteinfer.models.paged_decode import choose_num_splits
 from liteinfer.tokenizer import Tokenizer
@@ -43,36 +42,11 @@ _CPU_NOMINAL_TOTAL_BYTES = 1 << 30
 _PROFILE_WARMUP_TOKENS = 16
 
 
-def _packing_is_enabled(requested: bool | None, implementation: str) -> bool:
-    """Whether prefill packs its batch, from the config and the kernel that reads it.
-
-    `None` packs wherever the kernel can, which is the same rule
-    `enable_cuda_graphs` follows. An explicit `True` that cannot run raises
-    rather than quietly padding: a benchmark row that asks for the packed path
-    has to get it, or hear why it could not.
-    """
-    if requested is False:
-        return False
-    if handles_packed_prefill(implementation):
-        return True
-    if requested is True:
-        raise ValueError(
-            f"enable_packed_prefill was asked for but the {implementation} kernel reads "
-            "a padded batch and a mask"
-        )
-    return False
-
-
 class _Chunk(NamedTuple):
     """The tokens one sequence computes in a pass, and where they start."""
 
     token_ids: list[int]
     start: int
-
-    @property
-    def end(self) -> int:
-        """One past the chunk's last position, which is what the sequence holds afterwards."""
-        return self.start + len(self.token_ids)
 
 
 def _tokens_at(seq: Sequence, start: int, count: int) -> list[int]:
@@ -112,18 +86,11 @@ class ContinuousModelRunner:
         self._cache: ContinuousKVCache | None = None
         self._graphs: DecodeGraphs | None = None
         self._forward_bytes = 0
-        self._packs_prefill = False
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
         self.model, self.hf_config = load_hf_model(self.config, model_path)
         self.tokenizer = Tokenizer(model_path)
-        # After the model, because the kernel is what decides whether a packed
-        # batch can be read at all, and `load_hf_model` is where it is resolved.
-        # Resolved once here rather than per step.
-        self._packs_prefill = _packing_is_enabled(
-            self.config.enable_packed_prefill, self.attn_implementation
-        )
         # Measured before the pool exists, because the pool gets whatever the
         # forward turns out not to need.
         self._forward_bytes = self._profile_forward_bytes()
@@ -173,11 +140,10 @@ class ContinuousModelRunner:
         those are.
 
         How the step runs follows from the tokens it holds, not from a phase.
-        One token per sequence is a decode batch, which the paged kernel serves
-        with split-K and a captured graph replays. Anything else is one packed
-        forward where the device can pack: prompts, chunks and sampled tokens
-        side by side, every row's K/V read where it lies. A padded engine splits
-        that step in two instead; see `_padded_forward`.
+        One token per sequence is a decode batch, laid out one per row, which the
+        paged kernel serves with split-K and a captured graph replays. Anything
+        else is one packed forward: prompts, chunks and sampled tokens side by
+        side, every row's K/V read where it lies.
         """
         assert self._cache is not None and self.model is not None
 
@@ -190,9 +156,7 @@ class ContinuousModelRunner:
 
         if all(len(chunk.token_ids) == 1 for chunk in chunks):
             return self._decode(request_ids, chunks)
-        if self._packs_prefill:
-            return self._packed_forward(request_ids, chunks)
-        return self._padded_forward(request_ids, chunks)
+        return self._packed_forward(request_ids, chunks)
 
     def _next_chunks(self, seqs: list[Sequence], num_tokens: list[int] | None) -> list[_Chunk]:
         """The tokens each sequence computes next, starting after what is cached.
@@ -216,20 +180,19 @@ class ContinuousModelRunner:
     def _packed_forward(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
         """Every chunk as one flat run of tokens, with no padding.
 
-        A padded batch computes `len(seqs) * max(prompt_lens)` positions to keep
-        `sum(prompt_lens)` of them. On prompts whose lengths vary — which is what
-        real traffic is — that ratio reaches 13.4x at 32 sequences, and it is
-        entirely wasted work plus a mask to hide it afterwards.
+        Padding the batch to its longest prompt would compute `len(seqs) *
+        max(prompt_lens)` positions to keep `sum(prompt_lens)` of them. On prompts
+        whose lengths vary — which is what real traffic is — that ratio reaches
+        13.4x at 32 sequences.
 
         A sampled token is a chunk of one, so a step that admits prompts while
-        others decode is still one pass. Its rows are then read out of the pool
-        by `paged_prefill`, which takes one query per row as readily as many.
+        others decode is still one pass, every row read out of the pool.
         """
         assert self._cache is not None and self.model is not None
 
         counts = [len(chunk.token_ids) for chunk in chunks]
         token_ids = [token for chunk in chunks for token in chunk.token_ids]
-        payload = self._cache.make_packed_prefill_payload(request_ids, counts)
+        payload = self._cache.make_packed_payload(request_ids, counts)
         # The leading axis is 1 because the batch is the token run itself; where
         # each sequence begins is in the payload's addresses, which also give
         # every token's position for RoPE and each sequence's last token, the
@@ -238,82 +201,36 @@ class ContinuousModelRunner:
             input_ids=torch.tensor([token_ids], dtype=torch.long, device=self.device),
             position_ids=payload.addresses.positions,
             past_key_values=payload,
-            attention_mask=None,
             logits_positions=payload.addresses.query_start_loc[1:] - 1,
         )
         return out.logits[0]
-
-    def _padded_forward(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
-        """A step on an engine that pads: single tokens as a decode pass, the rest padded.
-
-        Left-padding a sampled token to the longest prompt beside it would
-        compute that prompt's length in positions to keep one. So a step holding
-        both runs two passes, and the logits are put back in `chunks` order.
-        """
-        single: list[int] = []
-        many: list[int] = []
-        for i, chunk in enumerate(chunks):
-            (single if len(chunk.token_ids) == 1 else many).append(i)
-        if not single:
-            return self._padded_prefill(request_ids, chunks)
-        logits = torch.cat([
-            self._padded_prefill([request_ids[i] for i in many], [chunks[i] for i in many]),
-            self._decode([request_ids[i] for i in single], [chunks[i] for i in single]),
-        ])
-        rows_in_chunk_order = [0] * len(chunks)
-        for row, i in enumerate(many + single):
-            rows_in_chunk_order[i] = row
-        return logits[torch.tensor(rows_in_chunk_order, device=logits.device)]
-
-    def _padded_prefill(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
-        """Every chunk left-padded to the longest, with a mask hiding the padding."""
-        assert self._cache is not None and self.model is not None
-
-        counts = [len(chunk.token_ids) for chunk in chunks]
-        input_ids, position_ids = self._build_padded_inputs(chunks)
-        build_prefill, _ = builders_for(type(self.model).__name__)
-        attention_mask = build_prefill(
-            counts, self.config.dtype, self.device, [chunk.end for chunk in chunks]
-        )
-        payload = self._cache.make_prefill_payload(request_ids, counts)
-        out = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            past_key_values=payload,
-            attention_mask=attention_mask,
-            logits_positions=LAST_POSITION,
-        )
-        return out.logits[:, -1, :]  # left-padded, so the last column is the last real token
 
     def _decode(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
         """One token per sequence, laid out one per batch row, which is what a capture holds.
 
         Every address is built here rather than on the first layer: the forward
-        pass must contain no host-side work. The write is one slot per sequence
-        — a packed run where every count is 1 — and only the read keeps the
-        right-aligned table, because `paged_decode` walks one row per sequence.
+        pass must contain no host-side work. The write is one slot per sequence;
+        the read is each sequence's whole history, bounded by its context length.
         """
         assert self._cache is not None and self.model is not None
 
         input_ids, position_ids = self._build_decode_inputs(chunks)
-        write_slots = self._cache.slot_mapping_for(request_ids, [1] * len(request_ids))
+        write_slots = self._cache.newest_slots_for(request_ids)
         slots = self._cache.slot_table_for(request_ids)
+        context_lens = self._cache.context_lens_for(request_ids)
 
         if self._graphs is not None and self._graphs.has_capacity_for(len(request_ids)):
-            return self._graphs.run(
-                input_ids,
-                position_ids,
-                write_slots,
-                slots,
-                self._cache.context_lens_for(request_ids),
-            )
+            return self._graphs.run(input_ids, position_ids, write_slots, slots, context_lens)
 
-        payload, attention_mask = self._build_decode_kv(request_ids, write_slots, slots)
+        # The split count is the paged kernel's alone, and choosing one asks the
+        # device how many SMs it has.
+        is_paged = reads_pool_in_place(self.attn_implementation)
+        num_splits = self.splits_for_width(len(request_ids)) if is_paged else None
+        payload = self._cache.make_decode_payload(write_slots, slots, context_lens, num_splits)
         out = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=payload,
-            attention_mask=attention_mask,
             logits_positions=LAST_POSITION,
         )
         return out.logits[:, -1, :]
@@ -321,32 +238,6 @@ class ContinuousModelRunner:
     # ------------------------------------------------------------------
     # Input builders
     # ------------------------------------------------------------------
-
-    def _build_decode_kv(
-        self, request_ids: list[str], write_slots: torch.Tensor, slots: torch.Tensor
-    ) -> tuple[KVPayload, torch.Tensor | None]:
-        """Pair this step's KV payload with the mask its attention kernel needs.
-
-        The paged kernel stops each sequence at its own context length, so there
-        is no padding to hide and no mask to build. The dense kernels read a
-        gather padded out to the longest sequence in the batch, so there is.
-        """
-        assert self._cache is not None
-        if reads_paged_kv(self.attn_implementation):
-            context_lens = self._cache.context_lens_for(request_ids)
-            payload = self._cache.make_paged_decode_payload(
-                write_slots, slots, context_lens, self.splits_for_width(len(request_ids))
-            )
-            return payload, None
-
-        # The cache's token counts already include this step's token, and they are
-        # what addressed the slots above — so the mask is built from the same source.
-        seq_total_lens = [self._cache.seq_total_len(rid) for rid in request_ids]
-        _, build_decode = builders_for(type(self.model).__name__)
-        return (
-            self._cache.make_decode_payload(write_slots, slots),
-            build_decode(seq_total_lens, self.config.dtype, self.device),
-        )
 
     def splits_for_width(self, batch_size: int) -> int:
         """How many programs share one sequence's decode key loop at this batch width.
@@ -380,18 +271,6 @@ class ContinuousModelRunner:
             device=self.device,
         )
         return tokens_and_positions[0].unsqueeze(1), tokens_and_positions[1].unsqueeze(1)
-
-    def _build_padded_inputs(self, chunks: list[_Chunk]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Every chunk left-padded to the longest, positions counting from where it starts."""
-        max_len = max(len(chunk.token_ids) for chunk in chunks)
-        shape = (len(chunks), max_len)
-        input_ids = torch.zeros(shape, dtype=torch.long, device=self.device)
-        position_ids = torch.zeros(shape, dtype=torch.long, device=self.device)
-        for i, chunk in enumerate(chunks):
-            offset = max_len - len(chunk.token_ids)
-            input_ids[i, offset:] = torch.tensor(chunk.token_ids, dtype=torch.long, device=self.device)
-            position_ids[i, offset:] = torch.arange(chunk.start, chunk.end, device=self.device)
-        return input_ids, position_ids
 
     def _create_decode_graphs(self) -> DecodeGraphs | None:
         """Build the capture cache, or `None` where decode cannot be captured.
@@ -487,8 +366,8 @@ class ContinuousModelRunner:
         What it still does not measure is the forward pass. `memory_allocated`
         counts tensors torch allocated, so the CUDA context and cuBLAS workspaces
         fall outside it, and the activations have not been allocated yet at all —
-        the fraction is what covers both. Replacing it with a profiled figure is
-        the rest of §2.6, and needs the worst-case forward to be bounded first.
+        the fraction is what covers both — and `_profile_forward_bytes` measures
+        the activations, which are subtracted here.
         """
         if self.device.type == "cuda":
             total = torch.cuda.get_device_properties(self.device).total_memory
@@ -499,22 +378,17 @@ class ContinuousModelRunner:
         return max(0, budget - self._forward_bytes) // bytes_per_block
 
     def _profile_forward_bytes(self) -> int:
-        """Peak allocation the widest prefill needs, beyond the weights.
+        """Peak allocation the widest step needs, beyond the weights.
 
-        `schedule()` admits up to `max_num_seqs` sequences at once and prefills
-        them in a single pass, so `max_num_seqs x max_model_len` tokens in one
-        forward is not hypothetical — it is what a cold engine does when that many
-        requests are already waiting. Running it here turns the activation budget
-        from a fraction someone guessed into a number this device measured, which
-        is what the fraction was standing in for. On Llama-3.2-1B at 32 x 4,096 it
-        is **9.04 GiB**, and it was 32.82 GiB before §3.7 stopped the LM head
-        running over every position — which is why that had to land first.
+        `schedule()` hands out up to `token_budget` tokens per step, so the
+        widest step is not hypothetical — it is what a cold engine does when that
+        many prompt tokens are already waiting. Running it here turns the
+        activation budget from a fraction someone guessed into a number this
+        device measured, through the kernel the engine will serve with.
 
-        The payload does not write to a cache, so this needs no pool: prefill
-        attention reads the K/V the pass just computed, and `ProfilePayload` hands
-        exactly that back. The pass is padded even on an engine that packs, which
-        over-reserves: padding computes every position a packed pass would, and
-        more.
+        The payload does not write to a cache, so this needs no pool: every
+        sequence is a whole prompt, whose attention reads only the K/V the pass
+        just computed, and `ProfilePayload` hands exactly that back.
 
         A forward that will not fit is not fatal. It means the configuration
         cannot serve its own worst case, which is worth saying rather than
@@ -525,46 +399,58 @@ class ContinuousModelRunner:
             return 0
         assert self.model is not None
 
-        batch, length = self.config.max_num_seqs, self.config.max_model_len
+        lengths = self._widest_step()
         try:
             # The first forward in a process allocates cuBLAS workspaces that every
             # later one reuses, and they land in the peak. Unwarmed, a narrow config
             # measured 8.49 MiB where a config sixteen times wider measured 5.77 —
             # so the first engine in a process would have been handed the smallest
             # pool. One throwaway pass absorbs that.
-            self._prefill_forward(1, min(length, _PROFILE_WARMUP_TOKENS))
+            self._profile_forward([min(self.config.max_model_len, _PROFILE_WARMUP_TOKENS)])
             torch.cuda.reset_peak_memory_stats(self.device)
             before = torch.cuda.memory_allocated(self.device)
-            self._prefill_forward(batch, length)
+            self._profile_forward(lengths)
             measured = torch.cuda.max_memory_allocated(self.device) - before
         except torch.OutOfMemoryError:
             _LOGGER.warning(
-                "the widest prefill this config allows — %d sequences x %d tokens — does "
+                "the widest step this config allows — %d tokens as %d sequences — does "
                 "not fit, so the KV pool is sized without a measured activation budget. "
-                "Lower max_num_seqs or max_model_len to serve that case.",
-                batch, length,
+                "Lower max_num_batched_tokens or max_model_len to serve that case.",
+                sum(lengths), len(lengths),
             )
             measured = 0
         finally:
             torch.cuda.empty_cache()
 
         _LOGGER.info(
-            "widest prefill (%d x %d) needs %.2f GiB of activations",
-            batch, length, measured / _GIB,
+            "widest step (%d tokens as %d sequences) needs %.2f GiB of activations",
+            sum(lengths), len(lengths), measured / _GIB,
         )
         return max(0, measured)
 
-    def _prefill_forward(self, batch: int, length: int) -> None:
-        """One prefill-shaped forward over dummy tokens, writing to no cache."""
+    def _widest_step(self) -> list[int]:
+        """The step needing the most activations: a full token budget in the fewest, longest prompts.
+
+        The linear layers cost the same however a step's tokens are split, but
+        attention costs more the longer each sequence is — the dense kernels copy
+        each context out, and `eager` writes its square score matrix — so the
+        worst case is whole `max_model_len` prompts, the remainder in one more.
+        """
+        longest = self.config.max_model_len
+        budget = min(self.config.token_budget, self.config.max_num_seqs * longest)
+        full, rest = divmod(budget, longest)
+        return [longest] * full + ([rest] if rest else [])
+
+    def _profile_forward(self, lengths: list[int]) -> None:
+        """One packed forward over whole prompts of dummy tokens, writing to no cache."""
         assert self.model is not None
-        build_prefill, _ = builders_for(type(self.model).__name__)
+        payload = ProfilePayload(lengths, self.device)
         with torch.inference_mode():
             self.model(
-                input_ids=torch.zeros((batch, length), dtype=torch.long, device=self.device),
-                position_ids=torch.arange(length, device=self.device).expand(batch, length),
-                past_key_values=ProfilePayload(),
-                attention_mask=build_prefill([length] * batch, self.config.dtype, self.device),
-                logits_positions=LAST_POSITION,
+                input_ids=torch.zeros((1, sum(lengths)), dtype=torch.long, device=self.device),
+                position_ids=payload.positions,
+                past_key_values=payload,
+                logits_positions=payload.query_start_loc[1:] - 1,
             )
 
     def _log_pool(self, num_blocks: int, bytes_per_block: int, reason: str) -> None:

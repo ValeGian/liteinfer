@@ -1,5 +1,10 @@
 # pyright: reportPrivateImportUsage=false
-"""The dense kernels must compute the same attention, and sdpa must be the cheaper one."""
+"""The dense kernels must compute the same attention, and sdpa must be the cheaper one.
+
+Every kernel reads a `PagedKV`. The dense ones copy each sequence's context out of
+the pool and attend one sequence at a time, with the causal rule that a
+sequence's queries are the last positions of its context.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +14,8 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.attention_mask import build_continuous_decode_mask, build_prefill_mask
 from liteinfer.models.attention import (
     IMPLEMENTATIONS,
-    DenseKV,
     PagedKV,
     eager_attention,
     paged_attention,
@@ -21,95 +24,123 @@ from liteinfer.models.attention import (
     unsupported_reason,
 )
 
-BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM = 2, 8, 2, 16
+NUM_HEADS, NUM_KV_HEADS, HEAD_DIM = 8, 2, 16
 KV_GROUPS = NUM_HEADS // NUM_KV_HEADS
-DTYPE = torch.float32
+SCALING = HEAD_DIM**-0.5
 
 
-def _qkv(num_queries: int, num_keys: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(0)
+class _Batch:
+    """Sequences laid end to end in a toy pool, and the queries each one brings.
 
-    def randn(heads: int, length: int) -> torch.Tensor:
-        return torch.randn(BATCH, heads, length, HEAD_DIM, generator=generator, dtype=DTYPE)
-
-    return randn(NUM_HEADS, num_queries), randn(NUM_KV_HEADS, num_keys), randn(NUM_KV_HEADS, num_keys)
-
-
-def test_kernels_agree_on_a_prefill_pass():
-    query, key, value = _qkv(num_queries=6, num_keys=6)
-    mask = build_prefill_mask([6, 4], DTYPE, torch.device("cpu"))
-    args = (query, DenseKV(key, value), mask, HEAD_DIM**-0.5, KV_GROUPS)
-
-    torch.testing.assert_close(sdpa_attention(*args), eager_attention(*args))
-
-
-def test_kernels_agree_on_a_decode_pass():
-    query, key, value = _qkv(num_queries=1, num_keys=6)
-    mask = build_continuous_decode_mask([6, 4], DTYPE, torch.device("cpu"))
-    args = (query, DenseKV(key, value), mask, HEAD_DIM**-0.5, KV_GROUPS)
-
-    torch.testing.assert_close(sdpa_attention(*args), eager_attention(*args))
-
-
-def test_kernels_agree_without_a_mask():
-    query, key, value = _qkv(num_queries=6, num_keys=6)
-    args = (query, DenseKV(key, value), None, HEAD_DIM**-0.5, KV_GROUPS)
-
-    torch.testing.assert_close(sdpa_attention(*args), eager_attention(*args))
-
-
-def test_padded_query_rows_are_finite():
-    """A fully masked row has no defined value; it must still not be a NaN.
-
-    The two kernels answer it differently — sdpa returns zeros, eager returns
-    the average of every value vector, because the mask is `finfo.min` rather
-    than `-inf` and a softmax over equal scores is uniform. Neither is more
-    correct, and the engine reads only the last column, which is never padding.
-    A NaN would be a real problem: it would poison the residual stream.
+    Sequence ``i``'s context occupies the pool's next ``context_lens[i]`` slots and
+    its ``query_lens[i]`` queries are its newest positions. No `query_lens` is a
+    decode step: one query per sequence, one per batch row. A shorter row's
+    columns past its context address real slots, as the engine's padding does —
+    the next sequence's, or spare ones at the end of the pool.
     """
-    query, key, value = _qkv(num_queries=6, num_keys=6)
-    mask = build_prefill_mask([6, 2], DTYPE, torch.device("cpu"))
 
-    padded_rows = sdpa_attention(query, DenseKV(key, value), mask, HEAD_DIM**-0.5, KV_GROUPS)[1, :, :4]
+    def __init__(self, context_lens, query_lens=None, dtype=torch.float32, device="cpu", seed=0):
+        generator = torch.Generator().manual_seed(seed)
 
-    assert padded_rows.isfinite().all()
+        def randn(*shape):
+            return torch.randn(*shape, generator=generator, dtype=torch.float32).to(dtype).to(device)
+
+        self.context_lens, self.query_lens = list(context_lens), query_lens
+        num_slots = sum(context_lens) + max(context_lens)
+        self.keys = randn(num_slots, NUM_KV_HEADS, HEAD_DIM)
+        self.values = randn(num_slots, NUM_KV_HEADS, HEAD_DIM)
+        starts = torch.tensor([0, *context_lens[:-1]]).cumsum(0)
+        self.slot_table = (starts.unsqueeze(1) + torch.arange(max(context_lens))).to(device)
+        if query_lens is None:
+            self.query = randn(len(context_lens), NUM_HEADS, 1, HEAD_DIM)
+        else:
+            self.query = randn(1, NUM_HEADS, sum(query_lens), HEAD_DIM)
+
+    def kv(self) -> PagedKV:
+        query_start_loc = None
+        if self.query_lens is not None:
+            query_start_loc = torch.tensor([0, *self.query_lens]).cumsum(0).to(torch.int32)
+            query_start_loc = query_start_loc.to(self.query.device)
+        return PagedKV(
+            self.keys,
+            self.values,
+            self.slot_table,
+            torch.tensor(self.context_lens, dtype=torch.int32, device=self.query.device),
+            query_start_loc=query_start_loc,
+            max_query_len=max(self.query_lens or [1]),
+            host_context_lens=tuple(self.context_lens),
+            host_query_lens=tuple(self.query_lens or ()),
+        )
+
+    def run(self, kernel) -> torch.Tensor:
+        return kernel(self.query, self.kv(), SCALING, KV_GROUPS)
 
 
-# ---------------------------------------------------------------------------
-# The paged entry: dense for prefill, and a decode contract it enforces
-# ---------------------------------------------------------------------------
+def test_kernels_agree_on_whole_prompts():
+    batch = _Batch([6, 3], query_lens=[6, 3])
+
+    torch.testing.assert_close(batch.run(sdpa_attention), batch.run(eager_attention))
 
 
-def _paged_kv() -> PagedKV:
-    """Addresses that no kernel will get as far as reading — the guards fire first."""
-    pool = torch.zeros(4, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
-    return PagedKV(pool, pool, torch.zeros(BATCH, 2, dtype=torch.long), torch.ones(BATCH))
+def test_kernels_agree_on_chunks_continuing_a_cached_prefix():
+    """A chunk shorter than its context is the case that needs an explicit causal rule."""
+    batch = _Batch([9, 5], query_lens=[4, 1])
+
+    torch.testing.assert_close(batch.run(sdpa_attention), batch.run(eager_attention))
 
 
-def test_paged_hands_a_prefill_pass_to_sdpa():
-    """Prefill K/V are the tensors the pass just computed; there is nothing paged to read."""
-    query, key, value = _qkv(num_queries=6, num_keys=6)
-    mask = build_prefill_mask([6, 4], DTYPE, torch.device("cpu"))
-    args = (query, DenseKV(key, value), mask, HEAD_DIM**-0.5, KV_GROUPS)
+def test_kernels_agree_on_a_decode_step():
+    batch = _Batch([6, 4])
 
-    torch.testing.assert_close(paged_attention(*args), sdpa_attention(*args))
+    torch.testing.assert_close(batch.run(sdpa_attention), batch.run(eager_attention))
 
 
-def test_paged_decode_rejects_a_mask():
-    """`context_lens` already bounds each sequence, so a mask would be a second answer."""
-    query, _, _ = _qkv(num_queries=1, num_keys=6)
-    mask = build_continuous_decode_mask([6, 4], DTYPE, torch.device("cpu"))
+def test_a_decode_row_ignores_what_its_columns_past_the_context_address():
+    """The batch is gathered as wide as its longest context; the bound must hide the rest."""
+    batch = _Batch([6, 4])
+    short_row = batch.run(eager_attention)[1]
 
-    with pytest.raises(ValueError, match="takes no mask"):
-        paged_attention(query, _paged_kv(), mask, HEAD_DIM**-0.5, KV_GROUPS)
+    batch.keys[10:] += 10.0
+    batch.values[10:] += 10.0
+
+    torch.testing.assert_close(batch.run(eager_attention)[1], short_row)
+
+
+def test_a_sequence_never_attends_to_another_s_keys():
+    """With nothing but slot ranges separating them, a leak would change the first row's answer."""
+    batch = _Batch([5, 4], query_lens=[5, 4])
+    alone = batch.run(eager_attention)[:, :, :5]
+
+    batch.keys[5:] += 10.0
+    together = batch.run(eager_attention)[:, :, :5]
+
+    torch.testing.assert_close(together, alone)
+
+
+def test_a_chunk_answers_what_the_same_rows_of_the_whole_prompt_answer():
+    """Its queries are the last positions of the context: the causal offset has to say so."""
+    whole = _Batch([7], query_lens=[7]).run(eager_attention)[:, :, -3:]
+    chunk = _Batch([7], query_lens=[3])
+    chunk.query = _Batch([7], query_lens=[7]).query[:, :, -3:]
+
+    torch.testing.assert_close(chunk.run(eager_attention), whole)
+
+
+def test_a_dense_kernel_without_host_lengths_for_a_packed_pass_is_refused():
+    """It slices each sequence on the host, and would otherwise have to sync to learn where."""
+    batch = _Batch([6, 4], query_lens=[2, 4])
+
+    with pytest.raises(ValueError, match="host_context_lens"):
+        eager_attention(batch.query, batch.kv()._replace(host_context_lens=()), SCALING, KV_GROUPS)
 
 
 def test_paged_decode_rejects_more_than_one_query_per_sequence():
     """The kernel reads the whole history uncausally, which only holds for one query."""
-    query, _, _ = _qkv(num_queries=2, num_keys=6)
+    batch = _Batch([6, 4])
+    query = torch.cat([batch.query, batch.query], dim=2)
 
     with pytest.raises(ValueError, match="one query per sequence"):
-        paged_attention(query, _paged_kv(), None, HEAD_DIM**-0.5, KV_GROUPS)
+        paged_attention(query, batch.kv(), SCALING, KV_GROUPS)
 
 
 @pytest.mark.parametrize("name", sorted(IMPLEMENTATIONS))
@@ -173,40 +204,39 @@ def test_the_universal_kernel_has_no_preconditions():
 
 @pytest.mark.gpu
 def test_kernels_agree_in_bfloat16_to_within_rounding():
-    """bf16 is the engine's working precision, and the kernels sum in different orders.
+    """bf16 is the engine's working precision, and the kernels sum in different orders."""
+    batch = _Batch([6, 9], query_lens=[6, 4], dtype=torch.bfloat16, device="cuda")
 
-    Compared on the real query rows only: a padded row attends to nothing, and
-    the two kernels disagree there by construction (see the test below).
-    """
-    query, key, value = (t.to(torch.bfloat16).cuda() for t in _qkv(num_queries=6, num_keys=6))
-    mask = build_prefill_mask([6, 4], torch.bfloat16, torch.device("cuda"))
-    args = (query, DenseKV(key, value), mask, HEAD_DIM**-0.5, KV_GROUPS)
-    real_rows = (slice(None), slice(None), slice(2, None))
-
-    torch.testing.assert_close(
-        sdpa_attention(*args)[real_rows], eager_attention(*args)[real_rows], rtol=0, atol=2**-6
-    )
+    torch.testing.assert_close(batch.run(sdpa_attention), batch.run(eager_attention), rtol=0, atol=2**-6)
 
 
 @pytest.mark.gpu
 def test_sdpa_does_not_materialise_the_score_matrix():
     """The point of the kernel: peak memory stops scaling with queries x keys.
 
-    At these shapes the eager score matrix is 512 MiB in bf16 and 1 GiB again
+    At this length the eager score matrix is 256 MiB in bf16 and 512 MiB again
     once softmax upcasts it, so a kernel that keeps it in SRAM shows up as a
     peak-memory difference far larger than the inputs themselves.
     """
     device = torch.device("cuda")
     seq_len = 2048
-    query = torch.randn(4, 32, seq_len, 64, dtype=torch.bfloat16, device=device)
-    key = value = torch.randn(4, 8, seq_len, 64, dtype=torch.bfloat16, device=device)
-    mask = build_continuous_decode_mask([seq_len] * 4, torch.bfloat16, device).expand(-1, -1, seq_len, -1)
+    query = torch.randn(1, 32, seq_len, 64, dtype=torch.bfloat16, device=device)
+    pool = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+    kv = PagedKV(
+        pool, pool,
+        torch.arange(seq_len, device=device).unsqueeze(0),
+        torch.tensor([seq_len], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, seq_len], dtype=torch.int32, device=device),
+        max_query_len=seq_len,
+        host_context_lens=(seq_len,),
+        host_query_lens=(seq_len,),
+    )
 
     def peak_bytes(kernel) -> int:
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats(device)
         before = torch.cuda.max_memory_allocated(device)
-        kernel(query, DenseKV(key, value), mask, 64**-0.5, 4)
+        kernel(query, kv, 64**-0.5, 4)
         torch.cuda.synchronize()
         return torch.cuda.max_memory_allocated(device) - before
 
