@@ -16,10 +16,11 @@ engine can serve, not just how fast it serves it.
 
 Both of those want K and V as one contiguous tensor, which for a paged cache
 means copying every sequence's history out of the pool before every decode
-step. `paged` takes the slot table instead and reads the pool in place; it is
-decode-only, and falls back to `sdpa` for prefill, where the keys are the
-tensors the pass has just computed and nothing is paged yet. See
-`models/paged_decode.py`.
+step. `paged` takes the slot table instead and reads the pool in place: every
+decode step, and every packed prefill chunk that continues a cached prompt. A
+prefill with nothing cached before it goes to `varlen` (packed) or `sdpa`
+(padded), because its keys are the tensors the pass has just computed and
+nothing is paged yet. See `models/paged_decode.py`.
 
 Causality is not passed as a flag to the dense kernels: left-padded batches
 need an explicit mask anyway (see `engine/attention_mask.py`), and that mask
@@ -62,6 +63,12 @@ class PagedKV(NamedTuple):
     """``[batch]`` real cached tokens per sequence — where each row's history ends."""
     num_splits: int | None = None
     """How many programs share each sequence's key loop; None lets the kernel choose."""
+    query_start_loc: torch.Tensor | None = None
+    """``[batch + 1]`` int32 prefix sums of each sequence's queries, for a pass that
+    brings more than one per sequence — a chunk continuing a cached prompt. None
+    is a decode step: one query per sequence, laid out one per batch row."""
+    max_query_len: int = 1
+    """Most queries any one sequence brings, which sizes the kernel's grid."""
 
 
 class VarlenKV(NamedTuple):
@@ -69,27 +76,18 @@ class VarlenKV(NamedTuple):
 
     The dense payloads hand back `[batch, heads, keys, dim]` and rely on padding
     plus a mask to keep one sequence's queries away from another's keys. A packed
-    batch has no padding to mask: it is one flat run of tokens, and the prefix
-    sums say where each sequence starts.
-
-    Queries and keys carry separate boundaries because they differ when a prompt
-    is chunked: a chunk continuing a prompt brings only its own queries, but
-    attends to every key the sequence holds. Where no sequence had anything
-    cached before the pass, the two are the same tensors.
+    batch has no padding to mask: it is one flat run of tokens, and `cu_seqlens`
+    is where each sequence starts.
     """
 
     keys: torch.Tensor
-    """`[1, kv_heads, total_keys, head_dim]` — every key the batch's sequences hold."""
+    """`[1, kv_heads, total_tokens, head_dim]` — the prompt K this pass computed."""
     values: torch.Tensor
     """The matching V."""
-    cu_seqlens_q: torch.Tensor
-    """`[num_sequences + 1]` int32 prefix sums: sequence `i`'s queries are `[cu[i], cu[i + 1])`."""
-    max_seqlen_q: int
-    """Most queries any one sequence brings, which the kernel needs as a host-side int."""
-    cu_seqlens_k: torch.Tensor
-    """The same prefix sums over the keys."""
-    max_seqlen_k: int
-    """Most keys any one sequence holds."""
+    cu_seqlens: torch.Tensor
+    """`[num_sequences + 1]` int32 prefix sums: sequence `i` owns `[cu[i], cu[i + 1])`."""
+    max_seqlen: int
+    """Longest sequence in the batch, which the kernel needs as a host-side int."""
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -182,13 +180,6 @@ def varlen_attention(
     flash reads one KV head per query group directly, where the dense path
     materialises a copy of K and V per query head first.
 
-    `is_causal` aligns the causal diagonal to the bottom right when a sequence
-    has fewer queries than keys, so a chunk's queries sit at the *end* of the
-    context: each attends to the whole prefix and to its own chunk up to itself,
-    which is what a chunk continuing a cached prompt needs.
-    `tests/unit/test_varlen_attention.py` pins that alignment, because the op's
-    signature does not state it.
-
     The entry point is `torch.ops.aten._flash_attention_forward`, which is what
     PyTorch's own SDPA calls once it has decided flash applies. Going through it
     directly is what lets the call carry `cu_seqlens`; SDPA's public signature has
@@ -210,10 +201,10 @@ def varlen_attention(
         packed_query,
         packed_key,
         packed_value,
-        kv.cu_seqlens_q,
-        kv.cu_seqlens_k,
-        kv.max_seqlen_q,
-        kv.max_seqlen_k,
+        kv.cu_seqlens,
+        kv.cu_seqlens,
+        kv.max_seqlen,
+        kv.max_seqlen,
         dropout_p=0.0,
         is_causal=True,
         return_debug_mask=False,
@@ -224,30 +215,40 @@ def varlen_attention(
 
 def paged_attention(
     query: torch.Tensor,
-    kv: DenseKV | PagedKV,
+    kv: DenseKV | VarlenKV | PagedKV,
     attention_mask: torch.Tensor | None,
     scaling: float,
     num_kv_groups: int,
 ) -> torch.Tensor:
-    """Decode straight out of the KV pool; prefill through `sdpa` or `varlen`.
+    """Attend straight out of the KV pool; a whole-prompt prefill through `sdpa` or `varlen`.
 
-    Which of the three happens is decided by what the cache handed over, not by a
-    flag: a prefill payload returns the K and V the pass just computed, and there
-    is nothing paged about them yet — packed if the batch was packed, padded if
-    it was padded.
+    Which happens is decided by what the cache handed over, not by a flag. A
+    prefill with nothing cached before it returns the K and V the pass just
+    computed — packed if the batch was packed, padded if it was padded — and
+    there is nothing paged about them yet. Everything else reads the pool: a
+    decode step one query per sequence, and a packed chunk continuing a cached
+    prompt many, through the same kernel.
     """
     if isinstance(kv, DenseKV):
         return sdpa_attention(query, kv, attention_mask, scaling, num_kv_groups)
     if isinstance(kv, VarlenKV):
         return varlen_attention(query, kv, attention_mask, scaling, num_kv_groups)
-
     if attention_mask is not None:
-        raise ValueError("paged decode takes no mask; context_lens bounds each sequence")
+        raise ValueError("paged attention takes no mask; context_lens bounds each sequence")
+    if kv.query_start_loc is None:
+        return _paged_decode_step(query, kv, scaling, num_kv_groups)
+    return _paged_chunks(query, kv, scaling, num_kv_groups)
+
+
+def _paged_decode_step(
+    query: torch.Tensor, kv: PagedKV, scaling: float, num_kv_groups: int
+) -> torch.Tensor:
+    """One query per sequence, ``[batch, heads, 1, dim]``."""
     if query.shape[2] != 1:
         raise ValueError(f"paged decode takes one query per sequence, got {query.shape[2]}")
 
     # Imported here rather than at module scope: the kernel needs Triton, which
-    # torch's CPU-only builds do not ship, and the other two kernels must keep
+    # torch's CPU-only builds do not ship, and the other kernels must keep
     # importing on those machines.
     from liteinfer.models.paged_decode import paged_decode
 
@@ -262,6 +263,26 @@ def paged_attention(
         num_splits=kv.num_splits,
     )
     return attn_output.unsqueeze(2)
+
+
+def _paged_chunks(query: torch.Tensor, kv: PagedKV, scaling: float, num_kv_groups: int) -> torch.Tensor:
+    """Packed queries, ``[1, heads, total_queries, dim]``, with their boundaries on `kv`."""
+    assert kv.query_start_loc is not None, "the caller dispatched on it"
+    from liteinfer.models.paged_decode import paged_prefill
+
+    # The layers speak `[1, heads, tokens, dim]`; the kernel wants the token axis first.
+    attn_output = paged_prefill(
+        query.squeeze(0).transpose(0, 1),
+        kv.key_pool,
+        kv.value_pool,
+        kv.slot_table,
+        kv.context_lens,
+        kv.query_start_loc,
+        kv.max_query_len,
+        scaling,
+        num_kv_groups,
+    )
+    return attn_output.transpose(0, 1).unsqueeze(0)
 
 
 IMPLEMENTATIONS = {

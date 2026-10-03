@@ -1350,6 +1350,78 @@ implementation exists to catch, and which no benchmark would ever have shown.
 Packing is now gated on the kernel as well as the device (`handles_packed_prefill`),
 and the dense kernels reject a packed batch loudly rather than misreading it.
 
+### A chunk reads its prefix where it lies (§2.10)
+
+Since §1.7 a prompt can be split across steps, and each later chunk must attend
+to the K/V an earlier step wrote. Until this change it did that by copying: the
+payload read every token the sequence held back out of the pool, then handed the
+copy to FlashAttention's varlen entry. `paged_prefill` gives the paged decode
+kernel a query dimension instead, so a chunk's queries read the pool in place —
+one program per block of 16 queries, the cached prefix folded without a mask and
+only the block's own span causally. Decode is its one-query case and is the same
+arithmetic it was: **162 of 162** shapes bit-identical to the previous kernel,
+across batch 1-32, query-head groups 1-8, head dims 64-128, fp32 and bf16, split
+and unsplit.
+
+**Per layer, at Llama-3.2-1B's attention shapes** (32 query heads, 8 KV heads,
+head dim 64, bf16) on an A40, both paths after the chunk's own K/V are stored and
+excluding address building, which both do once per step:
+
+| chunk | cached prefix | copy + flash | paged | |
+|---|---:|---:|---:|---:|
+| 64 | 0 | 18.6 us | **10.2 us** | **0.55x** |
+| 64 | 1,024 | 55.2 us | **43.5 us** | 0.79x |
+| 64 | 4,096 | 163.5 us | **144.8 us** | 0.89x |
+| 64 | 15,000 | 539.4 us | **492.0 us** | 0.91x |
+| 512 | 0 | 51.4 us | **32.6 us** | 0.64x |
+| 512 | 1,024 | 110.9 us | **89.5 us** | 0.81x |
+| 512 | 4,096 | 287.1 us | **272.6 us** | 0.95x |
+| 512 | 15,000 | 915.8 us | 945.3 us | 1.03x |
+| 2,048 | 0 | 259.2 us | **227.2 us** | 0.88x |
+| 2,048 | 2,048 | 615.4 us | 629.2 us | 1.02x |
+| 2,048 | 8,192 | 1,725.3 us | 1,939.1 us | **1.12x** |
+| 512 over 4,096, beside 7 prompts of 64 | | 305.3 us | **274.9 us** | 0.90x |
+| **31 one-token rows over 2,000, beside a 256 chunk** | | 1,516.3 us | **264.6 us** | **0.17x** |
+
+**It loses where the work is dot products and not reading.** A large chunk over a
+long prefix is compute-bound, and FlashAttention's hand-tuned MMA loop beats a
+Triton one there by up to 12% at 2,048 queries over 8,192 keys. Two changes
+narrowed it: folding the prefix without the causal mask (1.17x to 1.13x at that
+shape; FlashAttention does the same, masking only the diagonal) and a 32-key tile
+(1.13x to 1.12x). Neither warp count nor pipeline depth moved it further.
+
+**It wins wherever reading dominates, and most at the shape the next stage
+creates.** The last row is a mixed batch — decode rows beside a chunk, which is
+what one forward per step (§1.3) will hand the kernel on most admission steps.
+The copy reads out every row's whole context; the paged kernel reads it in place,
+**5.7x** faster. The copy path has no answer to that shape at all.
+
+**None of this reaches a default run.** Only a configured
+`max_num_batched_tokens` ever chunks a prompt, and the default never does, so
+the engine's default path is unchanged: decode bit-identical, whole prompts still
+on FlashAttention, and decode's launch no slower (47.1 against 47.5 us of host
+time per call, interleaved, where a first draft sharing the chunk kernel's
+signature cost 5 us more). No `BenchmarkConfig` row can show the change either,
+because the harness records no per-token timing under concurrent load, which is
+the only place chunking pays.
+
+**Whole prompts, for §1.3.** The same kernel over prompts with nothing cached,
+against FlashAttention on the K/V the pass computed:
+
+| prompts | flash | paged | |
+|---|---:|---:|---:|
+| 1 x 64 | 12.8 us | **10.4 us** | 0.82x |
+| 1 x 512 | 44.3 us | **32.6 us** | 0.74x |
+| 1 x 2,048 | 239.9 us | **226.2 us** | 0.94x |
+| 1 x 4,096 | 772.5 us | 802.8 us | 1.04x |
+| 32 x 18 | 65.6 us | **19.8 us** | **0.30x** |
+| 32 x 128 | 125.1 us | 130.4 us | 1.04x |
+| 8 x 512 | 166.0 us | **160.1 us** | 0.96x |
+
+At the mixed dataset's median prompt of 18 tokens it is 3.3x faster, and within
+4% at the rest — which says one kernel for every row is affordable, and leaves
+the engine-level measurement to the stage that would make the switch.
+
 ### A stable run is not a comparable one
 
 Two latency rows from the §1.5 re-measurement came back saying `paged-attn` was

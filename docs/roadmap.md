@@ -123,7 +123,7 @@ listed.
 
 ### 1.3 One forward for a mixed batch
 - **Status.** `planned` — the stage the rest of the chain exists to reach.
-- **Stage 6 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ (all four landed) → §2.10 → §1.3 → §3.9.
+- **Stage 6 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ (all five landed) → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** A step that admits new sequences while others decode issues **two**
   forward passes, and each pass costs its own ~700 kernel launches whatever it
@@ -134,17 +134,29 @@ listed.
 - **Scope.** `ContinuousModelRunner.prefill`/`decode` become one `execute` over
   the packed buffer. The scheduler already says what to run — since §1.7 its
   output is `num_scheduled_tokens` per request, and the engine's `_by_phase` is
-  the one place that still splits it in two — and the attention kernel takes
-  per-request lengths once §2.10 gives it a query dimension. What is left here is
-  the runner: one input build, one forward, one sample.
-- **Pre-reqs.** §2.10 for the kernel; §1.7 (the budget), §3.6 and §2.9 (the
-  layout) have landed.
+  the one place that still splits it in two — and since §2.10 the attention
+  kernel takes per-request query counts: `paged_prefill` with `query_start_loc`,
+  of which a decode row is the one-query case. What is left here is the runner:
+  one input build, one forward, one sample.
+- **One kernel for every row is already affordable.** Whole prompts still go to
+  FlashAttention's varlen entry, and only a chunk continuing a cached prompt
+  reads the pool. Measured per layer on an A40, the paged kernel over whole
+  prompts is **0.30x** of flash at 32 x 18 tokens (the mixed dataset's median),
+  0.74x at 512, 0.94x at 2,048 and 1.04x at 4,096 — so this stage can route every
+  row through it and delete `varlen_attention` with `VarlenKV`, after an engine
+  throughput run on the mixed dataset says the same.
+- **Pre-reqs.** All landed: §1.7 (the budget), §3.6 and §2.9 (the layout), §2.10
+  (the kernel).
 - **It costs some of §3.2, and §3.8 is the repair.** A mixed pass is not a uniform
   decode batch, so the captured graph does not cover it — roughly one step in
   eight at OSL 256 with 32 slots. Land this with a plan for capturing mixed
   batches, which is what §3.8 exists to be.
-- **Parity test.** Greedy output identical to the two-pass engine on a workload
-  that forces admissions mid-generation, which is the case this exists to serve.
+- **Parity test.** Logits, not greedy tokens: the tiny test model's greedy output
+  barely depends on attention, and §1.7's greedy parity tests passed with every
+  attention bug planted to check them. The one-pass engine's logits against the
+  two-pass engine's, both measured against a single-precision reference the way
+  `test_token_budget_gpu.py` does, on a workload that forces admissions
+  mid-generation — the case this exists to serve.
 
 ### 1.6 What is left of the loop outside the forward
 - **Status.** `planned` — follow-up to §1.5, and small.
@@ -207,32 +219,19 @@ listed.
 - **Measure it** per layer through a captured graph, five repeats and a minimum —
   the two traps in `docs/benchmarks.md` under §2.7 both bite at this scale.
 
-### 2.10 Paged attention with more than one query per sequence
-- **Status.** `planned` — the real engineering of the packed move.
-- **Stage 5 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ (all four landed) → §2.10 → §1.3 → §3.9.
+### 2.11 Choose the prefill tiles from the chunk length
+- **Status.** `planned` — follow-up to §2.10, and small.
 - **PRs.** _none yet_
-- **Why.** `paged_decode` assumes exactly one query per sequence: that is what
-  lets it read the whole history with no causal mask, and it is stated in the
-  module docstring. A mixed batch breaks the assumption — a prefill chunk brings
-  many queries *and* must attend to the prefix already in the pool. Without this
-  there is no single forward, so §1.3 stops here.
-- **What it replaces.** Since §1.7 a chunk that continues a prompt already
-  attends to its prefix, but by copying it: the prefill payload writes the chunk,
-  then `gather`s every token the sequence holds back out of the pool and hands
-  that to FlashAttention's varlen entry with separate `cu_seqlens_k` (packed) or
-  to the dense kernels with an offset causal mask (padded). That copy is decode's
-  pre-§2.3 gather in prefill form, and this kernel is what removes it.
-- **Scope.** The kernel takes `query_start_loc` alongside `context_lens`, loops a
-  query block per request, and masks causally *within* that block while keeping
-  the unmasked read of everything before it. The split-K grid (§2.7) stays: a
-  decode row is the `q = 1` case of the same kernel, and the chooser already
-  returns 1 wherever the batch is wide.
-- **It is one kernel serving both**, which is the point. vLLM reaches the same
-  place through FlashAttention's varlen-with-block-table entry point; liteinfer
-  reaches it by giving the kernel it already owns a query dimension.
-- **Parity test.** Against `eager` on a batch mixing a 1-query row with a
-  many-query row, and against today's `paged_decode` on an all-decode batch,
-  which must stay bit-identical.
+- **Why.** `paged_prefill` attends every chunk in tiles of 16 queries x 32 keys,
+  which the §2.10 sweep found fastest for every chunk of 512 tokens or more. A
+  short chunk over a long prefix is bound by reading the pool rather than by the
+  dot products, and would rather have 8 x 128: 92 against 145 us per layer for
+  64 queries over 4,096 keys, 300 against 492 over 15,000.
+- **Scope.** Pick the pair from `max_query_len` in `paged_prefill`, the way
+  `choose_num_splits` picks decode's split count from the batch width. Each
+  pair is one more compiled kernel, so the chooser should return few of them.
+- **Parity test.** Already there: the kernel tests sweep both tiles against
+  `eager`, so a chooser can only change speed.
 
 ---
 
@@ -390,7 +389,7 @@ listed.
 
 ### 3.9 Retire the padded path
 - **Status.** `planned` — the closing stage; nothing to build, everything to delete.
-- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ (all four landed) → §2.10 → §1.3 → §3.9.
+- **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ (all five landed) → §1.3 → §3.9.
 - **PRs.** _none yet_
 - **Why.** Padding is currently undone by five mechanisms that exist only to
   cancel each other: left-padded inputs, a right-aligned slot table, a null block
