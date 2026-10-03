@@ -95,9 +95,9 @@ def test_pool_reports_its_own_footprint() -> None:
         num_blocks=4, block_size=BLOCK_SIZE, num_layers=LAYERS, num_kv_heads=KV_HEADS,
         head_dim=HEAD_DIM, dtype=torch.float32, device=torch.device("cpu"),
     )
-    # 5 blocks (one is the null block) x 16 slots x 2 layers x 2 heads x 8 dims
-    # x 4 bytes, counted for keys and values.
-    assert pool.nbytes == 5 * BLOCK_SIZE * LAYERS * KV_HEADS * HEAD_DIM * 4 * 2
+    # 4 blocks x 16 slots x 2 layers x 2 heads x 8 dims x 4 bytes, counted for
+    # keys and values.
+    assert pool.nbytes == 4 * BLOCK_SIZE * LAYERS * KV_HEADS * HEAD_DIM * 4 * 2
 
 
 @pytest.mark.gpu
@@ -137,3 +137,17 @@ def test_a_cpu_engine_profiles_nothing() -> None:
     runner = _runner(max_num_seqs=4, max_model_len=64)
 
     assert runner._profile_forward_bytes() == 0
+
+
+def test_the_widest_step_is_whole_prompts_of_the_longest_length() -> None:
+    """Attention costs more the longer each sequence is, so the worst case packs the fewest, longest."""
+    runner = _runner(max_num_seqs=4, max_model_len=64, max_num_batched_tokens=100)
+
+    assert runner._widest_step() == [64, 36]
+
+
+def test_the_widest_step_never_holds_more_sequences_than_can_run() -> None:
+    """A budget past `max_num_seqs x max_model_len` is tokens no step can be given."""
+    runner = _runner(max_num_seqs=2, max_model_len=64, max_num_batched_tokens=1000)
+
+    assert runner._widest_step() == [64, 64]

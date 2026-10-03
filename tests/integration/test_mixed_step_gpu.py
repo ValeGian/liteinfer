@@ -44,7 +44,7 @@ def _runner(model_dir: Path, is_reference: bool, capture: bool = True) -> Contin
 
     The reference names its kernel because the default one packs in fp32 too,
     and would then share `paged_prefill` with the runs it is meant to judge.
-    `eager` pads, writes every score out, and cannot be captured.
+    `eager` copies each context out, writes every score, and cannot be captured.
     """
     kernel = {"dtype": torch.float32, "attn_implementation": "eager"} if is_reference else {
         "dtype": torch.bfloat16, "enable_cuda_graphs": capture
@@ -108,7 +108,6 @@ _ROWS = {
 
 def _run(model_dir: Path, is_mixed: bool, is_reference: bool = False) -> dict[str, torch.Tensor]:
     schedule = _Schedule(model_dir, is_reference)
-    assert schedule.runner._packs_prefill != is_reference, "the engine packs; the reference pads"
     step = schedule.mixed_step() if is_mixed else schedule.separate_steps()
     rows = {kind: step[rows].float() for kind, rows in _ROWS.items()}
     rows["after"] = schedule.decode_after().float()

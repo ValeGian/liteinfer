@@ -1,0 +1,32 @@
+{
+  "config": "liteinfer-sdpa",
+  "engine": "liteinfer",
+  "description": "Continuous batching, attention through PyTorch SDPA",
+  "baseline": "liteinfer-continuous",
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-10-03T21:00:02+00:00",
+  "revision": "364b983",
+  "dataset": {
+    "path": "/home/valerio/workspace/liteinfer/benchmarks/datasets/islmixed2048_osl128_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": null,
+    "target_osl": 128,
+    "max_isl": 2048,
+    "num_samples": 200,
+    "sha256": "d3de8f4e6ec9fb683be98e3316da7affe078e382b47d7b63dcf379259ba5f14e"
+  },
+  "summary": {
+    "output_tokens_per_s": 851.5434907296444,
+    "requests_per_s": 6.652683521325347,
+    "wall_time_s": 30.06305641308427
+  },
+  "raw": {
+    "wall_time_s": 30.06305641308427,
+    "output_tokens": 25600,
+    "step_phases": {
+      "prefill": 7,
+      "decode": 889
+    }
+  }
+}

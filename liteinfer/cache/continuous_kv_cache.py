@@ -12,34 +12,21 @@ Payload protocol
 ----------------
 The payload factories return lightweight objects that implement the same
 ``update(k, v, layer_idx)`` interface understood by the model's attention
-layers: store this pass's K/V, then hand back the K/V the attention kernel
-should read, as a ``DenseKV`` or a ``PagedKV``. Payloads hold a
-reference to this cache; they are ephemeral (created per forward pass) and must
-not outlive the forward call. Every address is computed when the payload is
-made rather than on the first layer, so the forward contains no host-side work.
+layers: store this pass's K/V, then hand back a ``PagedKV`` — the layer's pool
+plus the address of every token each sequence holds. Payloads hold a reference
+to this cache; they are ephemeral (created per forward pass) and must not
+outlive the forward call. Every address is computed when the payload is made
+rather than on the first layer, so the forward contains no host-side work.
 
-Prefill payloads
-    Store the tokens this pass computed. The packed payload then hands the
-    paged kernel the pool and the address of every token each sequence holds,
-    as decode does — whether that is the chunk alone, for a whole prompt, or a
-    prefix earlier passes wrote as well. The padded one, serving the dense
-    kernels, returns the pass's own K/V when nothing was cached before it, and
-    otherwise reads the context back out of the pool left-padded.
+Packed payload
+    A pass laid end to end: whole prompts, chunks continuing a cached prompt
+    and sampled tokens side by side, bounded by `query_start_loc`. Each
+    sequence's context is the chunk alone for a whole prompt, or reaches back to
+    a prefix earlier passes wrote.
 
 Decode payload
-    Appends one new token per sequence, then gathers and left-pads the full
-    accumulated K/V to ``[B, num_kv_heads, max_total_len, head_dim]`` — the
-    shape the dense kernels and the continuous-decode attention mask expect.
-
-Paged decode payload
-    Appends the same token and then returns nothing but addresses: the layer's
-    flat pool storage plus the slot table and context lengths the fused paged
-    kernel walks. The gather never happens, which is the whole point — see
-    ``models/paged_decode.py``.
-
-Both decode payloads write through a flat mapping — one slot per sequence,
-`slot_mapping` over a batch where every count is 1 — and read through the
-right-aligned slot table, which only the reads still need.
+    One token per sequence, one per batch row, over addresses the caller built —
+    which is what lets a captured graph refill them in place.
 """
 
 from __future__ import annotations
@@ -52,11 +39,11 @@ from liteinfer.cache.block_pool import (
     BlockPool,
     BlockPoolExhaustedError,
     PackedAddresses,
+    newest_slots,
     packed_addresses,
-    slot_mapping,
     slot_table,
 )
-from liteinfer.models.attention import DenseKV, PagedKV
+from liteinfer.models.attention import PagedKV
 
 
 class KVPayload(Protocol):
@@ -67,33 +54,45 @@ class KVPayload(Protocol):
     and the model.
     """
 
-    def update(
-        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
-    ) -> DenseKV | PagedKV:
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
         ...
 
 
 class ProfilePayload:
-    """What a forward is handed when it is being measured rather than served.
+    """What a packed forward is handed when it is being measured rather than served.
 
-    Returns this pass's K/V untouched, which is exactly what the prefill payload
-    returns *after* storing them — so the forward has the same shapes and the same
-    activation peak while needing no pool to write into. That is what lets the
-    measurement happen before the pool is sized, which is the whole point: the
-    pool gets what the forward turns out not to need.
-
-    Correct only for prefill, where attention reads the K/V the pass just
-    computed. A decode pass reads history it did not compute, so measuring one
-    means giving it a real cache. On a packing engine it is a padded stand-in for
-    a packed pass of the same tokens: that pass allocates nothing this one misses
-    (`paged_prefill` writes only its output), so the stand-in over-reserves rather
-    than under.
+    Each sequence is a whole prompt, so its context is exactly the K/V the pass
+    computes. Handing those back as the "pool", addressed by where each sequence
+    sits in the run, gives attention the same reads a served pass makes — through
+    whichever kernel the engine runs — while needing no pool to write into. That
+    is what lets the measurement happen before the pool is sized, which is the
+    whole point: the pool gets what the forward turns out not to need.
     """
 
-    def update(
-        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
-    ) -> DenseKV:
-        return DenseKV(key_states, value_states)
+    def __init__(self, lengths: list[int], device: torch.device) -> None:
+        self._lengths = tuple(lengths)
+        lens = torch.tensor(lengths, dtype=torch.long, device=device)
+        run_ends = torch.cumsum(lens, 0)
+        self.query_start_loc = torch.nn.functional.pad(run_ends, (1, 0)).to(torch.int32)
+        self.positions = torch.cat([torch.arange(length, device=device) for length in lengths]).unsqueeze(0)
+        # Columns past a sequence's length address the next one's tokens, and no
+        # answer depends on them: every read is bounded by the context length.
+        # Clamped so the last sequence's stay inside the pass.
+        slots = (run_ends - lens).unsqueeze(1) + torch.arange(max(lengths), device=device)
+        self._slots = slots.clamp_(max=sum(lengths) - 1)
+        self._context_lens = lens.to(torch.int32)
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
+        return PagedKV(
+            _tokens_first(key_states),
+            _tokens_first(value_states),
+            self._slots,
+            self._context_lens,
+            query_start_loc=self.query_start_loc,
+            max_query_len=max(self._lengths),
+            host_context_lens=self._lengths,
+            host_query_lens=self._lengths,
+        )
 
 
 class ContinuousKVCache:
@@ -165,99 +164,60 @@ class ContinuousKVCache:
     # Payload factory
     # ------------------------------------------------------------------
 
-    def make_prefill_payload(self, request_ids: list[str], counts: list[int]) -> _PrefillPayload:
-        """Return a payload for a left-padded pass over each sequence's newest `counts` tokens."""
-        write_slots = self.slot_table_for(request_ids, counts)
-        context_slots = (
-            self.slot_table_for(request_ids) if self._has_history(request_ids, counts) else None
-        )
-        return _PrefillPayload(self, write_slots, context_slots)
-
-    def make_packed_prefill_payload(
-        self, request_ids: list[str], counts: list[int]
-    ) -> _PackedPayload:
-        """Return a payload for the same tokens laid end to end rather than left-padded.
-
-        Same writes as `make_prefill_payload` — every token lands in the slot its
-        block table names — addressed by a flat mapping instead of a padded,
-        right-aligned table. What changes for the kernel is what comes back:
-        boundaries to respect rather than padding to mask, and the pool itself
-        with the address of every token each sequence holds, cached before the
-        pass or not.
+    def make_packed_payload(self, request_ids: list[str], counts: list[int]) -> _PackedPayload:
+        """Return a payload for each sequence's newest `counts` tokens, laid end to end.
 
         The payload carries the run's `PackedAddresses`, whose positions and
         boundaries the caller also needs for RoPE and for picking each
         sequence's last token, so they are built once per pass.
         """
+        totals = [self._token_counts[r] for r in request_ids]
         addresses = packed_addresses(
             [self._block_tables[r] for r in request_ids],
-            self._window_starts(request_ids, counts),
+            [total - count for total, count in zip(totals, counts, strict=True)],
             counts,
             self._pool.block_size,
             self._pool.device,
         )
-        return _PackedPayload(
-            self,
-            addresses,
-            max(counts),
-            self.slot_table_for(request_ids),
-            self.context_lens_for(request_ids),
-        )
+        return _PackedPayload(self, addresses, tuple(totals), tuple(counts))
 
-    def make_decode_payload(self, write_slots: torch.Tensor, slots: torch.Tensor) -> _DecodePayload:
-        """Return a payload for one decode forward pass writing `write_slots`, reading `slots`.
-
-        Both are computed by the caller rather than on the first layer, so the
-        forward pass contains no host-side work — which is what lets it be
-        captured into a CUDA graph, and what keeps the GPU from stalling
-        mid-pass otherwise.
-        """
-        return _DecodePayload(self, write_slots, slots)
-
-    def make_paged_decode_payload(
+    def make_decode_payload(
         self,
         write_slots: torch.Tensor,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
         num_splits: int | None = None,
-    ) -> _PagedDecodePayload:
-        """Return a payload that hands the pool's addresses to the paged kernel.
+    ) -> _DecodePayload:
+        """Return a payload for one decode forward pass writing `write_slots`, reading `slots`.
 
-        Same addresses as ``make_decode_payload``; the difference is that the
-        K/V never leave the pool, so the kernel also needs to know where each
-        sequence's history ends — and how many programs to cut that history
-        across, where the caller has an opinion.
+        The addresses are computed by the caller rather than on the first layer,
+        so the forward pass contains no host-side work — which is what lets it be
+        captured into a CUDA graph, and what keeps the GPU from stalling
+        mid-pass otherwise.
         """
-        return _PagedDecodePayload(self, write_slots, slots, context_lens, num_splits)
+        return _DecodePayload(self, write_slots, slots, context_lens, num_splits)
 
     # ------------------------------------------------------------------
-    # Internal helpers shared by payloads
+    # Addresses a decode step builds
     # ------------------------------------------------------------------
 
-    def slot_mapping_for(self, request_ids: list[str], counts: list[int]) -> torch.Tensor:
-        """Each sequence's newest `counts` tokens, end to end. See `block_pool.slot_mapping`.
-
-        A decode step's write is the case where every count is 1.
-        """
-        return slot_mapping(
+    def newest_slots_for(self, request_ids: list[str]) -> torch.Tensor:
+        """Each sequence's newest token's slot, ``[1, B]`` — where a decode step writes."""
+        return newest_slots(
             [self._block_tables[r] for r in request_ids],
-            counts,
+            [self._token_counts[r] - 1 for r in request_ids],
             self._pool.block_size,
             self._pool.device,
-            starts=self._window_starts(request_ids, counts),
         )
 
-    def slot_table_for(
-        self, request_ids: list[str], counts: list[int] | None = None
-    ) -> torch.Tensor:
-        """Each sequence's newest `counts` tokens, right-aligned; every cached token by default."""
-        tables = [self._block_tables[rid] for rid in request_ids]
-        block_size, device = self._pool.block_size, self._pool.device
-        if counts is None:
-            totals = [self._token_counts[rid] for rid in request_ids]
-            return slot_table(tables, totals, block_size, device)
-        starts = self._window_starts(request_ids, counts)
-        return slot_table(tables, counts, block_size, device, starts=starts)
+    def slot_table_for(self, request_ids: list[str]) -> torch.Tensor:
+        """Every cached token of each sequence, left-aligned. See `block_pool.slot_table`."""
+        return slot_table(
+            [self._block_tables[rid] for rid in request_ids],
+            [self._token_counts[rid] for rid in request_ids],
+            self._pool.block_size,
+            self._pool.device,
+        )
 
     def context_lens_for(self, request_ids: list[str]) -> torch.Tensor:
         """Cached-token count per sequence, as ``[B]`` on the pool's device."""
@@ -267,41 +227,26 @@ class ContinuousKVCache:
             device=self._pool.device,
         )
 
+    # ------------------------------------------------------------------
+    # Pool access shared by payloads
+    # ------------------------------------------------------------------
+
     def layer_storage(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """This layer's flat key/value stores, for a kernel that addresses them itself."""
         return self._pool.slots(layer_idx)
 
-    def scatter(
-        self, layer_idx: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> None:
+    def scatter(self, layer_idx: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         """Store one K/V column per slot, in the order the pass holds its tokens.
 
         `slots` has one entry per token of ``[B, H, T, D]`` taken batch-major:
-        ``[B, T]`` for a padded pass, ``[1, T]`` for a packed one, and ``[1, B]``
-        for a decode step, whose one token per sequence is a packed run of B.
-        Flattening both sides is what lets one write serve all three layouts.
+        ``[1, T]`` for a packed pass, and ``[1, B]`` for a decode step, whose one
+        token per sequence is a packed run of B. Flattening both sides is what
+        lets one write serve both layouts.
         """
         keys, values = self._pool.slots(layer_idx)
         flat_slots = slots.reshape(-1)
         keys[flat_slots] = _tokens_first(k)
         values[flat_slots] = _tokens_first(v)
-
-    def gather(self, layer_idx: int, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read the cached K/V at ``slots`` as ``[B, H, T, D]``."""
-        keys, values = self._pool.slots(layer_idx)
-        return keys[slots].permute(0, 2, 1, 3), values[slots].permute(0, 2, 1, 3)
-
-    def _window_starts(self, request_ids: list[str], counts: list[int]) -> list[int]:
-        """Where each sequence's newest `counts` tokens begin."""
-        return [
-            self._token_counts[rid] - count for rid, count in zip(request_ids, counts, strict=True)
-        ]
-
-    def _has_history(self, request_ids: list[str], counts: list[int]) -> bool:
-        """Whether any sequence held tokens before this pass's `counts` were added."""
-        return any(
-            self._token_counts[rid] > count for rid, count in zip(request_ids, counts, strict=True)
-        )
 
 
 def _tokens_first(states: torch.Tensor) -> torch.Tensor:
@@ -310,115 +255,50 @@ def _tokens_first(states: torch.Tensor) -> torch.Tensor:
     return states.permute(0, 2, 1, 3).reshape(batch * tokens, heads, head_dim)
 
 
-class _PrefillPayload:
-    """Prefill-pass payload for a left-padded batch.
-
-    Prompts arrive left-padded and the write table is right-aligned, so the two
-    line up column for column and padding lands in the null block.
-    """
-
-    def __init__(
-        self,
-        cache: ContinuousKVCache,
-        write_slots: torch.Tensor,
-        context_slots: torch.Tensor | None,
-    ) -> None:
-        self._cache = cache
-        self._write_slots = write_slots
-        self._context_slots = context_slots
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> DenseKV:
-        """Store this pass's tokens; return every token each sequence now holds."""
-        self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
-        if self._context_slots is None:
-            return DenseKV(key_states, value_states)
-        return DenseKV(*self._cache.gather(layer_idx, self._context_slots))
-
-
 class _PackedPayload:
     """Payload for a pass packed end to end: whole prompts, chunks and sampled tokens.
 
     Each sequence's queries are the newest tokens of its context, and that
     context may reach back past this pass to a prefix earlier ones wrote. So once
-    the pass is stored the payload hands the paged kernel the pool and the
-    addresses of everything each sequence holds, as it does for a decode step —
-    here with any number of queries per sequence, bounded by `query_start_loc`.
-    A whole prompt is the case where the context is the chunk itself. Nothing is
-    copied out of the pool, and the padded sibling's two alignments have nothing
-    to cancel here: token `i` of the run belongs to whichever sequence
-    `query_start_loc` says, and writes go to the slot the mapping names.
+    the pass is stored the payload hands attention the pool and the addresses of
+    everything each sequence holds, as it does for a decode step — here with any
+    number of queries per sequence, bounded by `query_start_loc`. A whole prompt
+    is the case where the context is the chunk itself.
     """
 
     def __init__(
         self,
         cache: ContinuousKVCache,
         addresses: PackedAddresses,
-        max_query_len: int,
-        slots: torch.Tensor,
-        context_lens: torch.Tensor,
+        host_context_lens: tuple[int, ...],
+        host_query_lens: tuple[int, ...],
     ) -> None:
         self._cache = cache
         self.addresses = addresses
-        self._max_query_len = max_query_len
-        self._slots = slots
-        self._context_lens = context_lens
+        self._host_context_lens = host_context_lens
+        self._host_query_lens = host_query_lens
 
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> PagedKV:
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
         """Store this pass's tokens; return where every token each sequence holds lives."""
         self._cache.scatter(layer_idx, self.addresses.slots, key_states, value_states)
         key_pool, value_pool = self._cache.layer_storage(layer_idx)
         return PagedKV(
             key_pool,
             value_pool,
-            self._slots,
-            self._context_lens,
+            self.addresses.slot_table,
+            self.addresses.context_lens,
             query_start_loc=self.addresses.query_start_loc,
-            max_query_len=self._max_query_len,
+            max_query_len=max(self._host_query_lens),
+            host_context_lens=self._host_context_lens,
+            host_query_lens=self._host_query_lens,
         )
 
 
 class _DecodePayload:
-    """Decode-pass payload over addresses the caller already built.
+    """Decode-pass payload that stores the new token and then only points at the pool.
 
     Every operation here is a tensor op on fixed pool storage, which is what
     makes the pass capturable: nothing decides anything on the host.
-    """
-
-    def __init__(
-        self, cache: ContinuousKVCache, write_slots: torch.Tensor, slots: torch.Tensor
-    ) -> None:
-        self._cache = cache
-        self._write_slots = write_slots
-        self._slots = slots
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> DenseKV:
-        """Store each sequence's decode token; return the gathered left-padded K/V."""
-        self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
-        return DenseKV(*self._cache.gather(layer_idx, self._slots))
-
-
-class _PagedDecodePayload:
-    """Decode-pass payload that stores the new token and then only points at the pool.
-
-    The gathering payload above copies ``[B, H, max_total, D]`` of K and V out of
-    the pool on every layer of every step. This one returns the pool itself plus
-    the addresses, and the fused kernel walks them — so the copy that dominated
-    decode does not exist on this path.
     """
 
     def __init__(
@@ -427,7 +307,7 @@ class _PagedDecodePayload:
         write_slots: torch.Tensor,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
-        num_splits: int | None = None,
+        num_splits: int | None,
     ) -> None:
         self._cache = cache
         self._write_slots = write_slots
@@ -435,12 +315,7 @@ class _PagedDecodePayload:
         self._context_lens = context_lens
         self._num_splits = num_splits
 
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> PagedKV:
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
         """Store each sequence's decode token; return where the whole history lives."""
         self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
         key_pool, value_pool = self._cache.layer_storage(layer_idx)

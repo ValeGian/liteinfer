@@ -183,9 +183,9 @@ def test_a_delta_against_a_removed_config_is_marked_in_text() -> None:
 
 
 def test_a_delta_against_a_runnable_config_is_not_marked_in_text() -> None:
-    members = [_throughput("liteinfer-sdpa", 10.0, baseline="liteinfer-continuous")]
+    members = [_throughput("liteinfer-graphs", 10.0, baseline="liteinfer-paged-attn")]
 
-    assert "liteinfer-continuous*" not in report.as_text(members)
+    assert "liteinfer-paged-attn*" not in report.as_text(members)
 
 
 def test_a_delta_against_a_removed_config_is_explained_in_html() -> None:

@@ -42,7 +42,6 @@ def _generate(model_dir: Path, max_num_batched_tokens: int | None) -> list[list[
             max_num_batched_tokens=max_num_batched_tokens,
         )
         async with llm:
-            assert llm.engine.model_runner._packs_prefill, "the packed path is what this tests"
             outputs = await llm.generate(
                 prompts, SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True)
             )
@@ -109,7 +108,6 @@ def _sequence() -> Sequence:
 def _run(model_dir: Path, chunks: list[int], is_reference: bool = False) -> list[torch.Tensor]:
     """Logits at the prompt's end, then after each decode step over fixed tokens."""
     runner, seq = _runner(model_dir, is_reference), _sequence()
-    assert runner._packs_prefill != is_reference, "the engine packs; the reference pads"
     for count in chunks:
         logits = runner.execute([seq], [count])
     steps = [logits.float()]
@@ -127,8 +125,8 @@ def _drift(run: list[torch.Tensor], reference: list[torch.Tensor], step: int) ->
 def runs(tiny_llama_dir: Path) -> dict[str, list[torch.Tensor]]:
     """The single-precision reference, and the bf16 engine with the prompt whole and chunked.
 
-    Both bf16 runs read every chunk through `paged_prefill`; the reference pads
-    the prompt and writes every score out through `eager`, which is what makes it
+    Both bf16 runs read every chunk through `paged_prefill`; the reference copies
+    the prompt out and writes every score through `eager`, which is what makes it
     a reference for both.
     """
     return {
