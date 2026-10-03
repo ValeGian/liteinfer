@@ -194,6 +194,13 @@ def test_a_delta_against_a_removed_config_is_explained_in_html() -> None:
     assert "spans two engines" in report.as_html(members)
 
 
+def test_a_removed_config_s_lineage_separator_is_markup_not_escaped_text() -> None:
+    """The separator is an entity the page renders, not one the reader sees spelled out."""
+    members = [_throughput("liteinfer-paged", 10.0, baseline="liteinfer-native-eager")]
+
+    assert "&amp;middot;" not in report.as_html(members)
+
+
 def test_differing_prompt_sets_are_flagged_in_text() -> None:
     mismatched = _throughput("liteinfer-eager", 10.0, dataset={"sha256": "different"})
     assert "WARNING" in report.as_text([_throughput("liteinfer-nocache", 10.0), mismatched])

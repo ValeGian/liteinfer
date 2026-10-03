@@ -1,0 +1,32 @@
+{
+  "config": "liteinfer-paged-prefill",
+  "engine": "liteinfer",
+  "description": "Packed prefill read through paged_prefill even with nothing cached, instead of FlashAttention's varlen entry. Measure it on a mixed-length dataset",
+  "baseline": "liteinfer-packed",
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-10-03T18:36:45+00:00",
+  "revision": "c54cd9a-dirty",
+  "dataset": {
+    "path": "/home/valerio/workspace/liteinfer/benchmarks/datasets/islmixed2048_osl16_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": null,
+    "target_osl": 16,
+    "max_isl": 2048,
+    "num_samples": 200,
+    "sha256": "d3de8f4e6ec9fb683be98e3316da7affe078e382b47d7b63dcf379259ba5f14e"
+  },
+  "summary": {
+    "output_tokens_per_s": 2342.890442702571,
+    "requests_per_s": 146.43065266891068,
+    "wall_time_s": 1.3658342454582453
+  },
+  "raw": {
+    "wall_time_s": 1.3658342454582453,
+    "output_tokens": 3200,
+    "step_phases": {
+      "prefill": 7,
+      "decode": 105
+    }
+  }
+}
