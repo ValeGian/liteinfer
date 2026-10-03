@@ -408,10 +408,24 @@ listed.
   specialization — the query count and the slot table's stride change every step — and its
   `run` convention is private and has moved between 3.x minors. Fewer constexprs
   do not shorten the key, which covers every argument.
-- **The payload's cost is already gone.** §3.9 builds a packed pass's addresses
-  from one transfer instead of five — paged TTFT at ISL 128 read 17.4 → 16.0 ms
-  back to back — so what this measures is the launch alone. Compare within one
-  session: the same row on the same code has read 16.4 and 17.4 ms in two.
+- **The payload's ~0.25 ms is already gone.** §3.9 builds a packed pass's
+  addresses from one transfer instead of five, so what is left to find is the
+  launch and the kernel's own time. Compare within one session: the same row on
+  the same code has read 16.4 and 17.4 ms TTFT in two.
+
+### 3.11 Bound the dense decode keys once per step, not per layer
+- **Status.** `planned` — raised by §3.9 ([#47](https://github.com/ValeGian/liteinfer/pull/47)).
+- **PRs.** _none yet_
+- **Why.** `eager` and `sdpa` batch a decode step by gathering each row's whole
+  context and hiding the columns past its length, and that bound — an `arange`
+  and a compare — is rebuilt in every layer from `context_lens`. Measured on the
+  `sdpa` fallback at ISL 128: ITL 15.3 → 15.7 ms against the padded path it
+  replaced, which built its mask once per step.
+- **Scope.** Build the bound once per step inside `models/attention.py`, keyed on
+  the step's `context_lens` tensor, so every layer after the first reuses it.
+  Not in the payload layer, which §3.9 cleared of masks. Land it only if it
+  measures: latency mode, `sdpa`, ISL 128, against this revision. The fallback
+  path only; `paged` never builds it.
 
 ---
 
@@ -564,3 +578,19 @@ listed.
   `liteinfer-onepass-budget` there. Both are `historical` — the before since
   §1.3, the after since §3.9 replaced varlen — so the comparison has to be run
   from §1.3's parent revision and from §1.3's own.
+
+### 8.9 Re-measure the rows §3.9 changed underneath
+- **Status.** `planned` — after [#46](https://github.com/ValeGian/liteinfer/pull/46) and [#47](https://github.com/ValeGian/liteinfer/pull/47) merge.
+- **PRs.** _none yet_
+- **Why.** Two kinds of stored row no longer describe the code they would run.
+  `liteinfer-paged-prefill` — the row that ships — was stored from #46's
+  uncommitted tree, before #47 rebuilt its addresses. And the decode-side rows on
+  fixed-ISL datasets (`liteinfer-graphs`, `-splitk`, `-graphs-b128`, the `-16k`
+  pair) were stored with a padded prefill through FlashAttention: their throughput
+  and ITL still compare, but a latency re-run measures `paged_prefill` TTFT, which
+  §2.10 measured at parity only up to 4,096 tokens — and the 16k rows run 15,360.
+- **Scope.** From master's committed revision, interleaved in one session:
+  `liteinfer-paged-prefill` and `liteinfer-sdpa-packed` on their stored shapes,
+  and the fixed-ISL latency rows, the long-context ones first. Store each, so the
+  report's deltas stop spanning revisions; say in `docs/benchmarks.md` which TTFTs
+  moved because the prefill kernel did.

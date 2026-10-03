@@ -1579,10 +1579,12 @@ output tok/s:
 
 One after rep at OSL 16 read 1,704 tok/s against 2,375 and 2,372 beside it, a
 1.5 s run. Latency, one request at a time at ISL 128 / OSL 256: TTFT p50
-**17.4 → 16.0 ms** (0.92x), p99 19.9 → 18.2, ITL p50 6.63 → 6.50. The TTFT gain
-is the address build: §3.9's first half had cost ~0.25 ms of it. The same row on
-the same code read 16.4 ms in that session and 17.4 in this one, so only
-back-to-back pairs compare. The stored `liteinfer-paged-prefill` rows stay #46's.
+**17.4 → 16.0 ms** (0.92x), p99 19.9 → 18.2, ITL p50 6.63 → 6.50. About 0.25 ms
+of that is accounted for — the address build the first half had added, now one
+transfer — and the rest is not: the same row on the same code read 16.4 ms in
+the first half's session and 17.4 in this one, so the pair bounds the change
+rather than explaining all of it. The stored `liteinfer-paged-prefill` rows stay
+#46's, to be re-measured from master once both halves land (§8.9).
 
 **The dense fallback**, `liteinfer-sdpa` (padded, from #46's branch) against
 `liteinfer-sdpa-packed`, two reps each on one A40 per shape:

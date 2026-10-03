@@ -117,9 +117,9 @@ One engine: continuous batching over a paged KV cache.
   `paged` (the default on CUDA) is a Triton kernel that reads the KV pool in
   place — one query per sequence for a decode step, any number for a packed
   pass — so the decode step stops growing with context. `sdpa` (the default
-  elsewhere) and `eager` copy each sequence's context out and attend one
-  sequence at a time: `sdpa` never materialises the score matrix, `eager` writes
-  it out in plain matmuls and is the parity reference. The engine picks between
+  elsewhere) and `eager` copy the contexts out of the pool — a decode step's all
+  at once, a packed pass's one sequence at a time: `sdpa` never materialises the
+  score matrix, `eager` writes it out in plain matmuls and is the parity reference. The engine picks between
   them from the device.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
