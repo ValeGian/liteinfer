@@ -7,6 +7,7 @@ in the harness, so all engines are timed by the same clock in the same way.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Protocol
 
 from benchmarks.configs import BenchmarkConfig
@@ -20,6 +21,10 @@ class Adapter(Protocol):
 
     def generate(self, prompts: list[str], max_tokens: int) -> list[int]:
         """Run all prompts to completion; return per-prompt output token counts."""
+        ...
+
+    def step_phases(self) -> dict[str, int] | None:
+        """Steps run so far, by phase, or None for an engine that does not report them."""
         ...
 
 
@@ -68,6 +73,9 @@ class LiteInferAdapter:
         )
         return [len(o.token_ids) for o in self._llm.generate(prompts, params)]
 
+    def step_phases(self) -> dict[str, int]:
+        return dict(Counter(step.phase.value for step in self._llm.stats.steps))
+
 
 class VLLMAdapter:
     """vLLM at its best: its own scheduler and CUDA graphs both left enabled."""
@@ -101,6 +109,9 @@ class VLLMAdapter:
         )
         outputs = self._llm.generate(prompts, params, use_tqdm=False)
         return [len(o.outputs[0].token_ids) for o in outputs]
+
+    def step_phases(self) -> None:
+        return None
 
 
 def build(config: BenchmarkConfig, model: str) -> Adapter:

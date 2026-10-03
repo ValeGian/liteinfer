@@ -23,9 +23,10 @@ def _dataset(num_samples: int = 3) -> Dataset:
 class StubAdapter:
     """Records every call; returns the requested output length by default."""
 
-    def __init__(self, short_by: int = 0) -> None:
+    def __init__(self, short_by: int = 0, reports_phases: bool = False) -> None:
         self.calls: list[tuple[int, int]] = []  # (num_prompts, max_tokens)
         self._short_by = short_by
+        self._reports_phases = reports_phases
 
     def __enter__(self):
         return self
@@ -36,6 +37,10 @@ class StubAdapter:
     def generate(self, prompts: list[str], max_tokens: int) -> list[int]:
         self.calls.append((len(prompts), max_tokens))
         return [max_tokens - self._short_by] * len(prompts)
+
+    def step_phases(self) -> dict[str, int] | None:
+        """One prefill step per call, so the warm-up's steps are distinguishable from the run's."""
+        return {"prefill": len(self.calls)} if self._reports_phases else None
 
 
 @contextmanager
@@ -146,3 +151,15 @@ def test_a_result_records_the_engine_revision_it_measured() -> None:
     from benchmarks.harness import _revision
 
     assert _revision() != ""
+
+
+def test_a_throughput_result_records_the_steps_of_the_timed_run_only(tmp_path):
+    result = _run("throughput", tmp_path, StubAdapter(reports_phases=True))
+
+    assert result.raw["step_phases"] == {"prefill": 1}
+
+
+def test_an_engine_that_reports_no_steps_records_none(tmp_path):
+    result = _run("throughput", tmp_path, StubAdapter())
+
+    assert "step_phases" not in result.raw

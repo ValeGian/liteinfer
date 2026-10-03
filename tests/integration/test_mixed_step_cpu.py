@@ -20,6 +20,7 @@ from liteinfer.cache.block_pool import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
 from liteinfer.engine.sequence import Sequence, SequenceStatus
+from liteinfer.outputs import RequestOutput
 from liteinfer.sampling.params import SamplingParams
 
 _TOLERANCE = {"rtol": 0, "atol": 1e-5}
@@ -147,35 +148,52 @@ def test_a_prompt_the_pool_cannot_hold_does_not_stop_a_running_sequence(tiny_lla
     assert len(_late_prompt_on_a_full_pool(tiny_llama_dir).running_tokens) == _RUNNING_TOKENS
 
 
-# Two 19-token prompts under an 8-token budget on a two-block pool. The first is
-# chunked 8 / 8 / 3; its last chunk needs its second block in the same step that
-# admits the second prompt, which needs one too, and only one is free.
-_CHUNKED_POOL = {"num_gpu_blocks": 2, "block_size": 16, "max_num_batched_tokens": 8}
-_CHUNKED_PROMPT = " ".join(f"tok{2 + i}" for i in range(19))
-_CHUNKED_OUTPUT_TOKENS = 4
+def _generate_on_a_small_pool(
+    model_dir: Path, prompt_lens: list[int], max_tokens: int, **pool
+) -> tuple[RequestOutput | BaseException, ...]:
+    """Every prompt submitted at once; each one's output, or the error that ended it."""
 
-
-def _two_prompts_on_a_chunking_full_pool(model_dir: Path) -> list:
     async def run():
         llm = AsyncLLM(
             str(model_dir), device="cpu", dtype=torch.float32,  # type: ignore[arg-type]
-            max_num_seqs=2, max_model_len=64, **_CHUNKED_POOL,
+            max_num_seqs=len(prompt_lens), max_model_len=64, block_size=16, **pool,
         )
         async with llm:
-            params = SamplingParams(
-                max_tokens=_CHUNKED_OUTPUT_TOKENS, temperature=0.0, ignore_eos=True
-            )
-            return await asyncio.gather(
-                llm.generate(_CHUNKED_PROMPT, params),
-                llm.generate(_CHUNKED_PROMPT.replace("tok2 ", "tok9 "), params),
-                return_exceptions=True,
-            )
+            params = SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True)
+            prompts = [" ".join(f"tok{2 + 7 * i + j}" for j in range(n)) for i, n in enumerate(prompt_lens)]
+            requests = [llm.generate(prompt, params) for prompt in prompts]
+            results = await asyncio.gather(*requests, return_exceptions=True)
+            return tuple(r if isinstance(r, BaseException) else r[0] for r in results)
 
     return asyncio.run(run())
 
 
 def test_a_full_pool_sheds_the_newcomer_rather_than_a_prompt_part_way_through(tiny_llama_dir: Path):
-    """The part-way prompt fits on its own; dropping it too would discard work for nothing."""
-    first, _ = _two_prompts_on_a_chunking_full_pool(tiny_llama_dir)
+    """The part-way prompt fits on its own; dropping it too would discard work for nothing.
 
-    assert len(first[0].token_ids) == _CHUNKED_OUTPUT_TOKENS
+    Two 19-token prompts, an 8-token budget, two blocks: the first is chunked
+    8 / 8 / 3, and its last chunk needs its second block in the step that admits
+    the second prompt, which needs one too.
+    """
+    first, _ = _generate_on_a_small_pool(
+        tiny_llama_dir, [19, 19], max_tokens=4, num_gpu_blocks=2, max_num_batched_tokens=8
+    )
+
+    assert isinstance(first, RequestOutput)
+
+
+def test_a_full_pool_sheds_a_part_way_prompt_rather_than_a_decoding_sequence(tiny_llama_dir: Path):
+    """No newcomer to drop: a 3-token prompt decodes while a 19-token one is chunked
+    5 / 7 / 7 beside it, and the last chunk needs a block that is not there."""
+    decoding, _ = _generate_on_a_small_pool(
+        tiny_llama_dir, [3, 19], max_tokens=4, num_gpu_blocks=2, max_num_batched_tokens=8
+    )
+
+    assert isinstance(decoding, RequestOutput)
+
+
+def test_a_full_pool_with_only_decodes_left_fails_them(tiny_llama_dir: Path):
+    """Nothing smaller to give up: one sequence outgrows the only block there is."""
+    (only,) = _generate_on_a_small_pool(tiny_llama_dir, [3], max_tokens=20, num_gpu_blocks=1)
+
+    assert isinstance(only, BlockPoolExhaustedError)

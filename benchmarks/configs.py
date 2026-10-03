@@ -222,6 +222,7 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         enable_packed_prefill=True,
         paged_decode_splits=None,
         max_num_batched_tokens=2048,
+        baseline="liteinfer-packed",
         description=(
             "Packed prefill under a 2,048-token step budget; a step that admits while "
             "others decode runs a prefill pass and a decode pass"

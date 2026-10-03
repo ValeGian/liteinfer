@@ -212,9 +212,10 @@ is no longer what the numbers show.
 
 **Batching works at both tiers.** Static batching converts B=1 → B=4 at 3.84×
 against vLLM's 3.84× on the same transition. Continuous batching converts
-B=4 → B=32 at 5.01× against vLLM's 6.17×. Whatever the two-pass prefill+decode
-step (§1.3) costs, it is a modest residual rather than a dominant term:
-continuous ITL (15.4 ms) sits level with static paged (15.0 ms).
+B=4 → B=32 at 5.01× against vLLM's 6.17×. The two-pass prefill+decode step was
+once the suspect for that gap; §1.3 measured that the throughput harness almost
+never builds such a step, so it is not the cause. Continuous ITL (15.4 ms) sits
+level with static paged (15.0 ms).
 
 **Paging cost ~8-10%, and paying it back is what §2.3 did.** Paged reached 0.92×
 of native-eager on throughput at B=1, 0.90× at B=4, and 0.90× on ITL, because the

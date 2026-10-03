@@ -201,8 +201,8 @@ listed.
 - **PRs.** _none yet_
 - **Why.** A mixed pass reads every row through `paged_prefill`, which has no
   split-K, so its decode rows lose the parallelism `paged_decode` buys a narrow
-  batch. At B=32 and a 2,176-token budget that costs nothing (0.88x-1.01x of a
-  separate decode launch per layer); at 16k context it does: **1.08x-1.51x** per
+  batch. At a 32-wide batch and contexts up to 2,000 that costs nothing
+  (0.88x-1.01x of a separate decode launch per layer); at 16k context it does: **1.08x-1.51x** per
   layer for 1-7 decode rows beside a chunk, about 3.4 ms over 16 layers on the
   worst shape. Still well under the graphed decode pass §1.3 removed, so not a
   regression against two passes — but money left on the table where long
@@ -387,6 +387,14 @@ listed.
   needs it, collapse `_padded_forward`'s two passes inside `execute` into the
   packed route §1.3 left, and then simplify what the choice left behind — a
   dispatcher with one entry is the shape to look for.
+- **`varlen_attention` goes too, if an engine run agrees.** A packed pass with
+  nothing cached still goes to FlashAttention's varlen entry; every other packed
+  pass already reads through `paged_prefill`. Per layer, `paged_prefill` over
+  whole prompts is 0.30x of flash at 32 x 18 tokens and within 4% up to 4,096
+  (§2.10), so routing every packed pass through it would delete
+  `varlen_attention`, `VarlenKV` and `_PackedPrefillPayload` — after a throughput
+  run on the mixed dataset, the prefill-heaviest shape at OSL 16, shows no loss.
+  §1.3 kept varlen so its own number measured one change.
 - **What stays.** `eager` and `sdpa` keep a packed per-sequence loop. They are the
   correctness reference and the CPU path, not performance paths, and should not
   pretend otherwise. `eager` in particular is the oracle the fused kernels are

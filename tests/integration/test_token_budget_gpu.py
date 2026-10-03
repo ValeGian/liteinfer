@@ -66,6 +66,9 @@ def test_a_budgeted_cuda_engine_generates_what_an_unbudgeted_one_does(tiny_llama
 
 _CHUNKED_PROMPT_LEN = 30
 _CHUNKS = [7, 16, 7]
+# Ends on a one-token chunk, which brings one token like a decode step and is
+# served by the captured decode graph rather than the packed prefill.
+_CHUNKS_ENDING_ON_ONE = [7, 22, 1]
 _DECODE_STEPS = 3
 # How much more a chunked bf16 run may drift from single precision than the
 # whole-prompt bf16 run already does. The logits reach ~60, where one bf16 ulp is
@@ -126,18 +129,21 @@ def runs(tiny_llama_dir: Path) -> dict[str, list[torch.Tensor]]:
         "reference": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN], torch.float32),
         "whole": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN]),
         "chunked": _run(tiny_llama_dir, _CHUNKS),
+        "chunked_to_one": _run(tiny_llama_dir, _CHUNKS_ENDING_ON_ONE),
     }
 
 
-def test_the_last_chunk_of_a_prompt_predicts_what_the_whole_prompt_does(runs):
+@pytest.mark.parametrize("chunked", ["chunked", "chunked_to_one"])
+def test_the_last_chunk_of_a_prompt_predicts_what_the_whole_prompt_does(runs, chunked: str):
     reference = runs["reference"]
 
-    assert _drift(runs["chunked"], reference, 0) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, 0)
+    assert _drift(runs[chunked], reference, 0) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, 0)
 
 
+@pytest.mark.parametrize("chunked", ["chunked", "chunked_to_one"])
 @pytest.mark.parametrize("step", range(1, _DECODE_STEPS + 1))
-def test_a_captured_decode_reads_what_the_chunks_wrote(runs, step: int):
+def test_a_captured_decode_reads_what_the_chunks_wrote(runs, step: int, chunked: str):
     """Graph-replayed decode walks the pool the packed chunks filled, so a misplaced token shows."""
     reference = runs["reference"]
 
-    assert _drift(runs["chunked"], reference, step) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, step)
+    assert _drift(runs[chunked], reference, step) <= _DRIFT_ALLOWANCE * _drift(runs["whole"], reference, step)

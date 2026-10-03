@@ -97,10 +97,12 @@ class EngineStats:
 
     The `prefill` and `decode` totals cover steps of that phase only. A mixed
     step's wall time belongs to both and cannot be split between them, so it
-    counts toward the overall totals and neither per-phase one. On an engine
-    that packs, every admission beside running sequences is a mixed step, so
-    the prefill averages describe cold starts; `StepMetrics.prompt_tokens` is
-    exact on every step, and is what to sum for prompt work.
+    counts toward the overall totals and neither per-phase one. Every step that
+    admits beside running sequences is a mixed step — on a padded engine too,
+    whose two passes inside `execute` are recorded as one step — so the prefill
+    averages describe the steps that admitted into an empty batch.
+    `StepMetrics.prompt_tokens` is exact on every step, and is what to sum for
+    prompt work.
     """
 
     steps: list[StepMetrics] = field(default_factory=list)

@@ -16,7 +16,12 @@ import torch
 
 
 class BlockPoolExhaustedError(RuntimeError):
-    """Raised when BlockPool.allocate() is called with no free blocks remaining."""
+    """The pool cannot hold what was asked of it.
+
+    Raised by `allocate` with no free block left, and by
+    `ContinuousKVCache.advance` before it allocates anything, when a step's
+    tokens need more blocks than are free.
+    """
 
 
 class BlockPool:
@@ -190,10 +195,9 @@ def packed_positions(
 
     Sequence ``i`` contributes ``[starts[i], starts[i] + counts[i])``, the same
     windows `slot_mapping` addresses. Built from the same two vectors on the
-    device, so the launch count is fixed whatever the batch holds. One
-    `arange` per sequence cost a launch each, which is the per-sequence host
-    work a decode step cannot afford. A batch of single tokens is just
-    ``starts``, and goes over in one transfer.
+    device, so the launch count is fixed whatever the batch holds, rather than
+    a launch per sequence, which is host work a decode step cannot afford. A
+    batch of single tokens is just ``starts``, and goes over in one transfer.
     """
     if all(count == 1 for count in counts):
         return torch.tensor([list(starts)], dtype=torch.long, device=device)
