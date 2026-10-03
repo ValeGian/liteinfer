@@ -397,8 +397,9 @@ listed.
 - **PRs.** _none yet_
 - **Why.** Padding is currently undone by five mechanisms that exist only to
   cancel each other: left-padded inputs, a right-aligned slot table, a null block
-  absorbing pad positions, two mask builders, and two runner entry points. Once
-  §1.3 landed, every one of them has a packed equivalent and the engine keeps both.
+  absorbing pad positions, two mask builders, and a two-pass route inside the
+  runner's one entry point. Since §1.3 every one of them has a packed equivalent,
+  and the engine keeps both.
   Keeping a slower general path "just in case" is how the codebase stops being
   readable.
 - **Scope.** Delete `build_prefill_mask` and the padded input builders, drop the
@@ -414,6 +415,11 @@ listed.
   `varlen_attention`, `VarlenKV` and `_PackedPrefillPayload` — after a throughput
   run on the mixed dataset, the prefill-heaviest shape at OSL 16, shows no loss.
   §1.3 kept varlen so its own number measured one change.
+- **The activation profile has to follow.** `_profile_forward_bytes` sizes the
+  pool from a *padded* `sdpa` forward over `max_num_seqs x max_model_len` with a
+  full `[B, 1, L, L]` mask, even on an engine that packs. That over-reserves
+  today, which is safe; with the padded path gone it is the wrong basis, and the
+  worst case to profile becomes one packed pass of `token_budget` tokens.
 - **What stays.** `eager` and `sdpa` keep a packed per-sequence loop. They are the
   correctness reference and the CPU path, not performance paths, and should not
   pretend otherwise. `eager` in particular is the oracle the fused kernels are
@@ -497,8 +503,10 @@ listed.
 
 ## 7. Hygiene / housekeeping
 
-- Trim `EngineStats`: six derived throughput properties, the `on_step`
-  listener and four running totals have no callers outside their own tests.
+- Trim `EngineStats`: the two overall throughput properties and the `on_step`
+  listener have no callers outside their own tests. §1.3 removed the per-phase
+  totals and averages, whose meaning a mixed step broke; `on_step` is what §6.2
+  plans to read, so decide it with §6.2.
 - Fix the five `reportOptionalMemberAccess` errors pyright reports on package
   code: `hf_config` and `tokenizer` are declared optional because they are
   assigned in `load_model` rather than `__init__`, so every read of them is an

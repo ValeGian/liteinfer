@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, packed_positions
+from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload, ProfilePayload
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import builders_for
@@ -63,16 +63,6 @@ def _packing_is_enabled(
     return False
 
 
-def _last_token_indices(chunk_lens: list[int], device: torch.device) -> torch.Tensor:
-    """Where each chunk's last token sits in the packed run.
-
-    Sampling reads one row per sequence, and in a packed batch those rows are at
-    the end of each chunk rather than in a shared last column.
-    """
-    ends = torch.tensor(chunk_lens, device=device).cumsum(0)
-    return ends - 1
-
-
 class _Chunk(NamedTuple):
     """The tokens one sequence computes in a pass, and where they start."""
 
@@ -90,8 +80,8 @@ def _tokens_at(seq: Sequence, start: int, count: int) -> list[int]:
 
     A chunk never crosses from one into the other: a sequence still computing
     its prompt has sampled nothing, and one past its prompt owes exactly the
-    token it last sampled. So this slices one list rather than building
-    `all_token_ids()`, which would copy the whole sequence for every row of
+    token it last sampled. So this slices one list rather than concatenating
+    prompt and output, which would copy the whole sequence for every row of
     every step.
     """
     prompt_len = len(seq.prompt_token_ids)
@@ -122,7 +112,7 @@ class ContinuousModelRunner:
         self._cache: ContinuousKVCache | None = None
         self._graphs: DecodeGraphs | None = None
         self._forward_bytes = 0
-        self._packed_prefill_enabled = False
+        self._packs_prefill = False
 
     def load_model(self) -> None:
         model_path = resolve_model_path(self.config.model)
@@ -130,7 +120,8 @@ class ContinuousModelRunner:
         self.tokenizer = Tokenizer(model_path)
         # After the model, because the kernel is what decides whether a packed
         # batch can be read at all, and `load_hf_model` is where it is resolved.
-        self._packed_prefill_enabled = _packing_is_enabled(
+        # Resolved once here rather than per step.
+        self._packs_prefill = _packing_is_enabled(
             self.config.enable_packed_prefill,
             self.attn_implementation,
             self.device,
@@ -141,11 +132,6 @@ class ContinuousModelRunner:
         self._forward_bytes = self._profile_forward_bytes()
         self._cache = ContinuousKVCache(self._create_block_pool())
         self._graphs = self._create_decode_graphs()
-
-    @property
-    def _packs_prefill(self) -> bool:
-        """Whether prefill goes in packed, resolved once at load rather than per step."""
-        return self._packed_prefill_enabled
 
     @property
     def attn_implementation(self) -> str:
@@ -245,14 +231,18 @@ class ContinuousModelRunner:
         assert self._cache is not None and self.model is not None
 
         counts = [len(chunk.token_ids) for chunk in chunks]
-        input_ids, position_ids = self._build_packed_inputs(chunks)
+        token_ids = [token for chunk in chunks for token in chunk.token_ids]
         payload = self._cache.make_packed_prefill_payload(request_ids, counts)
+        # The leading axis is 1 because the batch is the token run itself; where
+        # each sequence begins is in the payload's addresses, which also give
+        # every token's position for RoPE and each sequence's last token, the
+        # one row it samples from.
         out = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
+            input_ids=torch.tensor([token_ids], dtype=torch.long, device=self.device),
+            position_ids=payload.addresses.positions,
             past_key_values=payload,
             attention_mask=None,
-            logits_positions=_last_token_indices(counts, self.device),
+            logits_positions=payload.addresses.query_start_loc[1:] - 1,
         )
         return out.logits[0]
 
@@ -308,8 +298,7 @@ class ContinuousModelRunner:
         """
         assert self._cache is not None and self.model is not None
 
-        token_run, position_run = self._build_packed_inputs(chunks)
-        input_ids, position_ids = token_run.view(-1, 1), position_run.view(-1, 1)
+        input_ids, position_ids = self._build_decode_inputs(chunks)
         write_slots = self._cache.slot_mapping_for(request_ids, [1] * len(request_ids))
         slots = self._cache.slot_table_for(request_ids)
 
@@ -386,22 +375,14 @@ class ContinuousModelRunner:
             self.device.index or 0,
         )
 
-    def _build_packed_inputs(self, chunks: list[_Chunk]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Every chunk end to end as `[1, total_tokens]`, positions restarting per chunk.
-
-        The leading axis is 1 because the batch is the token run itself; where
-        each sequence begins lives in `cu_seqlens` on the payload, and in the
-        positions, which count from where each chunk starts in its sequence so
-        RoPE sees every token where it sits.
-        """
-        token_ids = [token for chunk in chunks for token in chunk.token_ids]
-        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        position_ids = packed_positions(
-            [chunk.start for chunk in chunks],
-            [len(chunk.token_ids) for chunk in chunks],
-            self.device,
+    def _build_decode_inputs(self, chunks: list[_Chunk]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each sequence's one token and its position, as ``[B, 1]`` each, in one transfer."""
+        tokens_and_positions = torch.tensor(
+            [[chunk.token_ids[0] for chunk in chunks], [chunk.start for chunk in chunks]],
+            dtype=torch.long,
+            device=self.device,
         )
-        return input_ids, position_ids
+        return tokens_and_positions[0].unsqueeze(1), tokens_and_positions[1].unsqueeze(1)
 
     def _build_padded_inputs(self, chunks: list[_Chunk]) -> tuple[torch.Tensor, torch.Tensor]:
         """Every chunk left-padded to the longest, positions counting from where it starts."""

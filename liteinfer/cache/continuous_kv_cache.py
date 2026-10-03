@@ -46,11 +46,18 @@ right-aligned slot table, which only the reads still need.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Protocol
+from typing import Protocol
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, BlockPoolExhaustedError, slot_mapping, slot_table
+from liteinfer.cache.block_pool import (
+    BlockPool,
+    BlockPoolExhaustedError,
+    PackedAddresses,
+    packed_addresses,
+    slot_mapping,
+    slot_table,
+)
 from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
 
 
@@ -176,15 +183,24 @@ class ContinuousKVCache:
         boundaries to respect rather than padding to mask. With nothing cached
         before the pass those are the K/V it computed; with a prefix cached, the
         pool itself and the addresses of every token each sequence holds.
+
+        The payload carries the run's `PackedAddresses`, whose positions and
+        boundaries the caller also needs for RoPE and for picking each
+        sequence's last token, so they are built once per pass.
         """
-        write_slots = self.slot_mapping_for(request_ids, counts)
-        queries = _Boundaries.of(counts, self._pool.device)
+        addresses = packed_addresses(
+            [self._block_tables[r] for r in request_ids],
+            self._window_starts(request_ids, counts),
+            counts,
+            self._pool.block_size,
+            self._pool.device,
+        )
         if not self._has_history(request_ids, counts):
-            return _PackedPrefillPayload(self, write_slots, queries)
+            return _PackedPrefillPayload(self, addresses, max(counts))
         return _PackedChunkPayload(
             self,
-            write_slots,
-            queries,
+            addresses,
+            max(counts),
             self.slot_table_for(request_ids),
             self.context_lens_for(request_ids),
         )
@@ -325,17 +341,6 @@ class _PrefillPayload:
         return DenseKV(*self._cache.gather(layer_idx, self._context_slots))
 
 
-class _Boundaries(NamedTuple):
-    """Where each sequence starts in a packed run, in the two forms the flash kernel reads."""
-
-    cu_seqlens: torch.Tensor
-    max_seqlen: int
-
-    @classmethod
-    def of(cls, lengths: list[int], device: torch.device) -> _Boundaries:
-        return cls(_cumulative_lengths(lengths, device), max(lengths))
-
-
 class _PackedPrefillPayload:
     """Prefill payload for whole prompts packed end to end, with no padding anywhere.
 
@@ -347,11 +352,11 @@ class _PackedPrefillPayload:
     """
 
     def __init__(
-        self, cache: ContinuousKVCache, write_slots: torch.Tensor, boundaries: _Boundaries
+        self, cache: ContinuousKVCache, addresses: PackedAddresses, max_query_len: int
     ) -> None:
         self._cache = cache
-        self._write_slots = write_slots
-        self._boundaries = boundaries
+        self.addresses = addresses
+        self._max_query_len = max_query_len
 
     def update(
         self,
@@ -360,9 +365,9 @@ class _PackedPrefillPayload:
         layer_idx: int,
     ) -> VarlenKV:
         """Store every prompt token; return the K/V this pass computed, plus the boundaries."""
-        self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
+        self._cache.scatter(layer_idx, self.addresses.slots, key_states, value_states)
         return VarlenKV(
-            key_states, value_states, self._boundaries.cu_seqlens, self._boundaries.max_seqlen
+            key_states, value_states, self.addresses.query_start_loc, self._max_query_len
         )
 
 
@@ -379,14 +384,14 @@ class _PackedChunkPayload:
     def __init__(
         self,
         cache: ContinuousKVCache,
-        write_slots: torch.Tensor,
-        queries: _Boundaries,
+        addresses: PackedAddresses,
+        max_query_len: int,
         slots: torch.Tensor,
         context_lens: torch.Tensor,
     ) -> None:
         self._cache = cache
-        self._write_slots = write_slots
-        self._queries = queries
+        self.addresses = addresses
+        self._max_query_len = max_query_len
         self._slots = slots
         self._context_lens = context_lens
 
@@ -397,24 +402,16 @@ class _PackedChunkPayload:
         layer_idx: int,
     ) -> PagedKV:
         """Store this pass's tokens; return where every token each sequence holds lives."""
-        self._cache.scatter(layer_idx, self._write_slots, key_states, value_states)
+        self._cache.scatter(layer_idx, self.addresses.slots, key_states, value_states)
         key_pool, value_pool = self._cache.layer_storage(layer_idx)
         return PagedKV(
             key_pool,
             value_pool,
             self._slots,
             self._context_lens,
-            query_start_loc=self._queries.cu_seqlens,
-            max_query_len=self._queries.max_seqlen,
+            query_start_loc=self.addresses.query_start_loc,
+            max_query_len=self._max_query_len,
         )
-
-
-def _cumulative_lengths(lengths: list[int], device: torch.device) -> torch.Tensor:
-    """`[0, l0, l0 + l1, ...]` as int32, which is the layout the flash kernel reads."""
-    boundaries = [0]
-    for length in lengths:
-        boundaries.append(boundaries[-1] + length)
-    return torch.tensor(boundaries, dtype=torch.int32, device=device)
 
 
 class _DecodePayload:

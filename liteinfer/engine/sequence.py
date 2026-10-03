@@ -70,6 +70,3 @@ class Sequence:
     @property
     def num_output_tokens(self) -> int:
         return len(self.output_token_ids)
-
-    def all_token_ids(self) -> list[int]:
-        return self.prompt_token_ids + self.output_token_ids

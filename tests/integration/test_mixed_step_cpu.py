@@ -19,9 +19,10 @@ from liteinfer import AsyncLLM
 from liteinfer.cache.block_pool import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
-from liteinfer.engine.sequence import Sequence, SequenceStatus
+from liteinfer.engine.sequence import Sequence
 from liteinfer.outputs import RequestOutput
 from liteinfer.sampling.params import SamplingParams
+from tests.integration.sequences import running_sequence
 
 _TOLERANCE = {"rtol": 0, "atol": 1e-5}
 
@@ -37,19 +38,9 @@ def _runner(model_dir: Path) -> ContinuousModelRunner:
     return runner
 
 
-def _sequence(request_id: str, prompt_len: int, offset: int) -> Sequence:
-    return Sequence(
-        request_id=request_id,
-        prompt="",
-        prompt_token_ids=[2 + (offset + i) % 250 for i in range(prompt_len)],
-        sampling_params=SamplingParams(temperature=0.0),
-        status=SequenceStatus.RUNNING,
-    )
-
-
 def _decoding(runner: ContinuousModelRunner) -> Sequence:
     """A sequence whose prompt is cached and whose sampled token is not yet."""
-    seq = _sequence("decoding", prompt_len=11, offset=0)
+    seq = running_sequence("decoding", prompt_len=11, offset=0)
     runner.execute([seq])
     seq.output_token_ids.append(7)
     return seq
@@ -65,7 +56,7 @@ def test_the_next_chunk_of_a_decoding_sequence_is_its_last_sampled_token(tiny_ll
 def test_a_chunk_crossing_from_prompt_into_output_is_refused(tiny_llama_dir: Path):
     """A sequence still computing its prompt has sampled nothing, so this is a caller bug."""
     runner = _runner(tiny_llama_dir)
-    seq = _sequence("crossing", prompt_len=5, offset=0)
+    seq = running_sequence("crossing", prompt_len=5, offset=0)
     seq.output_token_ids.append(7)
     assert runner._cache is not None, "load_model() builds the cache"
     runner._cache.register(seq.request_id)
@@ -78,12 +69,12 @@ def test_a_mixed_step_answers_each_sequence_in_the_order_it_was_given(tiny_llama
     """Two passes inside, scattered back: a row out of place would hand a sequence another's logits."""
     mixed_runner, separate_runner = _runner(tiny_llama_dir), _runner(tiny_llama_dir)
     mixed = mixed_runner.execute(
-        [_sequence("prompt-a", 9, 30), _decoding(mixed_runner), _sequence("prompt-b", 6, 60)]
+        [running_sequence("prompt-a", 9, 30), _decoding(mixed_runner), running_sequence("prompt-b", 6, 60)]
     )
     separate = torch.cat([
-        separate_runner.execute([_sequence("prompt-a", 9, 30)]),
+        separate_runner.execute([running_sequence("prompt-a", 9, 30)]),
         separate_runner.execute([_decoding(separate_runner)]),
-        separate_runner.execute([_sequence("prompt-b", 6, 60)]),
+        separate_runner.execute([running_sequence("prompt-b", 6, 60)]),
     ])
 
     torch.testing.assert_close(mixed, separate, **_TOLERANCE)

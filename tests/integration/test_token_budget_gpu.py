@@ -2,8 +2,8 @@
 
 On CUDA the engine packs prefill and replays decode from captured graphs, so a
 chunk continuing a prompt goes through a path the CPU tests never reach:
-FlashAttention's varlen entry with fewer queries than keys, reading its prefix
-back out of the pool. Every test here runs the same prompts with and without a
+`paged_prefill`, reading its prefix where it lies in the pool, and — for a
+chunk of one token — the captured decode graph. Every test here runs the same prompts with and without a
 budget small enough to split them.
 """
 
@@ -20,6 +20,7 @@ from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
+from tests.integration.sequences import prompt_text
 
 pytestmark = pytest.mark.gpu
 
@@ -30,12 +31,8 @@ _SLOTS = 3
 _BUDGET = 8
 
 
-def _prompt(length: int, offset: int) -> str:
-    return " ".join(f"tok{2 + (offset + i) % 200}" for i in range(length))
-
-
 def _generate(model_dir: Path, max_num_batched_tokens: int | None) -> list[list[int]]:
-    prompts = [_prompt(length, 11 * i) for i, length in enumerate(_PROMPT_LENS)]
+    prompts = [prompt_text(length, 11 * i) for i, length in enumerate(_PROMPT_LENS)]
 
     async def _run():
         llm = AsyncLLM(

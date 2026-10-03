@@ -18,6 +18,7 @@ import torch
 from liteinfer import AsyncLLM, EngineOverloaded
 from liteinfer.sampling.params import SamplingParams
 from tests.integration import tiny_llama
+from tests.integration.sequences import prompt_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -506,13 +507,9 @@ _BUDGET = 5
 _BUDGET_BLOCK_SIZE = 4
 
 
-def _prompt(length: int, offset: int) -> str:
-    return " ".join(f"tok{2 + (offset + i) % 200}" for i in range(length))
-
-
 def _budgeted_generate(model_dir: Path, max_num_batched_tokens: int | None):
     """Greedy completions of `_BUDGET_PROMPT_LENS`, and the step log that produced them."""
-    prompts = [_prompt(length, 7 * i) for i, length in enumerate(_BUDGET_PROMPT_LENS)]
+    prompts = [prompt_text(length, 7 * i) for i, length in enumerate(_BUDGET_PROMPT_LENS)]
 
     async def _run_test():
         llm = AsyncLLM(

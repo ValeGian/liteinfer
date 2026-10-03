@@ -21,8 +21,7 @@ import torch
 
 from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
-from liteinfer.engine.sequence import Sequence, SequenceStatus
-from liteinfer.sampling.params import SamplingParams
+from tests.integration.sequences import running_sequence
 
 pytestmark = pytest.mark.gpu
 
@@ -51,27 +50,17 @@ def _runner(model_dir: Path, dtype: torch.dtype, capture: bool = True) -> Contin
     return runner
 
 
-def _sequence(request_id: str, prompt_len: int, offset: int) -> Sequence:
-    return Sequence(
-        request_id=request_id,
-        prompt="",
-        prompt_token_ids=[2 + (offset + i) % 250 for i in range(prompt_len)],
-        sampling_params=SamplingParams(temperature=0.0),
-        status=SequenceStatus.RUNNING,
-    )
-
-
 class _Schedule:
     """The same four sequences brought to the same mixed step, on one runner."""
 
     def __init__(self, model_dir: Path, dtype: torch.dtype, capture: bool = True) -> None:
         self.runner = _runner(model_dir, dtype, capture)
         self.decoding = [
-            _sequence(f"decoding-{i}", length, 40 * i)
+            running_sequence(f"decoding-{i}", length, 40 * i)
             for i, length in enumerate(_DECODING_PROMPT_LENS)
         ]
-        self.chunked = _sequence("chunked", _CHUNKED_PROMPT_LEN, 100)
-        self.fresh = _sequence("fresh", _FRESH_PROMPT_LEN, 160)
+        self.chunked = running_sequence("chunked", _CHUNKED_PROMPT_LEN, 100)
+        self.fresh = running_sequence("fresh", _FRESH_PROMPT_LEN, 160)
 
         self.runner.execute(self.decoding)
         self.runner.execute([self.chunked], [_FIRST_CHUNK])

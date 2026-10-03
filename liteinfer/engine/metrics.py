@@ -46,16 +46,6 @@ class StepMetrics:
     def throughput_tokens_per_s(self) -> float:
         return (self.input_tokens + self.new_tokens) / self.wall_time_s if self.wall_time_s > 0 else 0.0
 
-    @property
-    def decode_throughput_tokens_per_s(self) -> float:
-        return self.new_tokens / self.wall_time_s if self.wall_time_s > 0 else 0.0
-
-    @property
-    def prefill_throughput_tokens_per_s(self) -> float:
-        if self.phase != Phase.PREFILL:
-            return 0.0
-        return self.input_tokens / self.wall_time_s if self.wall_time_s > 0 else 0.0
-
 
 @dataclass
 class TimeBreakdown:
@@ -95,23 +85,16 @@ class TimeBreakdown:
 class EngineStats:
     """Cumulative stats + per-step log. Subscribe via `on_step`.
 
-    The `prefill` and `decode` totals cover steps of that phase only. A mixed
-    step's wall time belongs to both and cannot be split between them, so it
-    counts toward the overall totals and neither per-phase one. Every step that
-    admits beside running sequences is a mixed step — on a padded engine too,
-    whose two passes inside `execute` are recorded as one step — so the prefill
-    averages describe the steps that admitted into an empty batch.
-    `StepMetrics.prompt_tokens` is exact on every step, and is what to sum for
-    prompt work.
+    Totals are over every step and nothing is split by phase: a step that admits
+    beside running sequences computes prompt and sampled tokens in one forward,
+    and its wall time cannot be divided between them. Each step's
+    `prompt_tokens` and `new_tokens` are exact, and are what to sum for either
+    kind of work.
     """
 
     steps: list[StepMetrics] = field(default_factory=list)
     total_input_tokens: int = 0
     total_new_tokens: int = 0
-    total_prefill_input_tokens: int = 0
-    total_prefill_wall_s: float = 0.0
-    total_decode_new_tokens: int = 0
-    total_decode_wall_s: float = 0.0
     total_wall_s: float = 0.0
     num_requests_finished: int = 0
     time: TimeBreakdown = field(default_factory=TimeBreakdown)
@@ -122,12 +105,6 @@ class EngineStats:
         self.total_input_tokens += step.input_tokens
         self.total_new_tokens += step.new_tokens
         self.total_wall_s += step.wall_time_s
-        if step.phase == Phase.PREFILL:
-            self.total_prefill_input_tokens += step.input_tokens
-            self.total_prefill_wall_s += step.wall_time_s
-        elif step.phase == Phase.DECODE:
-            self.total_decode_new_tokens += step.new_tokens
-            self.total_decode_wall_s += step.wall_time_s
         for listener in self.listeners:
             listener(step)
 
@@ -137,18 +114,6 @@ class EngineStats:
     @property
     def avg_throughput_tokens_per_s(self) -> float:
         return (self.total_input_tokens + self.total_new_tokens) / self.total_wall_s if self.total_wall_s > 0 else 0.0
-
-    @property
-    def avg_decode_throughput_tokens_per_s(self) -> float:
-        if self.total_decode_wall_s <= 0:
-            return 0.0
-        return self.total_decode_new_tokens / self.total_decode_wall_s
-
-    @property
-    def avg_prefill_throughput_tokens_per_s(self) -> float:
-        if self.total_prefill_wall_s <= 0:
-            return 0.0
-        return self.total_prefill_input_tokens / self.total_prefill_wall_s
 
 
 class StepTimer:
