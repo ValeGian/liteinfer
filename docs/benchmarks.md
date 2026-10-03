@@ -1473,10 +1473,11 @@ back to back on one A40, 200 samples:
 
 | shape | two forwards | one forward | |
 |---|---:|---:|---:|
-| mixed ≤2048 / OSL 128 | 3,164.0 tok/s | 3,219.6 | 1.02x |
-| ISL 128 / OSL 256 | 3,181.9 tok/s | 3,216.0 | 1.01x |
+| mixed ≤2048 / OSL 128 | 3,164.0 tok/s | 3,223.6 | 1.02x |
+| ISL 128 / OSL 256 | 3,181.9 tok/s | 3,223.3 | 1.01x |
 
-Inside run-to-run variance, as the step counts predict: 12-18 saved decode passes
+The after rows were re-run from the committed revision, so the report marks the
+pair as different revisions, which they are. Inside run-to-run variance, as the step counts predict: 12-18 saved decode passes
 of ~7 ms against 8-16 s runs. No regression, and no measurable win either; the
 workload this serves — requests arriving while others decode, where most steps
 admit — is not one the harness can offer yet (§8.8). Latency mode never mixes,
