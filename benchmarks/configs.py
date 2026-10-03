@@ -198,6 +198,7 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
             "Prefill as one flat token run, where FlashAttention's varlen entry can run: "
             "CUDA, half precision, paged kernel. Measure it on a mixed-length dataset"
         ),
+        historical=True,
     ),
     # The baseline it improves on: the same engine with the batch padded, at the
     # context budget a mixed dataset needs (2,048 cap plus its output tokens).
@@ -243,6 +244,23 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         description=(
             "The same budget with a step that admits while others decode run as one "
             "forward. Packed engines only: CUDA, half precision, paged kernel"
+        ),
+        historical=True,
+    ),
+    # --- liteinfer: every packed pass through one kernel (§3.9, first half) ---
+    BenchmarkConfig(
+        name="liteinfer-paged-prefill",
+        engine="liteinfer",
+        max_num_seqs=32,
+        max_model_len=2176,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        enable_packed_prefill=True,
+        paged_decode_splits=None,
+        baseline="liteinfer-packed",
+        description=(
+            "Packed prefill read through paged_prefill even with nothing cached, instead "
+            "of FlashAttention's varlen entry. Measure it on a mixed-length dataset"
         ),
     ),
     # --- vLLM reference points, matched on batch size ---

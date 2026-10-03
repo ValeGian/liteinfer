@@ -164,7 +164,7 @@ def fp32_kernel_outputs(model_dir):
         try:
             outputs[kernel] = {
                 "one_prompt": _liteinfer_greedy(engine, _PARITY_PROMPTS[0], _PARITY_MAX_TOKENS),
-                "left_padded_batch": [o.token_ids for o in engine.generate(_PARITY_PROMPTS, params)],
+                "unequal_lengths_batch": [o.token_ids for o in engine.generate(_PARITY_PROMPTS, params)],
             }
         finally:
             engine.close()
@@ -187,8 +187,8 @@ def test_sdpa_matches_eager_on_one_prompt(fp32_kernel_outputs) -> None:
 def test_sdpa_matches_eager_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
     """Prompts of different lengths are where a mask-handling difference would show."""
     assert (
-        fp32_kernel_outputs["sdpa"]["left_padded_batch"]
-        == fp32_kernel_outputs["eager"]["left_padded_batch"]
+        fp32_kernel_outputs["sdpa"]["unequal_lengths_batch"]
+        == fp32_kernel_outputs["eager"]["unequal_lengths_batch"]
     )
 
 
@@ -203,11 +203,11 @@ def test_paged_matches_sdpa_on_one_prompt(fp32_kernel_outputs) -> None:
 @pytest.mark.gpu
 @pytest.mark.e2e
 @pytest.mark.slow
-def test_paged_matches_sdpa_on_a_left_padded_batch(fp32_kernel_outputs) -> None:
-    """The paged kernel builds no mask, so a batch of unequal lengths is its risk case."""
+def test_paged_matches_sdpa_on_a_batch_of_unequal_lengths(fp32_kernel_outputs) -> None:
+    """The paged kernel packs and builds no mask, so a batch of unequal lengths is its risk case."""
     assert (
-        fp32_kernel_outputs["paged"]["left_padded_batch"]
-        == fp32_kernel_outputs["sdpa"]["left_padded_batch"]
+        fp32_kernel_outputs["paged"]["unequal_lengths_batch"]
+        == fp32_kernel_outputs["sdpa"]["unequal_lengths_batch"]
     )
 
 

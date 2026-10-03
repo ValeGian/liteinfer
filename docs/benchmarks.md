@@ -1496,6 +1496,61 @@ The same session refreshed `liteinfer-packed` and its baseline
 1.65x at OSL 128 (1.66x when §3.6 landed) and 4.46x at OSL 16 (4.80x), the
 second a 1.5 s run measured beside two others on the same host.
 
+### Every packed pass reads through one kernel (§3.9, first half)
+
+A packed pass with nothing cached before it went to FlashAttention's varlen
+entry; every other packed pass already read through `paged_prefill`. Now every
+packed pass does, and varlen is gone. §2.10 had measured the kernel over whole
+prompts per layer (0.30x of flash at 32 x 18 tokens, within 4% up to 4,096), so
+the open question was the engine.
+
+**Throughput**, `liteinfer-packed` (master, varlen) against
+`liteinfer-paged-prefill` (branch), interleaved four times each on one A40 per
+shape, 200 samples, median output tok/s:
+
+| shape | varlen | paged_prefill | |
+|---|---:|---:|---:|
+| mixed ≤2048 / OSL 16 | 2,242.5 tok/s | 2,342.0 | 1.04x |
+| mixed ≤2048 / OSL 128 | 3,194.9 tok/s | 3,173.0 | 0.99x |
+| ISL 128 / OSL 256 | 3,257.0 tok/s | 3,258.6 | 1.00x |
+
+No loss, which was the gate. OSL 16 is the shape that would have shown one —
+prefill is most of that run — and its before runs spread 2,165-2,385 against
+2,329-2,358 after, so 1.04x is not a win either. The stored result for each shape
+is the rep nearest its median; the stored `liteinfer-packed` rows predate this
+session and agree with the fresh befores (2,174 and 3,192 tok/s on the mixed
+shapes).
+
+**Latency got worse at short prompts.** One request at a time, ISL 128 / OSL 256:
+
+| | varlen | paged_prefill | |
+|---|---:|---:|---:|
+| TTFT p50 | 15.36 ms | 16.38 | 1.07x |
+| TTFT p99 | 18.01 ms | 18.84 | 1.05x |
+| ITL p50 | 6.61 ms | 6.61 | 1.00x |
+
+Under the 1.1x line, but the stored older row (15.31 ms) agrees with the fresh
+before, so it is read as real. One whole-prompt step on one sequence, p50 of 300,
+two rounds each:
+
+| prompt | step, varlen | step, paged_prefill | payload build |
+|---|---:|---:|---:|
+| 18 tokens | 13.1-13.2 ms | 13.5-14.8 | 0.38 → 0.61-0.67 ms |
+| 128 tokens | 13.4-13.6 ms | 14.5-14.6 | 0.40 → 0.63-0.65 ms |
+| 512 tokens | 18.5-18.6 ms | 18.7 | 0.39-0.48 → 0.66 ms |
+
+A fixed host cost the GPU work hides by 512 tokens. About 0.25 ms is the payload,
+which for a whole prompt now also builds the read table and the context lengths
+— a second transfer of the same block table, which the left-aligned table in the
+rest of §3.9 makes one. The remainder is Triton's launch path against an aten op,
+16 times per step: filed as §3.10.
+
+**Parity.** fp32 on CUDA now packs, so an fp32 `paged` engine prefills through
+`paged_prefill` rather than `sdpa`; the e2e suite's greedy comparison of `paged`
+against `sdpa` over 20 tokens still matches exactly. The GPU parity references
+for chunked and mixed steps are pinned to fp32 `eager`, which no longer shares a
+kernel with the runs it judges.
+
 ### A stable run is not a comparable one
 
 Two latency rows from the §1.5 re-measurement came back saying `paged-attn` was
