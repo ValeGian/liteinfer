@@ -12,23 +12,35 @@ import torch
 
 
 class Phase(str, Enum):
+    """What a step's forward carried: prompt tokens, sampled tokens, or both."""
+
     PREFILL = "prefill"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 @dataclass(frozen=True)
 class StepMetrics:
-    """Snapshot of one engine step."""
+    """Snapshot of one engine step, which is one forward wherever prefill is packed."""
 
     step_idx: int
-    phase: Phase
 
     num_seqs: int
-    input_tokens: int  # Total tokens in the forward-pass input across the batch.
-    new_tokens: int    # Total tokens sampled (and appended to outputs) this step.
+    input_tokens: int   # Total tokens in the forward-pass input across the batch.
+    prompt_tokens: int  # How many of `input_tokens` are prompt; the rest are sampled tokens.
+    new_tokens: int     # Total tokens sampled (and appended to outputs) this step.
 
     wall_time_s: float
     peak_gpu_mem_bytes: int | None = None
+
+    @property
+    def phase(self) -> Phase:
+        """Read off the token counts rather than stored beside them, so the two cannot disagree."""
+        if self.prompt_tokens == 0:
+            return Phase.DECODE
+        if self.prompt_tokens == self.input_tokens:
+            return Phase.PREFILL
+        return Phase.MIXED
 
     @property
     def throughput_tokens_per_s(self) -> float:
@@ -81,7 +93,15 @@ class TimeBreakdown:
 
 @dataclass
 class EngineStats:
-    """Cumulative stats + per-step log. Subscribe via `on_step`."""
+    """Cumulative stats + per-step log. Subscribe via `on_step`.
+
+    The `prefill` and `decode` totals cover steps of that phase only. A mixed
+    step's wall time belongs to both and cannot be split between them, so it
+    counts toward the overall totals and neither per-phase one. On an engine
+    that packs, every admission beside running sequences is a mixed step, so
+    the prefill averages describe cold starts; `StepMetrics.prompt_tokens` is
+    exact on every step, and is what to sum for prompt work.
+    """
 
     steps: list[StepMetrics] = field(default_factory=list)
     total_input_tokens: int = 0

@@ -56,10 +56,10 @@ def _prefill_logits(runner: ContinuousModelRunner, logits_positions: slice | Non
     assert cache is not None, "load_model() builds the cache"
     for request_id in request_ids:
         cache.register(request_id)
-    chunks = runner._next_prompt_chunks(seqs, None)
+    chunks = runner._next_chunks(seqs, None)
     cache.advance(request_ids, prompt_lens)
 
-    input_ids, position_ids = runner._build_prefill_inputs(chunks)
+    input_ids, position_ids = runner._build_padded_inputs(chunks)
     build_prefill, _ = builders_for(type(runner.model).__name__)
     mask = build_prefill(prompt_lens, runner.config.dtype, runner.device)
     payload = cache.make_prefill_payload(request_ids, prompt_lens)

@@ -39,6 +39,12 @@ class BenchmarkConfig:
     same reason again: every row stored before §2.7 ran the unsplit grid, and a
     stored number has to keep describing the grid it was measured on. `None`
     hands the choice to the kernel, which is what the split rows measure."""
+    max_num_batched_tokens: int | None = None
+    """Tokens one step may compute. None by default for the same reason again:
+    every row stored before §1.3 ran unbudgeted. Unbudgeted, every request in a
+    throughput run arrives at once and asks for the same output length, so the
+    engine admits in waves and no step ever holds prompts beside decodes; a
+    budget staggers admission, which is what makes such steps happen."""
     baseline: str | None = None
     historical: bool = False
     """Measured before the code was removed. Kept so the report still shows the
@@ -204,6 +210,39 @@ _ENTRIES: tuple[BenchmarkConfig, ...] = (
         enable_cuda_graphs=True,
         paged_decode_splits=None,
         description="Captured decode with a padded prefill, at a mixed dataset's context budget",
+    ),
+    # --- liteinfer: one forward for a step that admits while others decode (§1.3) ---
+    BenchmarkConfig(
+        name="liteinfer-packed-budget",
+        engine="liteinfer",
+        max_num_seqs=32,
+        max_model_len=2176,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        enable_packed_prefill=True,
+        paged_decode_splits=None,
+        max_num_batched_tokens=2048,
+        description=(
+            "Packed prefill under a 2,048-token step budget; a step that admits while "
+            "others decode runs a prefill pass and a decode pass"
+        ),
+        historical=True,
+    ),
+    BenchmarkConfig(
+        name="liteinfer-onepass-budget",
+        engine="liteinfer",
+        max_num_seqs=32,
+        max_model_len=2176,
+        attn_implementation="paged",
+        enable_cuda_graphs=True,
+        enable_packed_prefill=True,
+        paged_decode_splits=None,
+        max_num_batched_tokens=2048,
+        baseline="liteinfer-packed-budget",
+        description=(
+            "The same budget with a step that admits while others decode run as one "
+            "forward. Packed engines only: CUDA, half precision, paged kernel"
+        ),
     ),
     # --- vLLM reference points, matched on batch size ---
     BenchmarkConfig(

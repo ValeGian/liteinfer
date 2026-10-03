@@ -107,7 +107,7 @@ One engine: continuous batching over a paged KV cache.
   decoding sequence, as much of a waiting prompt as fits (a longer one is
   chunked across steps), admitted into free slots. Finished sequences are
   evicted individually.
-- **`ContinuousModelRunner`** — runs one prefill or decode forward pass.
+- **`ContinuousModelRunner`** — runs one step's forward: prompts and sampled tokens together, in one pass wherever prefill is packed.
   `torch.compile`, CUDA graph capture and tensor parallelism plug in here.
 - **`ContinuousKVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
   `slot_mapping` and `slot_table` map logical token positions to physical slots,
@@ -122,7 +122,7 @@ One engine: continuous batching over a paged KV cache.
   engine picks between them from the device.
 
 Sampling is a separate stage so strategies (greedy, top-p, …) can be swapped
-without touching the engine. `stats` records a `StepMetrics` per forward pass.
+without touching the engine. `stats` records a `StepMetrics` per step.
 
 Each of these components is explained, with diagrams and interactive figures, in
 [Inside liteinfer](https://claude.ai/code/artifact/52a9e43f-c529-4a70-af07-d55dbffb1cbf).

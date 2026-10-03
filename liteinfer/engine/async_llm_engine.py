@@ -19,16 +19,11 @@ Step structure
     2. ``schedule`` — spend the step's token budget: one token per decoding
        sequence, the rest of a prompt (or as much of it as fits) per prefilling
        one, and admit waiting sequences into free slots with what is left.
-    3. ``prefill`` the sequences still computing their prompt (one forward pass).
-    4. ``decode`` the ones past it (a second forward pass).
-    5. Deliver ``StreamEvent`` objects to per-request queues, for every sequence
+    3. ``execute`` every scheduled sequence's tokens — prompt chunks and sampled
+       tokens alike — and sample the sequences whose prompt is now complete.
+    4. Deliver ``StreamEvent`` objects to per-request queues, for every sequence
        that sampled a token — a prompt chunk that stops short of the prompt's
        end has none yet.
-
-The two-pass step (prefill + decode as separate forward calls) keeps the
-implementation simple at the cost of an extra kernel launch when new sequences
-join a running decode batch. See roadmap §1.3 for the planned single-pass
-chunked-prefill upgrade that eliminates this overhead.
 """
 
 from __future__ import annotations
@@ -36,12 +31,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 
+from liteinfer.cache.block_pool import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
 from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
 from liteinfer.engine.continuous_scheduler import ContinuousScheduler
 from liteinfer.engine.metrics import (
     EngineStats,
-    Phase,
     StepMetrics,
     StepTimer,
     peak_gpu_memory_bytes,
@@ -75,17 +70,19 @@ _FINISH_REASONS: dict[SequenceStatus, str] = {
 }
 
 
-def _by_phase(seqs: list[Sequence]) -> list[tuple[Phase, list[Sequence]]]:
-    """Split a step's sequences into the two passes the runner still issues, skipping empty ones.
+def _rows_to_shed(seqs: list[Sequence]) -> list[Sequence]:
+    """What a step the pool could not hold gives up, least invested first.
 
-    The scheduler has no phases — it grants tokens — so this is the one place
-    they remain, and it is what §1.3 removes. A sequence still computing its
-    prompt goes to prefill even when its chunk is a single token; everything
-    else is decoding its last sampled token.
+    Sequences this step would have started come first: they hold nothing yet,
+    and the scheduler admits them after every running one, so they are the
+    blocks that tipped the pool over. Failing that, prompts still part-way
+    through; failing that, everything, because a step of decodes alone that
+    does not fit has nothing smaller to give up. Each refused step sheds one
+    tier, and the rest go on next step.
     """
-    prefill = [seq for seq in seqs if not seq.is_prompt_computed]
-    decode = [seq for seq in seqs if seq.is_prompt_computed]
-    return [(phase, group) for phase, group in ((Phase.PREFILL, prefill), (Phase.DECODE, decode)) if group]
+    newcomers = [seq for seq in seqs if seq.num_computed_tokens == 0]
+    prompts = [seq for seq in seqs if not seq.is_prompt_computed]
+    return newcomers or prompts or seqs
 
 
 class AsyncLLMEngine:
@@ -239,14 +236,17 @@ class AsyncLLMEngine:
         if sched.is_empty:
             return
 
-        sampled_seqs: list[Sequence] = []
-        for phase, seqs in _by_phase(sched.seqs):
-            num_tokens = [sched.num_scheduled_tokens[seq.request_id] for seq in seqs]
-            try:
-                sampled_seqs += self._forward(phase, seqs, num_tokens)
-            except Exception as error:
-                self._abort(seqs, error)  # the pass failed, so its sequences cannot continue
-                return
+        num_tokens = [sched.num_scheduled_tokens[seq.request_id] for seq in sched.seqs]
+        try:
+            sampled_seqs = self._forward(sched.seqs, num_tokens)
+        except BlockPoolExhaustedError as error:
+            # Raised before anything ran or was allocated, so the step can shed
+            # its newcomers and the rest go on next step.
+            self._abort(_rows_to_shed(sched.seqs), error)
+            return
+        except Exception as error:
+            self._abort(sched.seqs, error)  # the pass failed, so its sequences cannot continue
+            return
 
         with self._timed("deliver", sync=False):
             newly_finished = 0
@@ -294,24 +294,21 @@ class AsyncLLMEngine:
             seq.status = SequenceStatus.FINISHED_ABORTED
             self._fail(seq.request_id, error)
 
-    def _forward(self, phase: Phase, seqs: list[Sequence], num_tokens: list[int]) -> list[Sequence]:
-        """Run one forward pass over `num_tokens` per sequence, record it, and sample.
+    def _forward(self, seqs: list[Sequence], num_tokens: list[int]) -> list[Sequence]:
+        """Run one step's forward over `num_tokens` per sequence, record it, and sample.
 
         Returns the sequences that sampled a token, which is all of them except a
         prompt chunk that stops short of its prompt's end: it has no next token
         yet, only K/V for the next chunk to attend to.
 
-        Prefill and decode are separate passes, so a step that admits new
-        sequences records two — which is what makes the two-pass cost (§1.3)
-        visible in `stats`. `StepMetrics.wall_time_s` is the pass itself;
-        sampling is charged to `stats.time.sample` instead, so the two are not
-        conflated.
+        `StepMetrics.wall_time_s` is the forward itself; sampling is charged to
+        `stats.time.sample` instead, so the two are not conflated.
         """
+        prompt_tokens = sum(
+            count for seq, count in zip(seqs, num_tokens, strict=True) if not seq.is_prompt_computed
+        )
         with self._timed("forward") as timer:
-            if phase is Phase.PREFILL:
-                logits = self.model_runner.prefill(seqs, num_tokens)
-            else:
-                logits = self.model_runner.decode(seqs)
+            logits = self.model_runner.execute(seqs, num_tokens)
         for seq, count in zip(seqs, num_tokens, strict=True):
             seq.num_computed_tokens += count
 
@@ -325,18 +322,23 @@ class AsyncLLMEngine:
                 self._apply_sampled(sampling_seqs, sampled)
 
         if self.config.collect_stats:
-            self._record(phase, len(seqs), sum(num_tokens), len(sampling_seqs), timer.elapsed)
+            self._record(len(seqs), sum(num_tokens), prompt_tokens, len(sampling_seqs), timer.elapsed)
         return sampling_seqs
 
     def _record(
-        self, phase: Phase, num_seqs: int, input_tokens: int, new_tokens: int, wall_time_s: float
+        self,
+        num_seqs: int,
+        input_tokens: int,
+        prompt_tokens: int,
+        new_tokens: int,
+        wall_time_s: float,
     ) -> None:
         self.stats.record(
             StepMetrics(
                 step_idx=self._step_idx,
-                phase=phase,
                 num_seqs=num_seqs,
                 input_tokens=input_tokens,
+                prompt_tokens=prompt_tokens,
                 new_tokens=new_tokens,
                 wall_time_s=wall_time_s,
                 peak_gpu_mem_bytes=peak_gpu_memory_bytes(self.model_runner.device),

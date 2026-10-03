@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, slot_mapping, slot_table
+from liteinfer.cache.block_pool import BlockPool, packed_positions, slot_mapping, slot_table
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
 
 CPU = torch.device("cpu")
@@ -172,3 +172,14 @@ def test_single_token_windows_are_addressed_as_a_longer_window_would_address_the
     as_pairs = _mapping(block_tables, [2, 2], starts=[start - 1 for start in starts])[0, 1::2]
 
     assert _mapping(block_tables, [1, 1], starts=starts).tolist() == [as_pairs.tolist()]
+
+
+def test_packed_positions_count_from_where_each_window_starts() -> None:
+    positions = packed_positions([5, 0, 9], [3, 2, 1], CPU)
+
+    assert positions.tolist() == [[5, 6, 7, 0, 1, 9]]
+
+
+def test_packed_positions_of_single_tokens_are_their_starts() -> None:
+    """The decode-step shape, which skips the device path entirely."""
+    assert packed_positions([4, 11], [1, 1], CPU).tolist() == [[4, 11]]

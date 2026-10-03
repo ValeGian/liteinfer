@@ -1,3 +1,4 @@
+# pyright: reportPrivateImportUsage=false
 """Pre-allocated physical KV storage divided into fixed-size blocks.
 
 One block index services all transformer layers: allocating block B gives
@@ -175,19 +176,46 @@ def slot_mapping(
     starts = [0] * len(counts) if starts is None else starts
     if all(count == 1 for count in counts):
         return _single_token_slots(block_tables, starts, block_size, device)
-    total = sum(counts)
     blocks, count, offsets = _window_blocks(block_tables, starts, counts, block_size, device)
 
-    owner = torch.repeat_interleave(
-        torch.arange(len(counts), device=device), count, output_size=total
-    )
-    # Position within the owning window: a running index minus where that
-    # window starts in the run, which `cumsum` gives for every token at once.
-    run_starts = torch.cumsum(count, 0) - count
-    local = torch.arange(total, device=device) - run_starts[owner] + offsets[owner]
-
+    owner, local = _offsets_in_windows(count, offsets, sum(counts))
     slots = blocks[owner].gather(1, (local // block_size).unsqueeze(1)).squeeze(1)
     return (slots * block_size + local % block_size).unsqueeze(0)
+
+
+def packed_positions(
+    starts: Sequence[int], counts: Sequence[int], device: torch.device
+) -> torch.Tensor:
+    """Logical position of every token in a packed run, as ``[1, sum(counts)]``.
+
+    Sequence ``i`` contributes ``[starts[i], starts[i] + counts[i])``, the same
+    windows `slot_mapping` addresses. Built from the same two vectors on the
+    device, so the launch count is fixed whatever the batch holds. One
+    `arange` per sequence cost a launch each, which is the per-sequence host
+    work a decode step cannot afford. A batch of single tokens is just
+    ``starts``, and goes over in one transfer.
+    """
+    if all(count == 1 for count in counts):
+        return torch.tensor([list(starts)], dtype=torch.long, device=device)
+    window = torch.tensor([list(counts), list(starts)], dtype=torch.long, device=device)
+    _, positions = _offsets_in_windows(window[0], window[1], sum(counts))
+    return positions.unsqueeze(0)
+
+
+def _offsets_in_windows(
+    count: torch.Tensor, base: torch.Tensor, total: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """For each token of a packed run: which window owns it, and `base` plus its index there.
+
+    The index within the owning window is a running index minus where that window
+    starts in the run, which `cumsum` gives for every token at once. ``total`` is
+    ``count.sum()``, passed from the host so nothing here waits on the device.
+    """
+    owner = torch.repeat_interleave(
+        torch.arange(count.shape[0], device=count.device), count, output_size=total
+    )
+    run_starts = torch.cumsum(count, 0) - count
+    return owner, torch.arange(total, device=count.device) - run_starts[owner] + base[owner]
 
 
 def _single_token_slots(

@@ -51,6 +51,7 @@ class LiteInferAdapter:
             enable_cuda_graphs=self._config.enable_cuda_graphs,
             enable_packed_prefill=self._config.enable_packed_prefill,
             paged_decode_splits=self._config.paged_decode_splits,
+            max_num_batched_tokens=self._config.max_num_batched_tokens,
         )
         return self
 

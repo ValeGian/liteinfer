@@ -1,3 +1,4 @@
+# pyright: reportPrivateImportUsage=false
 """Per-sequence paged KV cache for continuous batching.
 
 Sequences are keyed by ``request_id`` and can register or deregister at any
@@ -20,8 +21,9 @@ made rather than on the first layer, so the forward contains no host-side work.
 Prefill payloads
     Store the tokens this pass computed. When no sequence had anything cached
     before the pass, those K/V are the whole context and are returned as they
-    are. When one did — a prompt chunked across steps — attention must also see
-    the prefix a previous pass wrote. The packed payload then hands the paged
+    are. When one did — a prompt chunked across steps, or a sampled token sharing
+    a packed pass with new prompts — attention must also see the prefix a
+    previous pass wrote. The packed payload then hands the paged
     kernel the pool and every token's address, as decode does; the padded one,
     serving the dense kernels, reads the context back out of the pool
     left-padded.
@@ -48,7 +50,7 @@ from typing import NamedTuple, Protocol
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool, slot_mapping, slot_table
+from liteinfer.cache.block_pool import BlockPool, BlockPoolExhaustedError, slot_mapping, slot_table
 from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
 
 
@@ -122,14 +124,34 @@ class ContinuousKVCache:
         Called before the payload is made, because the payload addresses each
         sequence's newest tokens and those must already have somewhere to live.
         Allocation is host-side bookkeeping, and it stays out of the forward.
+
+        All or nothing: when the pool cannot hold every sequence's tokens, it
+        raises `BlockPoolExhaustedError` before anything changes. A step carries
+        running sequences and newly admitted ones in one pass, so a caller can
+        then drop the newcomers and keep the rest rather than lose the whole step,
+        and a cache left half-advanced would account for tokens no pass wrote.
         """
         block_size = self._pool.block_size
-        for request_id, count in zip(request_ids, counts, strict=True):
+        windows = list(zip(request_ids, counts, strict=True))
+        needed = sum(self._blocks_short_of(request_id, count) for request_id, count in windows)
+        if needed > self._pool.num_free_blocks:
+            raise BlockPoolExhaustedError(
+                f"KV block pool exhausted: this step needs {needed} more blocks and "
+                f"{self._pool.num_free_blocks} of {self._pool.num_blocks} are free. "
+                "Increase num_gpu_blocks or reduce max_num_seqs / max_model_len."
+            )
+        for request_id, count in windows:
             total = self._token_counts[request_id] + count
             table = self._block_tables[request_id]
             while len(table) * block_size < total:
                 table.append(self._pool.allocate())
             self._token_counts[request_id] = total
+
+    def _blocks_short_of(self, request_id: str, count: int) -> int:
+        """Blocks a sequence must be given before it can hold `count` more tokens."""
+        total = self._token_counts[request_id] + count
+        held = len(self._block_tables[request_id])
+        return max(0, -(-total // self._pool.block_size) - held)
 
     # ------------------------------------------------------------------
     # Payload factory

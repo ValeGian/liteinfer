@@ -102,11 +102,11 @@ def _run(model_dir: Path, chunks: list[int], dtype: torch.dtype = torch.bfloat16
     runner, seq = _runner(model_dir, dtype), _sequence()
     assert runner._packs_prefill == (dtype == torch.bfloat16), "bf16 packs; fp32 is the padded reference"
     for count in chunks:
-        logits = runner.prefill([seq], [count])
+        logits = runner.execute([seq], [count])
     steps = [logits.float()]
     for step in range(_DECODE_STEPS):
         seq.output_token_ids.append(3 + step)
-        steps.append(runner.decode([seq]).float())
+        steps.append(runner.execute([seq]).float())
     return steps
 
 

@@ -60,7 +60,7 @@ def _prefill_in_chunks(runner: ContinuousModelRunner, seqs: list[Sequence]) -> t
     last_logits: dict[str, torch.Tensor] = {}
     for counts in _CHUNKS:
         batch = [(seq, count) for seq, count in zip(seqs, counts, strict=True) if count]
-        logits = runner.prefill([seq for seq, _ in batch], [count for _, count in batch])
+        logits = runner.execute([seq for seq, _ in batch], [count for _, count in batch])
         for row, (seq, _) in enumerate(batch):
             last_logits[seq.request_id] = logits[row]
     return torch.stack([last_logits[seq.request_id] for seq in seqs])
@@ -72,7 +72,7 @@ def _decode_logits(runner: ContinuousModelRunner, seqs: list[Sequence]) -> list[
     for step in range(_DECODE_STEPS):
         for seq in seqs:
             seq.output_token_ids.append(3 + step)
-        steps.append(runner.decode(seqs))
+        steps.append(runner.execute(seqs))
     return steps
 
 
@@ -82,7 +82,7 @@ def test_the_chunk_plan_covers_every_prompt_exactly() -> None:
 
 
 def test_a_prompt_prefilled_in_chunks_predicts_what_one_pass_predicts(tiny_llama_dir: Path):
-    whole = _runner(tiny_llama_dir).prefill(_sequences())
+    whole = _runner(tiny_llama_dir).execute(_sequences())
     chunked = _prefill_in_chunks(_runner(tiny_llama_dir), _sequences())
 
     torch.testing.assert_close(chunked, whole, **_TOLERANCE)
@@ -92,7 +92,7 @@ def test_a_prompt_prefilled_in_chunks_predicts_what_one_pass_predicts(tiny_llama
 def test_decoding_after_a_chunked_prefill_reads_the_same_history(tiny_llama_dir: Path, step: int):
     """Decode reads the pool the chunks wrote, so a misplaced token shows up here."""
     whole_runner, whole_seqs = _runner(tiny_llama_dir), _sequences()
-    whole_runner.prefill(whole_seqs)
+    whole_runner.execute(whole_seqs)
     chunked_runner, chunked_seqs = _runner(tiny_llama_dir), _sequences()
     _prefill_in_chunks(chunked_runner, chunked_seqs)
 

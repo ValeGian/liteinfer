@@ -1,11 +1,10 @@
+# pyright: reportPrivateImportUsage=false
 """ContinuousModelRunner — forward-pass execution for continuous batching.
 
-* ``prefill(seqs, num_tokens)`` — the next chunk of each prompt, which is the
-  whole prompt unless the scheduler's token budget split it.
-* ``decode(seqs)`` — single-token pass for sequences already past prefill.
-
-A step where new and running sequences coexist issues both, rather than one
-mixed pass, which would need a flash-attention-style kernel. See roadmap §1.3.
+``execute(seqs, num_tokens)`` runs one step: the next ``num_tokens`` of each
+sequence, which is a chunk of its prompt (the whole prompt unless the
+scheduler's token budget split it) or the one token it last sampled. A step
+holding both is one forward wherever prefill is packed.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from liteinfer.cache.block_pool import BlockPool
+from liteinfer.cache.block_pool import BlockPool, packed_positions
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, KVPayload, ProfilePayload
 from liteinfer.config import EngineConfig
 from liteinfer.engine.attention_mask import builders_for
@@ -74,8 +73,8 @@ def _last_token_indices(chunk_lens: list[int], device: torch.device) -> torch.Te
     return ends - 1
 
 
-class _PromptChunk(NamedTuple):
-    """The prompt tokens one sequence computes in a prefill pass, and where they start."""
+class _Chunk(NamedTuple):
+    """The tokens one sequence computes in a pass, and where they start."""
 
     token_ids: list[int]
     start: int
@@ -84,6 +83,26 @@ class _PromptChunk(NamedTuple):
     def end(self) -> int:
         """One past the chunk's last position, which is what the sequence holds afterwards."""
         return self.start + len(self.token_ids)
+
+
+def _tokens_at(seq: Sequence, start: int, count: int) -> list[int]:
+    """`count` of the sequence's tokens from `start`, read from the prompt or the output.
+
+    A chunk never crosses from one into the other: a sequence still computing
+    its prompt has sampled nothing, and one past its prompt owes exactly the
+    token it last sampled. So this slices one list rather than building
+    `all_token_ids()`, which would copy the whole sequence for every row of
+    every step.
+    """
+    prompt_len = len(seq.prompt_token_ids)
+    if start >= prompt_len:
+        return seq.output_token_ids[start - prompt_len : start - prompt_len + count]
+    if start + count > prompt_len:
+        raise ValueError(
+            f"{seq.request_id}: a chunk from position {start} of {count} tokens crosses "
+            f"the end of its {prompt_len}-token prompt"
+        )
+    return seq.prompt_token_ids[start : start + count]
 
 
 def _head_dim(hf_config: PretrainedConfig) -> int:
@@ -156,17 +175,26 @@ class ContinuousModelRunner:
         self._cache.deregister(seq.request_id)
 
     @torch.inference_mode()
-    def prefill(self, seqs: list[Sequence], num_tokens: list[int] | None = None) -> torch.Tensor:
-        """Prefill pass over the next `num_tokens` prompt tokens of each sequence.
+    def execute(self, seqs: list[Sequence], num_tokens: list[int] | None = None) -> torch.Tensor:
+        """One step's forward over the next `num_tokens` tokens of each sequence.
 
-        Each sequence continues where the cache left off, so a prompt chunked
-        across steps is this call made once per chunk; the first one registers
-        the sequence. `None` prefills the rest of every prompt, which for a
-        sequence the cache has not seen is all of it.
+        Each sequence continues where the cache left off, with the next chunk of
+        its prompt or with the token it last sampled; the first call for a
+        sequence registers it. `None` computes everything the cache does not hold
+        yet — a whole prompt for a new sequence, the sampled token for one past
+        its prompt.
 
-        Returns logits ``[B, vocab_size]`` at each chunk's last token. Only a
-        chunk that ends its prompt has a next token worth sampling, and the
-        caller is the one that knows which rows those are.
+        Returns logits ``[len(seqs), vocab_size]`` at each sequence's last token,
+        in `seqs` order. Only a sequence whose prompt is now complete has a next
+        token worth sampling, and the caller is the one that knows which rows
+        those are.
+
+        How the step runs follows from the tokens it holds, not from a phase.
+        One token per sequence is a decode batch, which the paged kernel serves
+        with split-K and a captured graph replays. Anything else is one packed
+        forward where the device can pack: prompts, chunks and sampled tokens
+        side by side, every row's K/V read where it lies. A padded engine splits
+        that step in two instead; see `_padded_forward`.
         """
         assert self._cache is not None and self.model is not None
 
@@ -174,14 +202,88 @@ class ContinuousModelRunner:
         for request_id in request_ids:
             if not self._cache.is_registered(request_id):
                 self._cache.register(request_id)
-        chunks = self._next_prompt_chunks(seqs, num_tokens)
-        counts = [len(chunk.token_ids) for chunk in chunks]
-        self._cache.advance(request_ids, counts)
+        chunks = self._next_chunks(seqs, num_tokens)
+        self._cache.advance(request_ids, [len(chunk.token_ids) for chunk in chunks])
 
+        if all(len(chunk.token_ids) == 1 for chunk in chunks):
+            return self._decode(request_ids, chunks)
         if self._packs_prefill:
-            return self._packed_prefill(request_ids, chunks)
+            return self._packed_forward(request_ids, chunks)
+        return self._padded_forward(request_ids, chunks)
 
-        input_ids, position_ids = self._build_prefill_inputs(chunks)
+    def _next_chunks(self, seqs: list[Sequence], num_tokens: list[int] | None) -> list[_Chunk]:
+        """The tokens each sequence computes next, starting after what is cached.
+
+        A chunk running past what its sequence holds is refused rather than
+        truncated: the cache would account for tokens the pass never wrote.
+        """
+        assert self._cache is not None
+        chunks = []
+        for i, seq in enumerate(seqs):
+            start = self._cache.seq_total_len(seq.request_id)
+            count = len(seq) - start if num_tokens is None else num_tokens[i]
+            if count < 1 or start + count > len(seq):
+                raise ValueError(
+                    f"{seq.request_id}: cannot compute {count} tokens from position {start} "
+                    f"of a {len(seq)}-token sequence"
+                )
+            chunks.append(_Chunk(_tokens_at(seq, start, count), start))
+        return chunks
+
+    def _packed_forward(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
+        """Every chunk as one flat run of tokens, with no padding.
+
+        A padded batch computes `len(seqs) * max(prompt_lens)` positions to keep
+        `sum(prompt_lens)` of them. On prompts whose lengths vary — which is what
+        real traffic is — that ratio reaches 13.4x at 32 sequences, and it is
+        entirely wasted work plus a mask to hide it afterwards.
+
+        A sampled token is a chunk of one, so a step that admits prompts while
+        others decode is still one pass. Its rows are then read out of the pool
+        by `paged_prefill`, which takes one query per row as readily as many.
+        """
+        assert self._cache is not None and self.model is not None
+
+        counts = [len(chunk.token_ids) for chunk in chunks]
+        input_ids, position_ids = self._build_packed_inputs(chunks)
+        payload = self._cache.make_packed_prefill_payload(request_ids, counts)
+        out = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=payload,
+            attention_mask=None,
+            logits_positions=_last_token_indices(counts, self.device),
+        )
+        return out.logits[0]
+
+    def _padded_forward(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
+        """A step on an engine that pads: single tokens as a decode pass, the rest padded.
+
+        Left-padding a sampled token to the longest prompt beside it would
+        compute that prompt's length in positions to keep one. So a step holding
+        both runs two passes, and the logits are put back in `chunks` order.
+        """
+        single: list[int] = []
+        many: list[int] = []
+        for i, chunk in enumerate(chunks):
+            (single if len(chunk.token_ids) == 1 else many).append(i)
+        if not single:
+            return self._padded_prefill(request_ids, chunks)
+        logits = torch.cat([
+            self._padded_prefill([request_ids[i] for i in many], [chunks[i] for i in many]),
+            self._decode([request_ids[i] for i in single], [chunks[i] for i in single]),
+        ])
+        rows_in_chunk_order = [0] * len(chunks)
+        for row, i in enumerate(many + single):
+            rows_in_chunk_order[i] = row
+        return logits[torch.tensor(rows_in_chunk_order, device=logits.device)]
+
+    def _padded_prefill(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
+        """Every chunk left-padded to the longest, with a mask hiding the padding."""
+        assert self._cache is not None and self.model is not None
+
+        counts = [len(chunk.token_ids) for chunk in chunks]
+        input_ids, position_ids = self._build_padded_inputs(chunks)
         build_prefill, _ = builders_for(type(self.model).__name__)
         attention_mask = build_prefill(
             counts, self.config.dtype, self.device, [chunk.end for chunk in chunks]
@@ -196,90 +298,22 @@ class ContinuousModelRunner:
         )
         return out.logits[:, -1, :]  # left-padded, so the last column is the last real token
 
-    def _next_prompt_chunks(
-        self, seqs: list[Sequence], num_tokens: list[int] | None
-    ) -> list[_PromptChunk]:
-        """The prompt tokens each sequence computes next, starting after what is cached.
+    def _decode(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
+        """One token per sequence, laid out one per batch row, which is what a capture holds.
 
-        A chunk that runs past its prompt is refused rather than truncated: the
-        cache would account for tokens the pass never wrote.
-        """
-        assert self._cache is not None
-        chunks = []
-        for i, seq in enumerate(seqs):
-            start = self._cache.seq_total_len(seq.request_id)
-            prompt_len = len(seq.prompt_token_ids)
-            count = prompt_len - start if num_tokens is None else num_tokens[i]
-            if count < 1 or start + count > prompt_len:
-                raise ValueError(
-                    f"{seq.request_id}: cannot prefill {count} tokens from position {start} "
-                    f"of a {prompt_len}-token prompt"
-                )
-            chunks.append(_PromptChunk(seq.prompt_token_ids[start : start + count], start))
-        return chunks
-
-    def _packed_prefill(self, request_ids: list[str], chunks: list[_PromptChunk]) -> torch.Tensor:
-        """Prefill the same chunks as one flat run of tokens, with no padding.
-
-        A padded batch computes `len(seqs) * max(prompt_lens)` positions to keep
-        `sum(prompt_lens)` of them. On prompts whose lengths vary — which is what
-        real traffic is — that ratio reaches 13.4x at 32 sequences, and it is
-        entirely wasted work plus a mask to hide it afterwards.
+        Every address is built here rather than on the first layer: the forward
+        pass must contain no host-side work. The write is one slot per sequence
+        — a packed run where every count is 1 — and only the read keeps the
+        right-aligned table, because `paged_decode` walks one row per sequence.
         """
         assert self._cache is not None and self.model is not None
 
-        counts = [len(chunk.token_ids) for chunk in chunks]
-        input_ids, position_ids = self._build_packed_prefill_inputs(chunks)
-        payload = self._cache.make_packed_prefill_payload(request_ids, counts)
-        out = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            past_key_values=payload,
-            attention_mask=None,
-            logits_positions=_last_token_indices(counts, self.device),
-        )
-        return out.logits[0]
-
-    def _build_packed_prefill_inputs(
-        self, chunks: list[_PromptChunk]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Every chunk end to end as `[1, total_tokens]`, positions restarting per chunk.
-
-        The leading axis is 1 because the batch is the token run itself; where
-        each sequence begins lives in `cu_seqlens` on the payload, and in the
-        positions, which count from where each chunk starts in its prompt so RoPE
-        sees every token where it sits.
-        """
-        token_ids = [token for chunk in chunks for token in chunk.token_ids]
-        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        position_ids = torch.cat(
-            [torch.arange(chunk.start, chunk.end, device=self.device) for chunk in chunks]
-        ).unsqueeze(0)
-        return input_ids, position_ids
-
-    @torch.inference_mode()
-    def decode(self, seqs: list[Sequence]) -> torch.Tensor:
-        """Decode pass for sequences already past their prefill step.
-
-        Feeds one token per sequence (the last sampled token) and returns
-        logits ``[B, vocab_size]`` for sampling the next token.
-        """
-        assert self._cache is not None and self.model is not None
-
-        request_ids = [s.request_id for s in seqs]
-        input_ids, position_ids = self._build_decode_inputs(seqs)
-
-        # Account for this step's token before addressing it, then build every
-        # address here rather than on the first layer: the forward pass must
-        # contain no host-side work. The write is one slot per sequence — a
-        # packed run where every count is 1 — and only the read keeps the
-        # right-aligned table, because `paged_decode` walks one row per sequence.
-        one_each = [1] * len(seqs)
-        self._cache.advance(request_ids, one_each)
-        write_slots = self._cache.slot_mapping_for(request_ids, one_each)
+        token_run, position_run = self._build_packed_inputs(chunks)
+        input_ids, position_ids = token_run.view(-1, 1), position_run.view(-1, 1)
+        write_slots = self._cache.slot_mapping_for(request_ids, [1] * len(request_ids))
         slots = self._cache.slot_table_for(request_ids)
 
-        if self._graphs is not None and self._graphs.has_capacity_for(len(seqs)):
+        if self._graphs is not None and self._graphs.has_capacity_for(len(request_ids)):
             return self._graphs.run(
                 input_ids,
                 position_ids,
@@ -352,7 +386,24 @@ class ContinuousModelRunner:
             self.device.index or 0,
         )
 
-    def _build_prefill_inputs(self, chunks: list[_PromptChunk]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_packed_inputs(self, chunks: list[_Chunk]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Every chunk end to end as `[1, total_tokens]`, positions restarting per chunk.
+
+        The leading axis is 1 because the batch is the token run itself; where
+        each sequence begins lives in `cu_seqlens` on the payload, and in the
+        positions, which count from where each chunk starts in its sequence so
+        RoPE sees every token where it sits.
+        """
+        token_ids = [token for chunk in chunks for token in chunk.token_ids]
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        position_ids = packed_positions(
+            [chunk.start for chunk in chunks],
+            [len(chunk.token_ids) for chunk in chunks],
+            self.device,
+        )
+        return input_ids, position_ids
+
+    def _build_padded_inputs(self, chunks: list[_Chunk]) -> tuple[torch.Tensor, torch.Tensor]:
         """Every chunk left-padded to the longest, positions counting from where it starts."""
         max_len = max(len(chunk.token_ids) for chunk in chunks)
         shape = (len(chunks), max_len)
@@ -364,17 +415,10 @@ class ContinuousModelRunner:
             position_ids[i, offset:] = torch.arange(chunk.start, chunk.end, device=self.device)
         return input_ids, position_ids
 
-    def _build_decode_inputs(self, seqs: list[Sequence]) -> tuple[torch.Tensor, torch.Tensor]:
-        last_tokens = [s.output_token_ids[-1] for s in seqs]
-        positions = [len(s.prompt_token_ids) + len(s.output_token_ids) - 1 for s in seqs]
-        input_ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
-        position_ids = torch.tensor(positions, dtype=torch.long, device=self.device).unsqueeze(1)
-        return input_ids, position_ids
-
     def _create_decode_graphs(self) -> DecodeGraphs | None:
         """Build the capture cache, or `None` where decode cannot be captured.
 
-        Built here rather than lazily in `decode` because the preconditions are
+        Built here rather than lazily on the first decode step because the preconditions are
         known once the model is loaded, and because a `None` is the whole signal
         the decode path needs — no flag to re-read per step.
         """

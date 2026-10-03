@@ -1,0 +1,28 @@
+{
+  "config": "liteinfer-packed-budget",
+  "engine": "liteinfer",
+  "description": "Packed prefill under a 2,048-token step budget; a step that admits while others decode runs a prefill pass and a decode pass",
+  "baseline": null,
+  "mode": "throughput",
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "max_num_seqs": 32,
+  "timestamp": "2026-10-03T13:15:37+00:00",
+  "revision": "4176676-dirty",
+  "dataset": {
+    "path": "/home/valerio/workspace/liteinfer/benchmarks/datasets/isl128_osl256_n200_unsloth_llama_3_2_1b_instruct.json",
+    "target_isl": 128,
+    "target_osl": 256,
+    "max_isl": null,
+    "num_samples": 200,
+    "sha256": "d97d71495aff03159e2deb9e9a6e918dc6698b03311bd955a7d6f8b306273cb8"
+  },
+  "summary": {
+    "output_tokens_per_s": 3181.9401768526322,
+    "requests_per_s": 12.429453815830595,
+    "wall_time_s": 16.090811628848314
+  },
+  "raw": {
+    "wall_time_s": 16.090811628848314,
+    "output_tokens": 51200
+  }
+}
