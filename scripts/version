@@ -20,6 +20,17 @@ if ! git diff --quiet || ! git diff --staged --quiet; then
     exit 1
 fi
 
+# A release cut from a stale master tags a commit that never lands on origin and
+# misses whatever merged since, so require local master to match origin exactly.
+git fetch --quiet origin master
+LOCAL_HEAD=$(git rev-parse HEAD)
+REMOTE_HEAD=$(git rev-parse origin/master)
+if [[ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]]; then
+    read -r AHEAD BEHIND < <(git rev-list --left-right --count HEAD...origin/master)
+    printf "error: master is %s ahead, %s behind origin/master; sync it first\n" "$AHEAD" "$BEHIND" >&2
+    exit 1
+fi
+
 CURRENT=$(python3 -c "
 import re, sys
 with open('pyproject.toml') as f:
@@ -72,4 +83,6 @@ git add pyproject.toml liteinfer/__init__.py
 git commit -m "chore: release v${NEW}"
 git tag "v${NEW}"
 
-printf "\nDone. Run:  git push origin master --tags\n"
+# Push only the new tag (`--tags` would also push stale local tags), and
+# atomically, so the tag never lands on origin without the commit it points at.
+printf "\nDone. Run:  git push --atomic origin master v%s\n" "$NEW"
