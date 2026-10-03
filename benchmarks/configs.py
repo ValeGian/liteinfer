@@ -19,10 +19,11 @@ class BenchmarkConfig:
 
     Rows stored before §3.9 ran a padded prefill, which the engine no longer has.
     The decode-side rows stay runnable: on the fixed-ISL datasets they were
-    measured on, padding computed nothing a packed pass does not, so a re-run
-    measures a packed prefill doing the same work. Rows whose claim rested on
-    padding — the dense engines, and the padded baseline on mixed lengths — are
-    `historical`.
+    measured on, padding computed nothing a packed pass does not, so a re-run's
+    throughput and ITL compare. Its TTFT does not: the prompt now goes through
+    `paged_prefill` rather than FlashAttention, measured at parity only up to
+    4,096 tokens (§2.10). Rows whose claim rested on padding — the dense engines,
+    and the padded baseline on mixed lengths — are `historical`.
     """
 
     name: str
