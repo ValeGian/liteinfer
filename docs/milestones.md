@@ -6,7 +6,7 @@ Achieved milestones, newest first. When a roadmap item lands: flip its `Status` 
 
 ## 03-10-2026 — §3.9, first half: every packed pass reads through one kernel
 
-- **PRs.** #NN
+- **PRs.** [#46](https://github.com/ValeGian/liteinfer/pull/46) (first half)
 - **What.** `make_packed_prefill_payload` always returns the paged payload (`_PackedPayload`), so a packed pass with nothing cached reads its own K/V back out of the pool through `paged_prefill`, as chunks and mixed steps already did. `varlen_attention`, `VarlenKV`, `_reject_packed`, `varlen_unsupported_reason` and `_PackedPrefillPayload` are gone. Packing's preconditions were FlashAttention's — CUDA and half precision — and are now only the paged kernel's, so fp32 on CUDA packs too. A paged payload reaching a dense kernel dies on a missing attribute rather than attending across prompt boundaries, which `_reject_packed` existed to prevent.
 - **Measured.** Throughput against varlen, interleaved on one A40 per shape: 1.04x on mixed ≤2048 / OSL 16, 0.99x on OSL 128, 1.00x on ISL 128 — no loss, which was the gate. Worse: single-request TTFT at ISL 128, 15.4 → 16.4 ms (1.07x), a fixed host cost of payload building (~0.25 ms, folded into the slot table's realignment in the rest of §3.9) and Triton's launch path (§3.10). ITL unchanged at 6.61 ms.
 - **Bookkeeping.** `liteinfer-paged-prefill` is the new row; `liteinfer-packed` and `liteinfer-onepass-budget` measured varlen on their whole-prompt passes and are `historical`. The fp32 GPU parity references are pinned to `eager`, since an fp32 `paged` engine now shares `paged_prefill` with the bf16 runs it judges. The dashboard printed `&middot;` escaped on every removed-config row; fixed.

@@ -394,7 +394,7 @@ listed.
 ### 3.9 Retire the padded path
 - **Status.** `in-progress` — the first half (every packed pass through `paged_prefill`) is measured and passed its gate; the padded path's deletion follows.
 - **Stage 7 of the packed-batch move**, which runs ~~§8.7~~ → ~~§3.6~~ → ~~§2.9~~ → ~~§1.7~~ → ~~§2.10~~ → ~~§1.3~~ (all six landed) → §3.9.
-- **PRs.** _none yet_
+- **PRs.** [#46](https://github.com/ValeGian/liteinfer/pull/46) (first half)
 - **Why.** Padding is currently undone by five mechanisms that exist only to
   cancel each other: left-padded inputs, a right-aligned slot table, a null block
   absorbing pad positions, two mask builders, and a two-pass route inside the
