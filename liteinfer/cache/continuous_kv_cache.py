@@ -13,20 +13,18 @@ Payload protocol
 The payload factories return lightweight objects that implement the same
 ``update(k, v, layer_idx)`` interface understood by the model's attention
 layers: store this pass's K/V, then hand back the K/V the attention kernel
-should read, as a ``DenseKV``, a ``VarlenKV`` or a ``PagedKV``. Payloads hold a
+should read, as a ``DenseKV`` or a ``PagedKV``. Payloads hold a
 reference to this cache; they are ephemeral (created per forward pass) and must
 not outlive the forward call. Every address is computed when the payload is
 made rather than on the first layer, so the forward contains no host-side work.
 
 Prefill payloads
-    Store the tokens this pass computed. When no sequence had anything cached
-    before the pass, those K/V are the whole context and are returned as they
-    are. When one did — a prompt chunked across steps, or a sampled token sharing
-    a packed pass with new prompts — attention must also see the prefix a
-    previous pass wrote. The packed payload then hands the paged
-    kernel the pool and every token's address, as decode does; the padded one,
-    serving the dense kernels, reads the context back out of the pool
-    left-padded.
+    Store the tokens this pass computed. The packed payload then hands the
+    paged kernel the pool and the address of every token each sequence holds,
+    as decode does — whether that is the chunk alone, for a whole prompt, or a
+    prefix earlier passes wrote as well. The padded one, serving the dense
+    kernels, returns the pass's own K/V when nothing was cached before it, and
+    otherwise reads the context back out of the pool left-padded.
 
 Decode payload
     Appends one new token per sequence, then gathers and left-pads the full
@@ -58,7 +56,7 @@ from liteinfer.cache.block_pool import (
     slot_mapping,
     slot_table,
 )
-from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
+from liteinfer.models.attention import DenseKV, PagedKV
 
 
 class KVPayload(Protocol):
@@ -71,7 +69,7 @@ class KVPayload(Protocol):
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
-    ) -> DenseKV | VarlenKV | PagedKV:
+    ) -> DenseKV | PagedKV:
         ...
 
 
@@ -86,7 +84,10 @@ class ProfilePayload:
 
     Correct only for prefill, where attention reads the K/V the pass just
     computed. A decode pass reads history it did not compute, so measuring one
-    means giving it a real cache.
+    means giving it a real cache. On a packing engine it is a padded stand-in for
+    a packed pass of the same tokens: that pass allocates nothing this one misses
+    (`paged_prefill` writes only its output), so the stand-in over-reserves rather
+    than under.
     """
 
     def update(
@@ -174,15 +175,15 @@ class ContinuousKVCache:
 
     def make_packed_prefill_payload(
         self, request_ids: list[str], counts: list[int]
-    ) -> _PackedPrefillPayload | _PackedChunkPayload:
+    ) -> _PackedPayload:
         """Return a payload for the same tokens laid end to end rather than left-padded.
 
         Same writes as `make_prefill_payload` — every token lands in the slot its
         block table names — addressed by a flat mapping instead of a padded,
         right-aligned table. What changes for the kernel is what comes back:
-        boundaries to respect rather than padding to mask. With nothing cached
-        before the pass those are the K/V it computed; with a prefix cached, the
-        pool itself and the addresses of every token each sequence holds.
+        boundaries to respect rather than padding to mask, and the pool itself
+        with the address of every token each sequence holds, cached before the
+        pass or not.
 
         The payload carries the run's `PackedAddresses`, whose positions and
         boundaries the caller also needs for RoPE and for picking each
@@ -195,9 +196,7 @@ class ContinuousKVCache:
             self._pool.block_size,
             self._pool.device,
         )
-        if not self._has_history(request_ids, counts):
-            return _PackedPrefillPayload(self, addresses, max(counts))
-        return _PackedChunkPayload(
+        return _PackedPayload(
             self,
             addresses,
             max(counts),
@@ -341,44 +340,18 @@ class _PrefillPayload:
         return DenseKV(*self._cache.gather(layer_idx, self._context_slots))
 
 
-class _PackedPrefillPayload:
-    """Prefill payload for whole prompts packed end to end, with no padding anywhere.
+class _PackedPayload:
+    """Payload for a pass packed end to end: whole prompts, chunks and sampled tokens.
 
-    The padded sibling above leans on two alignments cancelling: prompts arrive
-    left-padded, the slot table is right-aligned, so the two line up column for
-    column. Here there is nothing to cancel — token `i` of the flat run belongs
-    to whichever sequence `cu_seqlens` says, and writes go to the slot the
-    mapping names.
-    """
-
-    def __init__(
-        self, cache: ContinuousKVCache, addresses: PackedAddresses, max_query_len: int
-    ) -> None:
-        self._cache = cache
-        self.addresses = addresses
-        self._max_query_len = max_query_len
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> VarlenKV:
-        """Store every prompt token; return the K/V this pass computed, plus the boundaries."""
-        self._cache.scatter(layer_idx, self.addresses.slots, key_states, value_states)
-        return VarlenKV(
-            key_states, value_states, self.addresses.query_start_loc, self._max_query_len
-        )
-
-
-class _PackedChunkPayload:
-    """Prefill payload for a packed batch where some prompt continues one already cached.
-
-    The chunk's keys are not all in this pass: the prefix is in the pool, written
-    by earlier ones. So once the chunk is stored the payload hands the paged
-    kernel the pool and the addresses of everything each sequence holds, as it
-    does for a decode step — here with several queries per sequence, at the end
-    of its context, bounded by `query_start_loc`. Nothing is copied out of the pool.
+    Each sequence's queries are the newest tokens of its context, and that
+    context may reach back past this pass to a prefix earlier ones wrote. So once
+    the pass is stored the payload hands the paged kernel the pool and the
+    addresses of everything each sequence holds, as it does for a decode step —
+    here with any number of queries per sequence, bounded by `query_start_loc`.
+    A whole prompt is the case where the context is the chunk itself. Nothing is
+    copied out of the pool, and the padded sibling's two alignments have nothing
+    to cancel here: token `i` of the run belongs to whichever sequence
+    `query_start_loc` says, and writes go to the slot the mapping names.
     """
 
     def __init__(

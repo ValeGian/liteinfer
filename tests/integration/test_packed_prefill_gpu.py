@@ -83,34 +83,47 @@ def test_a_packed_prefill_fills_the_cache_the_decode_path_reads(tiny_llama_dir: 
 
 
 def test_packing_is_on_by_default_where_it_can_run(tiny_llama_dir: Path):
-    """Half precision on CUDA is where the flash kernel runs, so that is where packing happens."""
+    """The paged kernel reads a packed batch, so wherever it runs, packing happens."""
     runner = _runner(tiny_llama_dir, packed=None)  # type: ignore[arg-type]
 
     assert runner._packs_prefill
 
 
-def test_asking_to_pack_where_flash_cannot_run_is_refused(tiny_llama_dir: Path):
-    """Single precision has no flash kernel; a config that asks for one hears why."""
+def test_single_precision_packs_too(tiny_llama_dir: Path):
+    """The paged kernel computes in any float dtype, so packing asks nothing of the precision."""
     config = EngineConfig(
         model=str(tiny_llama_dir),
         device="cuda",
         dtype=torch.float32,  # type: ignore[arg-type]
         max_model_len=64,
         attn_implementation="paged",
+    )
+    runner = ContinuousModelRunner(config)
+    runner.load_model()
+
+    assert runner._packs_prefill
+
+
+def test_asking_a_dense_kernel_to_pack_is_refused(tiny_llama_dir: Path):
+    """`eager` reads a padded batch and a mask; a config that asks it to pack hears why not."""
+    config = EngineConfig(
+        model=str(tiny_llama_dir),
+        device="cuda",
+        dtype=torch.bfloat16,  # type: ignore[arg-type]
+        max_model_len=64,
+        attn_implementation="eager",
         enable_packed_prefill=True,
     )
 
-    with pytest.raises(ValueError, match="half precision"):
+    with pytest.raises(ValueError, match="padded batch"):
         ContinuousModelRunner(config).load_model()
 
 
 def test_a_dense_kernel_is_never_handed_a_packed_batch(tiny_llama_dir: Path):
     """`eager` and `sdpa` read a padded batch and a mask, so the engine keeps padding for them.
 
-    Without this the packed payload would reach `eager_attention`, whose input
-    type has the same field names — it would attend across prompt boundaries and
-    return tokens rather than an error, which is how the e2e parity suite caught
-    this in the first place.
+    The packed payload hands back the pool and its addresses, which the dense
+    kernels have no way to read.
     """
     config = EngineConfig(
         model=str(tiny_llama_dir),

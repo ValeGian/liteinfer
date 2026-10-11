@@ -191,7 +191,7 @@ optimisations that were built, measured and reverted.
 **Prompts of different lengths no longer pay for each other.** A prefill batch
 was padded to its longest prompt — on real prompt lengths, a batch of 32
 computed **13.4× the positions it kept**, and the mask that hid them also ruled
-FlashAttention out. Packed end to end with `cu_seqlens`, the same mixed-length
+FlashAttention out. Packed end to end, the same mixed-length
 workload runs **2,009 → 3,337 tok/s (1.7×)**, and **4.8×** when outputs are short
 enough that prefill is most of the work. On prompts that are all the same length
 it is 1.00×, which is why no number in this file moved until the benchmark

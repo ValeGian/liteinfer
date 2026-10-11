@@ -23,7 +23,7 @@ from liteinfer.engine.cuda_graphs import DecodeGraphs, graphs_are_enabled
 from liteinfer.engine.sequence import Sequence
 from liteinfer.hub import resolve_model_path
 from liteinfer.models import LAST_POSITION
-from liteinfer.models.attention import reads_paged_kv, varlen_unsupported_reason
+from liteinfer.models.attention import handles_packed_prefill, reads_paged_kv
 from liteinfer.models.loader import load_hf_model
 from liteinfer.models.paged_decode import choose_num_splits
 from liteinfer.tokenizer import Tokenizer
@@ -43,23 +43,23 @@ _CPU_NOMINAL_TOTAL_BYTES = 1 << 30
 _PROFILE_WARMUP_TOKENS = 16
 
 
-def _packing_is_enabled(
-    requested: bool | None, implementation: str, device: torch.device, dtype: torch.dtype
-) -> bool:
-    """Whether prefill packs its batch, from the config and what the device can run.
+def _packing_is_enabled(requested: bool | None, implementation: str) -> bool:
+    """Whether prefill packs its batch, from the config and the kernel that reads it.
 
-    `None` packs wherever the preconditions hold, which is the same rule
+    `None` packs wherever the kernel can, which is the same rule
     `enable_cuda_graphs` follows. An explicit `True` that cannot run raises
     rather than quietly padding: a benchmark row that asks for the packed path
     has to get it, or hear why it could not.
     """
     if requested is False:
         return False
-    reason = varlen_unsupported_reason(implementation, device, dtype)
-    if reason is None:
+    if handles_packed_prefill(implementation):
         return True
     if requested is True:
-        raise ValueError(f"enable_packed_prefill was asked for but {reason}")
+        raise ValueError(
+            f"enable_packed_prefill was asked for but the {implementation} kernel reads "
+            "a padded batch and a mask"
+        )
     return False
 
 
@@ -122,10 +122,7 @@ class ContinuousModelRunner:
         # batch can be read at all, and `load_hf_model` is where it is resolved.
         # Resolved once here rather than per step.
         self._packs_prefill = _packing_is_enabled(
-            self.config.enable_packed_prefill,
-            self.attn_implementation,
-            self.device,
-            self.config.dtype,
+            self.config.enable_packed_prefill, self.attn_implementation
         )
         # Measured before the pool exists, because the pool gets whatever the
         # forward turns out not to need.
@@ -515,7 +512,9 @@ class ContinuousModelRunner:
 
         The payload does not write to a cache, so this needs no pool: prefill
         attention reads the K/V the pass just computed, and `ProfilePayload` hands
-        exactly that back.
+        exactly that back. The pass is padded even on an engine that packs, which
+        over-reserves: padding computes every position a packed pass would, and
+        more.
 
         A forward that will not fit is not fatal. It means the configuration
         cannot serve its own worst case, which is worth saying rather than

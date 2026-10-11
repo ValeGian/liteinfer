@@ -17,11 +17,10 @@ engine can serve, not just how fast it serves it.
 Both of those want K and V as one contiguous tensor, which for a paged cache
 means copying every sequence's history out of the pool before every decode
 step. `paged` takes the slot table instead and reads the pool in place: every
-decode step, and every packed pass in which some row has history — a chunk that
-continues a cached prompt, or a step mixing sampled tokens with new prompts. A
-prefill with nothing cached before it goes to `varlen` (packed) or `sdpa`
-(padded), because its keys are the tensors the pass has just computed and
-nothing is paged yet. See `models/paged_decode.py`.
+decode step and every packed pass — whole prompts, chunks continuing a cached
+prompt, and sampled tokens beside new prompts alike, since the pass writes its
+own K/V to the pool before attention reads it. Only a padded prefill, which the
+dense kernels serve, still goes to `sdpa`. See `models/paged_decode.py`.
 
 Causality is not passed as a flag to the dense kernels: left-padded batches
 need an explicit mask anyway (see `engine/attention_mask.py`), and that mask
@@ -65,30 +64,12 @@ class PagedKV(NamedTuple):
     num_splits: int | None = None
     """How many programs share each sequence's key loop; None lets the kernel choose."""
     query_start_loc: torch.Tensor | None = None
-    """``[batch + 1]`` int32 prefix sums of each sequence's queries, for a pass that
-    brings more than one per sequence — a chunk continuing a cached prompt. None
-    is a decode step: one query per sequence, laid out one per batch row."""
+    """``[batch + 1]`` int32 prefix sums of each sequence's queries, for a packed
+    pass — whole prompts, chunks and sampled tokens laid end to end, any number
+    per row. None is a decode step: one query per sequence, laid out one per
+    batch row."""
     max_query_len: int = 1
     """Most queries any one sequence brings, which sizes the kernel's grid."""
-
-
-class VarlenKV(NamedTuple):
-    """K/V for a prefill batch packed end to end, with the sequence boundaries.
-
-    The dense payloads hand back `[batch, heads, keys, dim]` and rely on padding
-    plus a mask to keep one sequence's queries away from another's keys. A packed
-    batch has no padding to mask: it is one flat run of tokens, and `cu_seqlens`
-    is where each sequence starts.
-    """
-
-    keys: torch.Tensor
-    """`[1, kv_heads, total_tokens, head_dim]` — the prompt K this pass computed."""
-    values: torch.Tensor
-    """The matching V."""
-    cu_seqlens: torch.Tensor
-    """`[num_sequences + 1]` int32 prefix sums: sequence `i` owns `[cu[i], cu[i + 1])`."""
-    max_seqlen: int
-    """Longest sequence in the batch, which the kernel needs as a host-side int."""
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -101,22 +82,6 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(batch, num_kv_heads, n_rep, slen, head_dim)
         .reshape(batch, num_kv_heads * n_rep, slen, head_dim)
     )
-
-
-def _reject_packed(kv, kernel: str) -> None:
-    """A packed batch carries its boundaries in `cu_seqlens`, which only `varlen` reads.
-
-    `VarlenKV` holds fields named `keys` and `values` like the dense payloads do,
-    so a kernel that does not check would attend straight across the boundary
-    between two prompts — and, with no mask to stop it, across a prompt's own
-    future. That is a wrong answer rather than a crash, which is why it is
-    checked rather than assumed.
-    """
-    if isinstance(kv, VarlenKV):
-        raise ValueError(
-            f"{kernel} cannot read a packed batch: it has no way to honour cu_seqlens. "
-            "Packed prefill requires the paged implementation."
-        )
 
 
 def eager_attention(
@@ -132,7 +97,6 @@ def eager_attention(
     dot-product attention is a line here — and because it is the reference the
     fused kernels are checked against.
     """
-    _reject_packed(kv, "eager")
     key = _repeat_kv(kv.keys, num_kv_groups)
     value = _repeat_kv(kv.values, num_kv_groups)
 
@@ -158,7 +122,6 @@ def sdpa_attention(
     so left-padded batches land on the memory-efficient backend; both avoid the
     score matrix, which is the property that matters here.
     """
-    _reject_packed(kv, "sdpa")
     key = _repeat_kv(kv.keys, num_kv_groups)
     value = _repeat_kv(kv.values, num_kv_groups)
 
@@ -166,75 +129,24 @@ def sdpa_attention(
     return nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=scaling)
 
 
-def varlen_attention(
-    query: torch.Tensor,
-    kv: VarlenKV,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    num_kv_groups: int,
-) -> torch.Tensor:
-    """Attention over a packed prefill batch, through FlashAttention's varlen entry.
-
-    Two things fall away against `sdpa_attention` on the same batch. There is no
-    mask, because there is no padding to hide — `cu_seqlens` says where each
-    sequence ends, so `is_causal` is the whole rule. And there is no `_repeat_kv`:
-    flash reads one KV head per query group directly, where the dense path
-    materialises a copy of K and V per query head first.
-
-    The entry point is `torch.ops.aten._flash_attention_forward`, which is what
-    PyTorch's own SDPA calls once it has decided flash applies. Going through it
-    directly is what lets the call carry `cu_seqlens`; SDPA's public signature has
-    nowhere to put them. It is a private op, so `varlen_unsupported_reason` states
-    its preconditions and `tests/unit/test_varlen_attention.py` pins its answer
-    against `eager`.
-    """
-    if attention_mask is not None:
-        raise ValueError("packed attention takes no mask; cu_seqlens bounds each sequence")
-
-    # `[1, heads, tokens, dim]` is the layout the layers speak; flash wants the
-    # token axis first. The batch axis is 1 by construction — a packed batch is
-    # one run of tokens, and `cu_seqlens` carries what the batch axis used to.
-    packed_query = query.squeeze(0).transpose(0, 1)
-    packed_key = kv.keys.squeeze(0).transpose(0, 1)
-    packed_value = kv.values.squeeze(0).transpose(0, 1)
-
-    attn_output, *_ = torch.ops.aten._flash_attention_forward(
-        packed_query,
-        packed_key,
-        packed_value,
-        kv.cu_seqlens,
-        kv.cu_seqlens,
-        kv.max_seqlen,
-        kv.max_seqlen,
-        dropout_p=0.0,
-        is_causal=True,
-        return_debug_mask=False,
-        scale=scaling,
-    )
-    return attn_output.transpose(0, 1).unsqueeze(0)
-
-
 def paged_attention(
     query: torch.Tensor,
-    kv: DenseKV | VarlenKV | PagedKV,
+    kv: DenseKV | PagedKV,
     attention_mask: torch.Tensor | None,
     scaling: float,
     num_kv_groups: int,
 ) -> torch.Tensor:
-    """Attend straight out of the KV pool; a whole-prompt prefill through `sdpa` or `varlen`.
+    """Attend straight out of the KV pool; a padded prefill through `sdpa`.
 
     Which happens is decided by what the cache handed over, not by a flag. A
-    prefill with nothing cached before it returns the K and V the pass just
-    computed — packed if the batch was packed, padded if it was padded — and
-    there is nothing paged about them yet. Everything else reads the pool: a
-    decode step one query per sequence, and a packed pass with history any
-    number per row — chunks, sampled tokens and whole prompts side by side —
-    through the same kernel.
+    padded prefill returns the K and V the pass just computed, left-padded, and
+    those want a mask rather than addresses. Everything else reads the pool: a
+    decode step one query per sequence, and a packed pass any number per row —
+    whole prompts, chunks and sampled tokens side by side — through the same
+    kernel.
     """
     if isinstance(kv, DenseKV):
         return sdpa_attention(query, kv, attention_mask, scaling, num_kv_groups)
-    if isinstance(kv, VarlenKV):
-        return varlen_attention(query, kv, attention_mask, scaling, num_kv_groups)
     if attention_mask is not None:
         raise ValueError("paged attention takes no mask; context_lens bounds each sequence")
     if kv.query_start_loc is None:
@@ -326,26 +238,6 @@ def unsupported_reason(name: str, device: torch.device) -> str | None:
     return None
 
 
-def varlen_unsupported_reason(
-    implementation: str, device: torch.device, dtype: torch.dtype
-) -> str | None:
-    """Why a prefill batch cannot be packed here, or `None` if it can.
-
-    Two of the three preconditions belong to the flash kernel underneath rather
-    than to packing: it is CUDA-only, and it computes in half precision. The
-    third is the engine's own: a packed batch may only be handed to a kernel
-    that reads `cu_seqlens`. Where any of them fails the engine pads the batch
-    and masks it, as it did everywhere before.
-    """
-    if not handles_packed_prefill(implementation):
-        return f"the {implementation} kernel reads a padded batch and a mask"
-    if device.type != "cuda":
-        return f"FlashAttention is CUDA-only and the device is {device}"
-    if dtype not in (torch.float16, torch.bfloat16):
-        return f"FlashAttention computes in half precision and the dtype is {dtype}"
-    return None
-
-
 def select_implementation(requested: str | None, device: torch.device) -> str:
     """Resolve a kernel name, choosing one when the caller did not.
 
@@ -367,11 +259,11 @@ def select_implementation(requested: str | None, device: torch.device) -> str:
 
 
 def handles_packed_prefill(name: str) -> bool:
-    """Whether this kernel can attend to a prefill batch that carries `cu_seqlens`.
+    """Whether this kernel can attend to a batch packed end to end, bounded by `query_start_loc`.
 
-    Only the paged implementation dispatches on the payload type, so only it
-    reaches `varlen_attention`. The dense kernels want a padded batch and a mask,
-    which is what the engine keeps building wherever this is False.
+    Only the paged implementation reads the pool through per-sequence
+    addresses. The dense kernels want a padded batch and a mask, which is what
+    the engine keeps building wherever this is False.
     """
     return name == PAGED_IMPLEMENTATION
 

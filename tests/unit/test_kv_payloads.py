@@ -1,3 +1,4 @@
+# pyright: reportPrivateImportUsage=false
 """What each payload writes to the pool and hands the attention kernel.
 
 The two decode payloads write the same token to the same slot and differ only
@@ -16,7 +17,7 @@ import torch
 
 from liteinfer.cache.block_pool import BlockPool
 from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
-from liteinfer.models.attention import DenseKV, PagedKV, VarlenKV
+from liteinfer.models.attention import DenseKV, PagedKV
 
 _BLOCK_SIZE = 4
 _NUM_KV_HEADS = 2
@@ -147,9 +148,9 @@ def test_gathering_payload_returns_a_dense_kv():
 def test_the_profile_payload_hands_back_what_it_was_given():
     """It measures a forward's memory, so it must not need a pool to write into.
 
-    Prefill attention reads the K/V the pass just computed, which is what the real
-    prefill payload returns after storing it — so returning them untouched gives a
-    forward with the same shapes and the same activation peak.
+    Padded prefill attention reads the K/V the pass just computed, which is what
+    the padded prefill payload returns after storing it — so returning them
+    untouched gives a forward with the same shapes and the same activation peak.
     """
     from liteinfer.cache.continuous_kv_cache import ProfilePayload
 
@@ -211,33 +212,55 @@ def _left_padded(keys: torch.Tensor, lengths: list[int]) -> torch.Tensor:
 
 def _packed_whole_prompts(
     cache: ContinuousKVCache, request_ids: list[str], lengths: list[int], keys, values
-) -> VarlenKV:
-    """What a packed pass over whole prompts hands attention: this pass's K/V and boundaries."""
+) -> PagedKV:
+    """What a packed pass over whole prompts hands attention: the pool, addresses and boundaries."""
     kv = cache.make_packed_prefill_payload(request_ids, lengths).update(keys, values, _LAYER)
-    assert isinstance(kv, VarlenKV), "nothing was cached before the pass"
+    assert isinstance(kv, PagedKV), "a packed pass reads the pool"
     return kv
 
 
 def test_packed_prefill_payload_reports_where_each_prompt_starts():
-    """`cu_seqlens` marks where each prompt starts; a padded pass needs padding and a mask for that."""
+    """`query_start_loc` marks where each prompt starts; a padded pass needs padding and a mask for that."""
     cache = _cache()
     request_ids, lengths = ["a", "b"], [2, 5]
     _registered(cache, request_ids, lengths)
 
     kv = _packed_whole_prompts(cache, request_ids, lengths, *_prompt_kv(lengths))
 
-    assert kv.cu_seqlens.tolist() == [0, 2, 7]
+    assert kv.query_start_loc is not None and kv.query_start_loc.tolist() == [0, 2, 7]
 
 
-def test_a_whole_prompt_attends_to_the_keys_its_own_pass_computed():
-    """Nothing was cached before the pass, so reading the pool back would be a wasted copy."""
+def test_a_whole_prompt_attends_to_exactly_the_tokens_its_own_pass_wrote():
+    """Nothing was cached before the pass, so each prompt's context is the prompt itself."""
     cache = _cache()
-    _registered(cache, ["a"], [3])
-    keys, values = _prompt_kv([3])
+    request_ids, lengths = ["a", "b"], [2, 5]
+    _registered(cache, request_ids, lengths)
 
-    kv = _packed_whole_prompts(cache, ["a"], [3], keys, values)
+    kv = _packed_whole_prompts(cache, request_ids, lengths, *_prompt_kv(lengths))
 
-    assert kv.keys is keys
+    assert kv.context_lens.tolist() == lengths
+
+
+def test_a_whole_prompt_addresses_the_keys_its_own_pass_wrote():
+    """Read through its addresses, the pool holds exactly the K/V the pass computed."""
+    cache = _cache()
+    request_ids, lengths = ["a", "b"], [2, 5]
+    _registered(cache, request_ids, lengths)
+    keys, values = _prompt_kv(lengths)
+
+    kv = _packed_whole_prompts(cache, request_ids, lengths, keys, values)
+
+    torch.testing.assert_close(_read_back_keys(kv, lengths), keys)
+
+
+def _read_back_keys(kv: PagedKV, lengths: list[int]) -> torch.Tensor:
+    """Every key a `PagedKV` addresses, packed `[1, H, sum, D]` as the pass computed them.
+
+    The slot table is right-aligned, so each sequence's context is the last
+    `length` columns of its row.
+    """
+    rows = [row[-length:] for row, length in zip(kv.slot_table, lengths, strict=True)]
+    return kv.key_pool[torch.cat(rows)].permute(1, 0, 2).unsqueeze(0)
 
 
 def test_packed_prefill_payload_writes_the_same_pool_as_the_padded_one():
@@ -259,13 +282,13 @@ def test_packed_prefill_payload_writes_the_same_pool_as_the_padded_one():
     )
 
 
-def test_packed_prefill_payload_returns_a_varlen_kv():
+def test_packed_prefill_payload_returns_a_paged_kv_for_whole_prompts():
     """The returned type is what selects the kernel, so it is part of the contract."""
     cache = _cache()
     _registered(cache, ["a"], [3])
     payload = cache.make_packed_prefill_payload(["a"], [3])
 
-    assert isinstance(payload.update(*_prompt_kv([3]), _LAYER), VarlenKV)
+    assert isinstance(payload.update(*_prompt_kv([3]), _LAYER), PagedKV)
 
 
 # --- a prompt chunked across passes ------------------------------------------
@@ -328,9 +351,7 @@ def test_a_continuing_chunk_addresses_the_prefix_an_earlier_pass_wrote():
     """Read through its addresses, the pool holds the whole prompt, as if computed in one pass."""
     kv = _chunked_packed(_cache())
 
-    rows = [row[-length:] for row, length in zip(kv.slot_table, _CHUNKED_LENGTHS, strict=True)]
-    read_back = kv.key_pool[torch.cat(rows)].permute(1, 0, 2).unsqueeze(0)
-    torch.testing.assert_close(read_back, _prompt_kv(_CHUNKED_LENGTHS)[0])
+    torch.testing.assert_close(_read_back_keys(kv, _CHUNKED_LENGTHS), _prompt_kv(_CHUNKED_LENGTHS)[0])
 
 
 def test_a_padded_continuing_chunk_reads_back_the_whole_prompt_left_padded():

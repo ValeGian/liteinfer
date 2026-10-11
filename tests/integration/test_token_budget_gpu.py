@@ -1,3 +1,4 @@
+# pyright: reportPrivateImportUsage=false
 """A token budget must not change what a CUDA engine generates.
 
 On CUDA the engine packs prefill and replays decode from captured graphs, so a
@@ -77,10 +78,18 @@ _DECODE_STEPS = 3
 _DRIFT_ALLOWANCE = 2.0
 
 
-def _runner(model_dir: Path, dtype: torch.dtype = torch.bfloat16) -> ContinuousModelRunner:
+def _runner(model_dir: Path, is_reference: bool) -> ContinuousModelRunner:
+    """The bf16 engine under test, or the reference: fp32 through `eager`.
+
+    The reference names its kernel because the default one packs in fp32 too,
+    and would then share `paged_prefill` with the runs it is meant to judge.
+    """
+    kernel = {"dtype": torch.float32, "attn_implementation": "eager"} if is_reference else {
+        "dtype": torch.bfloat16
+    }
     config = EngineConfig(
-        model=str(model_dir), device="cuda", dtype=dtype,  # type: ignore[arg-type]
-        max_num_seqs=1, max_model_len=64,
+        model=str(model_dir), device="cuda", max_num_seqs=1, max_model_len=64,
+        **kernel,  # type: ignore[arg-type]
     )
     runner = ContinuousModelRunner(config)
     runner.load_model()
@@ -97,10 +106,10 @@ def _sequence() -> Sequence:
     )
 
 
-def _run(model_dir: Path, chunks: list[int], dtype: torch.dtype = torch.bfloat16) -> list[torch.Tensor]:
-    """Logits at the prompt's end, then after each captured decode step over fixed tokens."""
-    runner, seq = _runner(model_dir, dtype), _sequence()
-    assert runner._packs_prefill == (dtype == torch.bfloat16), "bf16 packs; fp32 is the padded reference"
+def _run(model_dir: Path, chunks: list[int], is_reference: bool = False) -> list[torch.Tensor]:
+    """Logits at the prompt's end, then after each decode step over fixed tokens."""
+    runner, seq = _runner(model_dir, is_reference), _sequence()
+    assert runner._packs_prefill != is_reference, "the engine packs; the reference pads"
     for count in chunks:
         logits = runner.execute([seq], [count])
     steps = [logits.float()]
@@ -118,12 +127,12 @@ def _drift(run: list[torch.Tensor], reference: list[torch.Tensor], step: int) ->
 def runs(tiny_llama_dir: Path) -> dict[str, list[torch.Tensor]]:
     """The single-precision reference, and the bf16 engine with the prompt whole and chunked.
 
-    In bf16 on CUDA the chunked run's later chunks go through the paged kernel
-    and the whole prompt through FlashAttention; in fp32 packing is off and the
-    prompt goes through `sdpa`, which is what makes it a reference for both.
+    Both bf16 runs read every chunk through `paged_prefill`; the reference pads
+    the prompt and writes every score out through `eager`, which is what makes it
+    a reference for both.
     """
     return {
-        "reference": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN], torch.float32),
+        "reference": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN], is_reference=True),
         "whole": _run(tiny_llama_dir, [_CHUNKED_PROMPT_LEN]),
         "chunked": _run(tiny_llama_dir, _CHUNKS),
         "chunked_to_one": _run(tiny_llama_dir, _CHUNKS_ENDING_ON_ONE),

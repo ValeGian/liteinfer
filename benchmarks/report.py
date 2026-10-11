@@ -453,16 +453,16 @@ def _table(members: list[dict], mode: str) -> str:
             value = result["summary"][key]
             css = ' class="best"' if value == best[key] else ""
             cells.append(f"<td{css}>{value:,.1f}</td>")
-        lineage = f"improves on {row.base}" if row.base else "reference point"
+        lineage = [f"improves on {row.base}" if row.base else "reference point"]
         if _is_historical(row):
-            lineage += " &middot; removed from the codebase"
+            lineage.append("removed from the codebase")
         if _spans_two_engines(row):
-            lineage += " &middot; which is no longer runnable, so this delta spans two engines"
+            lineage.append("which is no longer runnable, so this delta spans two engines")
         body.append(
             f'<tr class="{"ref" if result["engine"] == "vllm" else ""}">'
             f'<td class="name"><span class="label">{html.escape(result["config"])}</span>'
             f'<span class="desc">{html.escape(result["description"])} '
-            f"&middot; {html.escape(lineage)}</span>"
+            f"&middot; {' &middot; '.join(html.escape(part) for part in lineage)}</span>"
             f'<span class="bar" style="width:{max(fraction, 0.012) * 100:.1f}%"></span></td>'
             + "".join(cells)
             + _delta(row.vs_base, row.unsound.get("base"))
