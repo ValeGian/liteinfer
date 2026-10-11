@@ -10,18 +10,18 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 
 LAYERS, KV_HEADS, HEAD_DIM = 2, 2, 8
 BLOCK_SIZE = 16
 
 
-def _runner(**kwargs) -> ContinuousModelRunner:
+def _runner(**kwargs) -> ModelRunner:
     defaults = dict(model="unused", device="cpu", dtype=torch.float32, block_size=BLOCK_SIZE)
-    return ContinuousModelRunner(EngineConfig(**{**defaults, **kwargs}))
+    return ModelRunner(EngineConfig(**{**defaults, **kwargs}))
 
 
-def _blocks(runner: ContinuousModelRunner) -> int:
+def _blocks(runner: ModelRunner) -> int:
     return runner._compute_num_blocks(LAYERS, KV_HEADS, HEAD_DIM)
 
 

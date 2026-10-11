@@ -18,7 +18,7 @@ import torch
 
 from liteinfer import AsyncLLM
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
 from tests.integration.sequences import prompt_text
@@ -77,7 +77,7 @@ _DECODE_STEPS = 3
 _DRIFT_ALLOWANCE = 2.0
 
 
-def _runner(model_dir: Path, is_reference: bool) -> ContinuousModelRunner:
+def _runner(model_dir: Path, is_reference: bool) -> ModelRunner:
     """The bf16 engine under test, or the reference: fp32 through `eager`.
 
     The reference names its kernel because the default one packs in fp32 too,
@@ -90,7 +90,7 @@ def _runner(model_dir: Path, is_reference: bool) -> ContinuousModelRunner:
         model=str(model_dir), device="cuda", max_num_seqs=1, max_model_len=64,
         **kernel,  # type: ignore[arg-type]
     )
-    runner = ContinuousModelRunner(config)
+    runner = ModelRunner(config)
     runner.load_model()
     return runner
 

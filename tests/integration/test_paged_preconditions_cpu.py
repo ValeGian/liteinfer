@@ -14,10 +14,10 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 
 
-def _runner(model_dir: Path, **overrides) -> ContinuousModelRunner:
+def _runner(model_dir: Path, **overrides) -> ModelRunner:
     config = EngineConfig(
         model=str(model_dir),
         device="cpu",
@@ -26,7 +26,7 @@ def _runner(model_dir: Path, **overrides) -> ContinuousModelRunner:
         max_model_len=64,
         **overrides,
     )
-    return ContinuousModelRunner(config)
+    return ModelRunner(config)
 
 
 def test_the_default_falls_back_to_a_kernel_this_device_can_run(tiny_llama_dir: Path) -> None:

@@ -6,7 +6,7 @@ from __future__ import annotations
 import torch
 
 from liteinfer.cache.block_pool import BlockPool, newest_slots, packed_addresses, slot_table
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
+from liteinfer.cache.kv_cache import KVCache
 
 CPU = torch.device("cpu")
 BLOCK_SIZE = 4
@@ -16,12 +16,12 @@ def _table(block_tables, totals):
     return slot_table(block_tables, totals, BLOCK_SIZE, CPU)
 
 
-def _cache_with(totals: list[int]) -> ContinuousKVCache:
+def _cache_with(totals: list[int]) -> KVCache:
     pool = BlockPool(
         num_blocks=16, block_size=BLOCK_SIZE, num_layers=1, num_kv_heads=1, head_dim=2,
         dtype=torch.float32, device=CPU,
     )
-    cache = ContinuousKVCache(pool)
+    cache = KVCache(pool)
     for i, total in enumerate(totals):
         cache.reserve([f"r{i}"], [total])
     return cache
@@ -65,7 +65,7 @@ def test_reserve_allocates_a_block_only_when_the_last_one_fills() -> None:
         num_blocks=8, block_size=4, num_layers=1, num_kv_heads=1, head_dim=2,
         dtype=torch.float32, device=CPU,
     )
-    cache = ContinuousKVCache(pool)
+    cache = KVCache(pool)
     cache.reserve(["r0"], [4])                   # one block, exactly full
     blocks_after_prompt = len(cache._block_tables["r0"])
 

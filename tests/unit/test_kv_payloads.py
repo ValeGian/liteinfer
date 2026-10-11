@@ -13,9 +13,9 @@ from __future__ import annotations
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import (
-    ContinuousKVCache,
+from liteinfer.cache.kv_cache import (
     DecodeProfilePayload,
+    KVCache,
     ProfilePayload,
 )
 from liteinfer.models.attention import PagedKV
@@ -26,8 +26,8 @@ _HEAD_DIM = 8
 _LAYER = 0
 
 
-def _cache() -> ContinuousKVCache:
-    return ContinuousKVCache(
+def _cache() -> KVCache:
+    return KVCache(
         BlockPool(
             num_blocks=8,
             block_size=_BLOCK_SIZE,
@@ -74,7 +74,7 @@ _MID_DECODE_PROMPT_LENS = [2, 6]
 _MID_DECODE_TOTALS = [length + 1 for length in _MID_DECODE_PROMPT_LENS]
 
 
-def _two_sequences_mid_decode() -> tuple[ContinuousKVCache, list[str]]:
+def _two_sequences_mid_decode() -> tuple[KVCache, list[str]]:
     """A cache holding two prefilled sequences of different lengths, with room for one more token each."""
     cache = _cache()
     request_ids, prompt_lens = ["short", "long"], _MID_DECODE_PROMPT_LENS
@@ -85,7 +85,7 @@ def _two_sequences_mid_decode() -> tuple[ContinuousKVCache, list[str]]:
     return cache, request_ids
 
 
-def _decode_payload(cache: ContinuousKVCache, request_ids: list[str], num_splits=None):
+def _decode_payload(cache: KVCache, request_ids: list[str], num_splits=None):
     """The payload `execute` builds for a decode step, from the same addresses."""
     return cache.make_decode_payload(
         cache.newest_slots_for(request_ids, [total - 1 for total in _MID_DECODE_TOTALS]),
@@ -205,7 +205,7 @@ def test_the_decode_profile_payload_addresses_only_its_own_stand_in_pool():
 
 
 def _packed_whole_prompts(
-    cache: ContinuousKVCache, request_ids: list[str], lengths: list[int], keys, values
+    cache: KVCache, request_ids: list[str], lengths: list[int], keys, values
 ) -> PagedKV:
     """What a packed pass over whole prompts hands attention: the pool, addresses and boundaries."""
     cache.reserve(request_ids, lengths)
@@ -268,7 +268,7 @@ def _ragged_chunk(keys: torch.Tensor, chunks: list[slice]) -> torch.Tensor:
     return torch.cat(pieces, dim=2)
 
 
-def _chunked_packed(cache: ContinuousKVCache) -> PagedKV:
+def _chunked_packed(cache: KVCache) -> PagedKV:
     """Prefill `_CHUNKED_LENGTHS` in two packed passes; return what the second one hands attention."""
     request_ids = ["a", "b"]
     keys, values = _prompt_kv(_CHUNKED_LENGTHS)

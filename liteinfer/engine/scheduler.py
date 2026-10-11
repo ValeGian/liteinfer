@@ -1,4 +1,4 @@
-"""ContinuousScheduler — iteration-level scheduling for continuous batching.
+"""Scheduler — iteration-level scheduling for continuous batching.
 
 Every step hands out a token budget. Each sequence carries `num_computed_tokens`,
 and what it is owed is the rest of its length: the remainder of the prompt for
@@ -32,7 +32,7 @@ from liteinfer.engine.sequence import Sequence, SequenceStatus
 
 
 @dataclass
-class ContinuousSchedulerOutput:
+class SchedulerOutput:
     """Decisions for one continuous-batching step."""
 
     seqs: list[Sequence] = field(default_factory=list)
@@ -46,7 +46,7 @@ class ContinuousSchedulerOutput:
         return not self.seqs
 
 
-class ContinuousScheduler:
+class Scheduler:
     """Iteration-level scheduler: spends a token budget every step.
 
     * Admits waiting sequences whenever ``len(running) < max_num_seqs`` and some
@@ -64,9 +64,9 @@ class ContinuousScheduler:
         sequence.status = SequenceStatus.WAITING
         self.waiting.append(sequence)
 
-    def schedule(self) -> ContinuousSchedulerOutput:
+    def schedule(self) -> SchedulerOutput:
         """Grant running sequences what they are owed, then admit waiting ones with the rest."""
-        out = ContinuousSchedulerOutput()
+        out = SchedulerOutput()
         budget = self.config.token_budget
 
         for seq in self.running:
@@ -84,7 +84,7 @@ class ContinuousScheduler:
         return out
 
     @staticmethod
-    def _grant(out: ContinuousSchedulerOutput, seq: Sequence, budget: int) -> int:
+    def _grant(out: SchedulerOutput, seq: Sequence, budget: int) -> int:
         """Schedule what `seq` is owed, clamped to `budget`, and return what it took."""
         num_tokens = min(seq.num_uncomputed_tokens, budget)
         # Every unfinished sequence owes at least its sampled token; zero means the

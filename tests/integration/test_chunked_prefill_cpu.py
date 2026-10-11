@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
 
@@ -31,8 +31,8 @@ _DECODE_STEPS = 3
 _TOLERANCE = {"rtol": 0, "atol": 1e-5}
 
 
-def _runner(model_dir: Path) -> ContinuousModelRunner:
-    runner = ContinuousModelRunner(
+def _runner(model_dir: Path) -> ModelRunner:
+    runner = ModelRunner(
         EngineConfig(
             model=str(model_dir), device="cpu", dtype=torch.float32,  # type: ignore[arg-type]
             max_num_seqs=len(_PROMPT_LENS), max_model_len=64, block_size=_BLOCK_SIZE,
@@ -55,7 +55,7 @@ def _sequences() -> list[Sequence]:
     ]
 
 
-def _prefill_in_chunks(runner: ContinuousModelRunner, seqs: list[Sequence]) -> torch.Tensor:
+def _prefill_in_chunks(runner: ModelRunner, seqs: list[Sequence]) -> torch.Tensor:
     """Run `_CHUNKS`; return each sequence's logits from the pass that ended its prompt."""
     last_logits: dict[str, torch.Tensor] = {}
     for counts in _CHUNKS:
@@ -66,7 +66,7 @@ def _prefill_in_chunks(runner: ContinuousModelRunner, seqs: list[Sequence]) -> t
     return torch.stack([last_logits[seq.request_id] for seq in seqs])
 
 
-def _decode_logits(runner: ContinuousModelRunner, seqs: list[Sequence]) -> list[torch.Tensor]:
+def _decode_logits(runner: ModelRunner, seqs: list[Sequence]) -> list[torch.Tensor]:
     """Feed a fixed token for a few steps, so both runs decode the same inputs."""
     steps = []
     for step in range(_DECODE_STEPS):

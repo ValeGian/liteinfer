@@ -103,13 +103,13 @@ One engine: continuous batching over a paged KV cache.
 
 - **`AsyncLLM`** — asyncio API: `await llm.generate(...)`, or `async for` to
   stream tokens. **`LLM`** is a synchronous facade over it for offline batch use.
-- **`ContinuousScheduler`** — spends a token budget every step: one token per
+- **`Scheduler`** — spends a token budget every step: one token per
   decoding sequence, as much of a waiting prompt as fits (a longer one is
   chunked across steps), admitted into free slots. Finished sequences are
   evicted individually.
-- **`ContinuousModelRunner`** — runs one step's forward: prompts and sampled tokens together, in one pass.
+- **`ModelRunner`** — runs one step's forward: prompts and sampled tokens together, in one pass.
   `torch.compile`, CUDA graph capture and tensor parallelism plug in here.
-- **`ContinuousKVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
+- **`KVCache`** — per-sequence blocks drawn from a shared `BlockPool`;
   `packed_addresses`, `newest_slots` and `slot_table` map logical token positions
   to physical slots, so a whole batch is read or written with a single indexing op.
 - **`models/attention.py`** — the attention kernel, one per

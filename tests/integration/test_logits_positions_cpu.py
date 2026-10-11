@@ -15,13 +15,13 @@ from pathlib import Path
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 
 _PROMPT_LENS = (7, 4, 9)
 
 
-def _loaded_runner(model_dir: Path) -> ContinuousModelRunner:
-    runner = ContinuousModelRunner(
+def _loaded_runner(model_dir: Path) -> ModelRunner:
+    runner = ModelRunner(
         EngineConfig(
             model=str(model_dir),
             device="cpu",
@@ -39,7 +39,7 @@ def _last_tokens() -> torch.Tensor:
     return torch.tensor(_PROMPT_LENS).cumsum(0) - 1
 
 
-def _prefill_logits(runner: ContinuousModelRunner, logits_positions: torch.Tensor | None):
+def _prefill_logits(runner: ModelRunner, logits_positions: torch.Tensor | None):
     """One packed prefill forward over `_PROMPT_LENS`, built the way `execute` builds it."""
     cache, model = runner._cache, runner.model
     assert cache is not None and model is not None, "load_model() builds both"
