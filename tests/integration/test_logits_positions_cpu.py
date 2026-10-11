@@ -45,10 +45,8 @@ def _prefill_logits(runner: ContinuousModelRunner, logits_positions: torch.Tenso
     assert cache is not None and model is not None, "load_model() builds both"
     request_ids = [f"seq-{i}" for i in range(len(_PROMPT_LENS))]
     prompt_lens: list[int] = list(_PROMPT_LENS)
-    for request_id in request_ids:
-        cache.register(request_id)
-    cache.advance(request_ids, prompt_lens)
-    payload = cache.make_packed_payload(request_ids, prompt_lens)
+    cache.reserve(request_ids, prompt_lens)
+    payload = cache.make_packed_payload(request_ids, [0] * len(prompt_lens), prompt_lens)
     token_ids = [token for length in prompt_lens for token in range(2, 2 + length)]
 
     with torch.inference_mode():
@@ -59,7 +57,7 @@ def _prefill_logits(runner: ContinuousModelRunner, logits_positions: torch.Tenso
             logits_positions=logits_positions,
         )
     for request_id in request_ids:
-        cache.deregister(request_id)
+        cache.release(request_id)
     return out.logits
 
 

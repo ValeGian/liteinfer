@@ -108,7 +108,9 @@ class AsyncLLMEngine:
 
     @property
     def tokenizer(self) -> Tokenizer:
-        return self.model_runner.tokenizer
+        tokenizer = self.model_runner.tokenizer
+        assert tokenizer is not None, "start() loads the tokenizer"
+        return tokenizer
 
     async def start(self) -> None:
         """Load model and start the background generate loop."""
@@ -227,7 +229,7 @@ class AsyncLLMEngine:
         with self._timed("schedule", sync=False):
             finished = self.scheduler.remove_finished()
             for seq in finished:
-                self.model_runner.deregister_sequence(seq)
+                self.model_runner.release_sequence(seq)
                 queue = self._forget(seq.request_id)
                 if queue is not None:
                     queue.put_nowait(None)
@@ -309,10 +311,10 @@ class AsyncLLMEngine:
         )
         with self._timed("forward") as timer:
             logits = self.model_runner.execute(seqs, num_tokens)
-        for seq, count in zip(seqs, num_tokens, strict=True):
-            seq.num_computed_tokens += count
 
         with self._timed("sample"):
+            # `execute` counted what the pass wrote, so these are the rows whose
+            # prompt is now complete.
             rows = [i for i, seq in enumerate(seqs) if seq.is_prompt_computed]
             sampling_seqs = [seqs[i] for i in rows]
             if sampling_seqs:

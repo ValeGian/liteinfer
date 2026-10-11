@@ -145,14 +145,20 @@ listed.
 - **PRs.** _none yet_
 - **Why.** The scheduler admits by slots and by the token budget, never by free
   KV blocks, so a step can be scheduled that the pool cannot hold. Since §1.3,
-  `advance` refuses such a step whole and the engine fails its least invested
+  `ContinuousKVCache.reserve` refuses such a step whole and the engine fails its least invested
   tier — every sequence the step would have started, even where one fewer would
   have fitted, and without retrying them once blocks free up. Before §1.3 a
   refused prefill pass failed every prompt in it, so this is not a regression,
   but it is a request failed for want of waiting.
 - **Scope.** `ContinuousScheduler.schedule()` asks the cache how many blocks a
-  grant needs (`_blocks_short_of` already computes it) and stops admitting when
-  the free pool would run out, leaving the rest waiting. Running sequences that
+  grant needs (`_blocks_short_of` already computes it, from the total the
+  sequence will hold) and stops admitting when the free pool would run out,
+  leaving the rest waiting. The scheduler is built before the model loads and the
+  pool is sized only after the activation profile, so the first commit splits
+  `BlockPool` into a host half — free list and block tables, needing only
+  `num_blocks` — handed to the scheduler in `start()`, and the device tensors the
+  runner keeps. Preempting by recompute is then freeing a sequence's blocks and
+  setting its `num_computed_tokens` back to 0. Running sequences that
   outgrow the pool still need an answer — vLLM preempts and recomputes — and
   that is the larger half; without it, a decoding sequence the pool cannot grow
   is still failed.
@@ -427,6 +433,28 @@ listed.
   measures: latency mode, `sdpa`, ISL 128, against this revision. The fallback
   path only; `paged` never builds it.
 
+### 3.12 A decode step is a packed run of single tokens
+- **Status.** `planned` — from the review after §3.9; waits for §8.9's rows.
+- **PRs.** _none yet_
+- **Why.** A decode step writes as a packed run already (`newest_slots` returns
+  `[1, B]`), but its queries are still `[B, 1]`, and that one asymmetry is what
+  keeps `_build_decode_inputs`, `models.LAST_POSITION`, two ways of slicing
+  logits, `logits_positions: slice | Tensor`, `[max_num_seqs, 1]` capture buffers
+  and two served payload classes (`_PackedPayload`, `_DecodePayload`, both "store,
+  then point at the pool") alive. The dense kernels' batched decode wants
+  `[B, H, 1, D]`, which is one transpose inside `_dense`, not a layout for the
+  whole engine.
+- **Scope.** Decode inputs as `[1, B]`; one payload class over a `PagedKV` minus
+  the pool; `past_key_values` renamed `kv_payload`; decode's three address
+  transfers (`newest_slots_for`, `slot_table_for`, the context lengths) folded
+  into one, as `packed_addresses` already is. Keep what was measured: host-side
+  decode addresses (0.28 → 0.021 ms, §2.9), the split-K `paged_decode` kernel
+  for one-query rows (merging it into `paged_prefill` cost 5 us per layer of host
+  time, §2.10), and capture per batch width.
+- **Measure it** in latency mode against §8.9's stored `liteinfer-paged-prefill`
+  rows — it changes what a captured decode step does — and in throughput mode on
+  the same shapes. Expected neutral; the point is the code it deletes.
+
 ---
 
 ## 4. Modeling and parity
@@ -497,11 +525,20 @@ listed.
   listener have no callers outside their own tests. §1.3 removed the per-phase
   totals and averages, whose meaning a mixed step broke; `on_step` is what §6.2
   plans to read, so decide it with §6.2.
-- Fix the five `reportOptionalMemberAccess` errors pyright reports on package
-  code: `hf_config` and `tokenizer` are declared optional because they are
-  assigned in `load_model` rather than `__init__`, so every read of them is an
-  error. Either construct the runner already loaded, or keep a loaded-state
-  object the type system can see. The remaining pyright output is
+- Drop the `Continuous*` prefix from `ContinuousScheduler`,
+  `ContinuousSchedulerOutput`, `ContinuousModelRunner`, `ContinuousKVCache` and
+  their modules: it named a choice against static batching that no longer
+  exists. Rename `models/paged_decode.py`, which holds `paged_prefill` too, and
+  fix the text that still describes retired code: the history in
+  `engine/cuda_graphs.py`'s module docstring, `_packed_forward`'s argument against
+  padding, `engine/__init__.py`'s "one prefill or decode forward pass" and
+  `models/__init__.py`'s `qwen.py`. Mechanical, its own PR, nothing measured.
+- `hf_config` and `tokenizer` are optional on the runner because `load_model`
+  assigns them, so reads of them carry asserts for the type checker. Building the
+  runner already loaded — `load_hf_model` returning the model, its shape and the
+  resolved kernel, instead of recording the kernel on
+  `hf_config._attn_implementation`, a private transformers attribute — removes
+  both. Package code is otherwise pyright-clean; the rest of its output is
   `reportPrivateImportUsage` against torch's re-exports, which is noise.
 
 ---

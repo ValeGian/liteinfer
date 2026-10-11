@@ -21,45 +21,41 @@ def _cache(num_blocks: int) -> ContinuousKVCache:
     return ContinuousKVCache(pool)
 
 
-def _holding(cache: ContinuousKVCache, counts: dict[str, int]) -> ContinuousKVCache:
-    for request_id, count in counts.items():
-        cache.register(request_id)
-        cache.advance([request_id], [count])
+def _holding(cache: ContinuousKVCache, totals: dict[str, int]) -> ContinuousKVCache:
+    for request_id, total in totals.items():
+        cache.reserve([request_id], [total])
     return cache
 
 
 def test_a_step_the_pool_cannot_hold_is_refused() -> None:
     cache = _holding(_cache(num_blocks=3), {"running": 4})
-    cache.register("new")
 
     with pytest.raises(BlockPoolExhaustedError):
-        cache.advance(["running", "new"], [1, 8])  # 1 + 2 blocks against 2 free
+        cache.reserve(["running", "new"], [5, 8])  # 1 + 2 blocks against 2 free
 
 
-def test_a_refused_step_leaves_every_sequence_where_it_was() -> None:
+def test_a_refused_step_leaves_every_block_table_as_it_was() -> None:
     cache = _holding(_cache(num_blocks=3), {"running": 4})
-    cache.register("new")
 
     with pytest.raises(BlockPoolExhaustedError):
-        cache.advance(["running", "new"], [1, 8])
+        cache.reserve(["running", "new"], [5, 8])
 
-    assert (cache.seq_total_len("running"), cache.seq_total_len("new")) == (4, 0)
+    # "new" was never given room, so it has no table at all.
+    assert {rid: len(table) for rid, table in cache._block_tables.items()} == {"running": 1}
 
 
 def test_a_refused_step_allocates_no_blocks() -> None:
     cache = _holding(_cache(num_blocks=3), {"running": 4})
-    cache.register("new")
 
     with pytest.raises(BlockPoolExhaustedError):
-        cache.advance(["running", "new"], [1, 8])
+        cache.reserve(["running", "new"], [5, 8])
 
     assert cache._pool.num_free_blocks == 2
 
 
 def test_a_step_that_exactly_fills_the_pool_is_accepted() -> None:
     cache = _holding(_cache(num_blocks=3), {"running": 4})
-    cache.register("new")
 
-    cache.advance(["running", "new"], [1, 4])  # one block each, two free
+    cache.reserve(["running", "new"], [5, 4])  # one block each, two free
 
     assert cache._pool.num_free_blocks == 0

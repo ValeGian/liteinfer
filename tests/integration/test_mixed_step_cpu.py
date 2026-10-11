@@ -31,12 +31,10 @@ from tests.integration.sequences import running_sequence
 _TOLERANCE = {"rtol": 0, "atol": 1e-4}
 
 
-def _runner(model_dir: Path) -> ContinuousModelRunner:
+def _runner(model_dir: Path, **overrides) -> ContinuousModelRunner:
+    config = {"max_num_seqs": 4, "max_model_len": 64, "block_size": 4, **overrides}
     runner = ContinuousModelRunner(
-        EngineConfig(
-            model=str(model_dir), device="cpu", dtype=torch.float32,  # type: ignore[arg-type]
-            max_num_seqs=4, max_model_len=64, block_size=4,
-        )
+        EngineConfig(model=str(model_dir), device="cpu", dtype=torch.float32, **config)  # type: ignore[arg-type]
     )
     runner.load_model()
     return runner
@@ -62,11 +60,30 @@ def test_a_chunk_crossing_from_prompt_into_output_is_refused(tiny_llama_dir: Pat
     runner = _runner(tiny_llama_dir)
     seq = running_sequence("crossing", prompt_len=5, offset=0)
     seq.output_token_ids.append(7)
-    assert runner._cache is not None, "load_model() builds the cache"
-    runner._cache.register(seq.request_id)
 
     with pytest.raises(ValueError, match="crosses the end"):
         runner._next_chunks([seq], None)
+
+
+def test_a_pass_counts_the_tokens_it_wrote_on_each_sequence(tiny_llama_dir: Path):
+    """The sequence is the only record of what the cache holds for it, so the pass that wrote it says so."""
+    runner = _runner(tiny_llama_dir)
+    seq = running_sequence("chunked", prompt_len=9, offset=0)
+
+    runner.execute([seq], [4])
+
+    assert seq.num_computed_tokens == 4
+
+
+def test_a_pass_the_pool_cannot_hold_leaves_the_count_where_it_was(tiny_llama_dir: Path):
+    """Nothing was written, so nothing is counted; the step can be retried or shed."""
+    runner = _runner(tiny_llama_dir, num_gpu_blocks=1)
+    seq = running_sequence("too-long", prompt_len=9, offset=0)  # three blocks of 4
+
+    with pytest.raises(BlockPoolExhaustedError):
+        runner.execute([seq])
+
+    assert seq.num_computed_tokens == 0
 
 
 def test_a_mixed_step_answers_each_sequence_in_the_order_it_was_given(tiny_llama_dir: Path):
