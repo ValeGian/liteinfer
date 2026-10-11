@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
+from liteinfer.cache.block_tables import BlockTables
 from liteinfer.cache.kv_cache import KVCache
 from liteinfer.engine.cuda_graphs import (
     _MAX_CAPTURES,
@@ -65,7 +66,7 @@ def _graphs_on_cpu(max_num_seqs: int) -> DecodeGraphs:
     )
     return DecodeGraphs(
         torch.nn.Identity(),
-        KVCache(pool),
+        KVCache(pool, BlockTables(pool.num_blocks, pool.block_size)),
         device=_CPU,
         max_num_seqs=max_num_seqs,
         max_model_len=16,

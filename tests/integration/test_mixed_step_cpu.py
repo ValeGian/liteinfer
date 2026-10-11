@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from liteinfer import AsyncLLM
-from liteinfer.cache.block_pool import BlockPoolExhaustedError
+from liteinfer.cache.block_tables import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
 from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.sequence import Sequence
@@ -104,7 +104,7 @@ def test_a_mixed_step_answers_each_sequence_in_the_order_it_was_given(tiny_llama
 # --- a step the pool cannot hold ---------------------------------------------
 
 # One block of 16 tokens: the running sequence fits in it for its whole
-# generation, and the late prompt needs a second block that is never there.
+# generation, and the late prompt needs two — more than the whole pool holds.
 _POOL = {"num_gpu_blocks": 1, "block_size": 16}
 _RUNNING_TOKENS = 8
 
@@ -145,7 +145,7 @@ def _late_prompt_on_a_full_pool(model_dir: Path) -> _LatePrompt:
     return asyncio.run(run())
 
 
-def test_a_prompt_the_pool_cannot_hold_fails_with_the_pool_error(tiny_llama_dir: Path):
+def test_a_prompt_the_pool_could_never_hold_fails_with_the_pool_error(tiny_llama_dir: Path):
     assert isinstance(_late_prompt_on_a_full_pool(tiny_llama_dir).late_error, BlockPoolExhaustedError)
 
 
@@ -180,32 +180,40 @@ def _generate_on_a_small_pool(
     return asyncio.run(run())
 
 
-def test_a_full_pool_sheds_the_newcomer_rather_than_a_prompt_part_way_through(tiny_llama_dir: Path):
-    """The part-way prompt fits on its own; dropping it too would discard work for nothing.
+def _all_completed(results: tuple[RequestOutput | BaseException, ...]) -> bool:
+    return all(isinstance(result, RequestOutput) for result in results)
 
-    Two 19-token prompts, an 8-token budget, two blocks: the first is chunked
-    8 / 8 / 3, and its last chunk needs its second block in the step that admits
-    the second prompt, which needs one too.
-    """
-    first, _ = _generate_on_a_small_pool(
+
+def test_a_pool_too_small_for_every_prompt_at_once_completes_them_all(tiny_llama_dir: Path):
+    """Four prompts of one block each over two blocks: they run two at a time, and none fails."""
+    results = _generate_on_a_small_pool(tiny_llama_dir, [10] * 4, max_tokens=4, num_gpu_blocks=2)
+
+    assert _all_completed(results)
+
+
+def test_a_newcomer_waits_for_the_block_a_part_way_prompt_is_about_to_take(tiny_llama_dir: Path):
+    """Two 19-token prompts, an 8-token budget, two blocks: the first is chunked
+    8 / 8 / 3 and its last chunk takes the second block in the step that would
+    have admitted the other, which then waits for the first to finish."""
+    results = _generate_on_a_small_pool(
         tiny_llama_dir, [19, 19], max_tokens=4, num_gpu_blocks=2, max_num_batched_tokens=8
     )
 
-    assert isinstance(first, RequestOutput)
+    assert _all_completed(results)
 
 
-def test_a_full_pool_sheds_a_part_way_prompt_rather_than_a_decoding_sequence(tiny_llama_dir: Path):
-    """No newcomer to drop: a 3-token prompt decodes while a 19-token one is chunked
-    5 / 7 / 7 beside it, and the last chunk needs a block that is not there."""
-    decoding, _ = _generate_on_a_small_pool(
+def test_a_part_way_prompt_waits_for_the_block_a_finishing_sequence_frees(tiny_llama_dir: Path):
+    """A 3-token prompt decodes while a 19-token one is chunked 5 / 7 / 4 beside it;
+    the last 3 tokens need a block only the decoding sequence's end returns."""
+    results = _generate_on_a_small_pool(
         tiny_llama_dir, [3, 19], max_tokens=4, num_gpu_blocks=2, max_num_batched_tokens=8
     )
 
-    assert isinstance(decoding, RequestOutput)
+    assert _all_completed(results)
 
 
-def test_a_full_pool_with_only_decodes_left_fails_them(tiny_llama_dir: Path):
-    """Nothing smaller to give up: one sequence outgrows the only block there is."""
+def test_a_sequence_that_outgrows_the_whole_pool_fails(tiny_llama_dir: Path):
+    """Nothing else will ever free a block: one sequence outgrows the only block there is."""
     (only,) = _generate_on_a_small_pool(tiny_llama_dir, [3], max_tokens=20, num_gpu_blocks=1)
 
     assert isinstance(only, BlockPoolExhaustedError)

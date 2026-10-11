@@ -1,11 +1,11 @@
 # pyright: reportPrivateImportUsage=false
 """Pre-allocated physical KV storage divided into fixed-size blocks.
 
-One block index services all transformer layers: allocating block B gives
-access to K/V memory at pool.keys[layer_idx, B, ...] for every layer_idx.
-This lets a single free-list serve the whole model, and enables future
-cross-layer sharing (e.g. prefix caching) where the same block can be
-reused by multiple sequences at the same logical position.
+One block index services all transformer layers: block B is K/V memory at
+pool.keys[layer_idx, B, ...] for every layer_idx. That is what lets one set of
+host-side block tables (`cache/block_tables.py`) serve the whole model, and
+enables future cross-layer sharing (e.g. prefix caching) where the same block
+can be reused by multiple sequences at the same logical position.
 """
 
 from __future__ import annotations
@@ -14,15 +14,6 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 import torch
-
-
-class BlockPoolExhaustedError(RuntimeError):
-    """The pool cannot hold what was asked of it.
-
-    Raised by `allocate` with no free block left, and by
-    `KVCache.reserve` before it allocates anything, when a step's
-    tokens need more blocks than are free.
-    """
 
 
 class BlockPool:
@@ -39,9 +30,8 @@ class BlockPool:
     what lets the caches read and write a whole batch with one indexing op
     instead of a Python loop over blocks (see ``slot_table``).
 
-    A single free-list tracks which block indices are available. Allocating
-    block B means all layers can write K/V into that block's slots. Freeing
-    block B returns it to the free-list regardless of which layers wrote to it.
+    Which blocks are free and which sequence holds which is `BlockTables`, on
+    the host; this is only the storage they index, for every layer at once.
     """
 
     def __init__(
@@ -63,7 +53,6 @@ class BlockPool:
         shape = (num_layers, num_blocks * block_size, num_kv_heads, head_dim)
         self._keys = torch.zeros(shape, dtype=dtype, device=device)
         self._values = torch.zeros(shape, dtype=dtype, device=device)
-        self._free_blocks: list[int] = list(range(num_blocks))
 
     @property
     def nbytes(self) -> int:
@@ -73,27 +62,6 @@ class BlockPool:
     @property
     def device(self) -> torch.device:
         return self._keys.device
-
-    @property
-    def num_free_blocks(self) -> int:
-        return len(self._free_blocks)
-
-    def allocate(self) -> int:
-        """Pop and return a free block index.
-
-        Raises:
-            BlockPoolExhaustedError: if no free blocks remain.
-        """
-        if not self._free_blocks:
-            raise BlockPoolExhaustedError(
-                f"KV block pool exhausted: all {self.num_blocks} blocks are in use. "
-                "Increase num_gpu_blocks or reduce max_num_seqs / max_model_len."
-            )
-        return self._free_blocks.pop()
-
-    def free(self, block_idx: int) -> None:
-        """Return block_idx to the free-list."""
-        self._free_blocks.append(block_idx)
 
     def slots(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return this layer's flat key/value stores: ``[num_slots, num_kv_heads, head_dim]``."""

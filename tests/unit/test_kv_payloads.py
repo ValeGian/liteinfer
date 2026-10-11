@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
+from liteinfer.cache.block_tables import BlockTables
 from liteinfer.cache.kv_cache import (
     DecodeProfilePayload,
     KVCache,
@@ -27,17 +28,21 @@ _LAYER = 0
 
 
 def _cache() -> KVCache:
-    return KVCache(
-        BlockPool(
-            num_blocks=8,
-            block_size=_BLOCK_SIZE,
-            num_layers=2,
-            num_kv_heads=_NUM_KV_HEADS,
-            head_dim=_HEAD_DIM,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-        )
+    pool = BlockPool(
+        num_blocks=8,
+        block_size=_BLOCK_SIZE,
+        num_layers=2,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
     )
+    return KVCache(pool, BlockTables(pool.num_blocks, pool.block_size))
+
+
+def _reserve(cache: KVCache, request_ids: list[str], totals: list[int]) -> None:
+    """Give each sequence room for `totals` tokens, as the runner does before a pass."""
+    cache._blocks.reserve(request_ids, totals)
 
 
 def _decode_token(batch: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -78,10 +83,10 @@ def _two_sequences_mid_decode() -> tuple[KVCache, list[str]]:
     """A cache holding two prefilled sequences of different lengths, with room for one more token each."""
     cache = _cache()
     request_ids, prompt_lens = ["short", "long"], _MID_DECODE_PROMPT_LENS
-    cache.reserve(request_ids, prompt_lens)
+    _reserve(cache, request_ids, prompt_lens)
     prompt_kv = torch.zeros(1, _NUM_KV_HEADS, sum(prompt_lens), _HEAD_DIM)
     cache.make_packed_payload(request_ids, [0, 0], prompt_lens).update(prompt_kv, prompt_kv, _LAYER)
-    cache.reserve(request_ids, _MID_DECODE_TOTALS)
+    _reserve(cache, request_ids, _MID_DECODE_TOTALS)
     return cache, request_ids
 
 
@@ -208,7 +213,7 @@ def _packed_whole_prompts(
     cache: KVCache, request_ids: list[str], lengths: list[int], keys, values
 ) -> PagedKV:
     """What a packed pass over whole prompts hands attention: the pool, addresses and boundaries."""
-    cache.reserve(request_ids, lengths)
+    _reserve(cache, request_ids, lengths)
     return cache.make_packed_payload(request_ids, [0] * len(lengths), lengths).update(keys, values, _LAYER)
 
 
@@ -272,12 +277,12 @@ def _chunked_packed(cache: KVCache) -> PagedKV:
     """Prefill `_CHUNKED_LENGTHS` in two packed passes; return what the second one hands attention."""
     request_ids = ["a", "b"]
     keys, values = _prompt_kv(_CHUNKED_LENGTHS)
-    cache.reserve(request_ids, _FIRST_CHUNK)
+    _reserve(cache, request_ids, _FIRST_CHUNK)
     first = [slice(0, count) for count in _FIRST_CHUNK]
     cache.make_packed_payload(request_ids, [0, 0], _FIRST_CHUNK).update(
         _ragged_chunk(keys, first), _ragged_chunk(values, first), _LAYER
     )
-    cache.reserve(request_ids, _CHUNKED_LENGTHS)
+    _reserve(cache, request_ids, _CHUNKED_LENGTHS)
     second = [slice(count, None) for count in _FIRST_CHUNK]
     return cache.make_packed_payload(request_ids, _FIRST_CHUNK, _SECOND_CHUNK).update(
         _ragged_chunk(keys, second), _ragged_chunk(values, second), _LAYER

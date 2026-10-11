@@ -16,9 +16,10 @@ Per-request delivery
 
 Step structure
     1. ``remove_finished`` — evict individually-done sequences, free KV blocks.
-    2. ``schedule`` — spend the step's token budget: one token per decoding
-       sequence, the rest of a prompt (or as much of it as fits) per prefilling
-       one, and admit waiting sequences into free slots with what is left.
+    2. ``schedule`` — spend the step's token budget and free KV blocks: one
+       token per decoding sequence, the rest of a prompt (or as much of it as
+       fits) per prefilling one, and admit waiting sequences into free slots with
+       what is left. A request the pool cannot serve is failed here.
     3. ``execute`` every scheduled sequence's tokens — prompt chunks and sampled
        tokens alike — and sample the sequences whose prompt is now complete.
     4. Deliver ``StreamEvent`` objects to per-request queues, for every sequence
@@ -31,7 +32,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 
-from liteinfer.cache.block_pool import BlockPoolExhaustedError
+from liteinfer.cache.block_tables import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
 from liteinfer.engine.metrics import (
     EngineStats,
@@ -70,27 +71,12 @@ _FINISH_REASONS: dict[SequenceStatus, str] = {
 }
 
 
-def _rows_to_shed(seqs: list[Sequence]) -> list[Sequence]:
-    """What a step the pool could not hold gives up, least invested first.
-
-    Sequences this step would have started come first: they hold nothing yet,
-    and the scheduler admits them after every running one, so they are the
-    blocks that tipped the pool over. Failing that, prompts still part-way
-    through; failing that, everything, because a step of decodes alone that
-    does not fit has nothing smaller to give up. Each refused step sheds one
-    tier, and the rest go on next step.
-    """
-    newcomers = [seq for seq in seqs if seq.num_computed_tokens == 0]
-    prompts = [seq for seq in seqs if not seq.is_prompt_computed]
-    return newcomers or prompts or seqs
-
-
 class AsyncLLMEngine:
     """Continuous-batching inference engine backed by an asyncio event loop."""
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
-        self.scheduler = Scheduler(config)
+        self._scheduler: Scheduler | None = None
         self.model_runner = ModelRunner(config)
         self.sampler = Sampler()
         self._step_idx = 0
@@ -112,9 +98,16 @@ class AsyncLLMEngine:
         assert tokenizer is not None, "start() loads the tokenizer"
         return tokenizer
 
+    @property
+    def scheduler(self) -> Scheduler:
+        """Built by `start`, because it admits by the KV blocks the loaded model's pool holds."""
+        assert self._scheduler is not None, "start() builds the scheduler"
+        return self._scheduler
+
     async def start(self) -> None:
         """Load model and start the background generate loop."""
         self.model_runner.load_model()
+        self._scheduler = Scheduler(self.config, self.model_runner.block_tables)
         self._loop_task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
@@ -227,13 +220,10 @@ class AsyncLLMEngine:
 
     def _run_step(self) -> None:
         with self._timed("schedule", sync=False):
-            finished = self.scheduler.remove_finished()
-            for seq in finished:
-                self.model_runner.release_sequence(seq)
-                queue = self._forget(seq.request_id)
-                if queue is not None:
-                    queue.put_nowait(None)
+            self._close_finished()
             sched = self.scheduler.schedule()
+            for refusal in sched.refused:
+                self._abort([refusal.seq], BlockPoolExhaustedError(refusal.reason))
 
         if sched.is_empty:
             return
@@ -241,15 +231,20 @@ class AsyncLLMEngine:
         num_tokens = [sched.num_scheduled_tokens[seq.request_id] for seq in sched.seqs]
         try:
             sampled_seqs = self._forward(sched.seqs, num_tokens)
-        except BlockPoolExhaustedError as error:
-            # Raised before anything ran or was allocated, so the step can shed
-            # its newcomers and the rest go on next step.
-            self._abort(_rows_to_shed(sched.seqs), error)
-            return
         except Exception as error:
             self._abort(sched.seqs, error)  # the pass failed, so its sequences cannot continue
             return
+        self._deliver(sampled_seqs)
 
+    def _close_finished(self) -> None:
+        """Evict finished sequences, freeing their blocks, and end their callers' streams."""
+        for seq in self.scheduler.remove_finished():
+            queue = self._forget(seq.request_id)
+            if queue is not None:
+                queue.put_nowait(None)
+
+    def _deliver(self, sampled_seqs: list[Sequence]) -> None:
+        """Hand each sequence that sampled a token its event, where its caller wants one."""
         with self._timed("deliver", sync=False):
             newly_finished = 0
             for seq in sampled_seqs:

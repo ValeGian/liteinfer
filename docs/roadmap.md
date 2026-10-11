@@ -141,29 +141,29 @@ listed.
   rather than in isolation.
 
 ### 1.8 Admit by what the pool can hold
-- **Status.** `planned` — raised in review of §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
-- **PRs.** _none yet_
-- **Why.** The scheduler admits by slots and by the token budget, never by free
-  KV blocks, so a step can be scheduled that the pool cannot hold. Since §1.3,
-  `KVCache.reserve` refuses such a step whole and the engine fails its least invested
-  tier — every sequence the step would have started, even where one fewer would
-  have fitted, and without retrying them once blocks free up. Before §1.3 a
-  refused prefill pass failed every prompt in it, so this is not a regression,
-  but it is a request failed for want of waiting.
-- **Scope.** `Scheduler.schedule()` asks the cache how many blocks a
-  grant needs (`_blocks_short_of` already computes it, from the total the
-  sequence will hold) and stops admitting when the free pool would run out,
-  leaving the rest waiting. The scheduler is built before the model loads and the
-  pool is sized only after the activation profile, so the first commit splits
-  `BlockPool` into a host half — free list and block tables, needing only
-  `num_blocks` — handed to the scheduler in `start()`, and the device tensors the
-  runner keeps. Preempting by recompute is then freeing a sequence's blocks and
-  setting its `num_computed_tokens` back to 0. Running sequences that
-  outgrow the pool still need an answer — vLLM preempts and recomputes — and
-  that is the larger half; without it, a decoding sequence the pool cannot grow
-  is still failed.
+- **Status.** `in-progress` — admission landed; preemption is what is left. Raised in review of §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
+- **PRs.** _first half pending_
+- **Why.** The scheduler admitted by slots and by the token budget, never by
+  free KV blocks, so a step could be scheduled that the pool could not hold, and
+  the engine then failed the least invested rows of it — requests failed for want
+  of waiting.
+- **Landed (first half).** `BlockPool` is split: `BlockTables` (free list and
+  per-sequence tables, host-side) is built by the runner once the pool is sized
+  and handed to the scheduler in `start()`; the tensors stay with the runner. A
+  step's grants are bounded by the free blocks, running sequences first: a prompt
+  part-way through takes a smaller chunk, a sequence that fits nothing sits the
+  step out, and a waiting prompt is admitted only when its whole grant fits, in
+  arrival order. A prompt no empty pool could hold is refused at once. When every
+  running sequence sits out, the most recently admitted one is refused so the
+  rest can grow — the stopgap the second half replaces.
+- **Scope (second half).** Preempt by recompute instead of refusing: free the
+  newest running sequence's blocks, set its `num_computed_tokens` back to 0, and
+  put it at the front of the waiting queue, as vLLM does. Its output so far stays
+  on the `Sequence`, so recomputing it is a prefill of prompt plus output.
+  Decide whether a preempted sequence's stream should see anything.
 - **Parity test.** A pool too small for every waiting prompt at once completes
-  all of them, in more steps.
+  all of them, in more steps — in `test_mixed_step_cpu.py`. The second half's: a
+  pool too small for every running sequence to finish completes them all too.
 
 ---
 
