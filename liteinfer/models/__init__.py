@@ -1,8 +1,8 @@
 """Model implementations and weight loading.
 
-Per-architecture model code (e.g., `llama.py`, `qwen.py`) lives here.
-Each model exposes a constructor that accepts an `EngineConfig` and a
-`forward()` matching the shape the engine's runner expects.
+Per-architecture model code lives here — `llama.py` today. Each model is built
+from its `transformers` config and exposes a `forward()` matching the shape the
+engine's runner expects.
 
 The dispatch table from HF architecture name to local class is owned by
 `load_hf_model`.

@@ -18,7 +18,7 @@ import torch
 from liteinfer import AsyncLLM
 from liteinfer.cache.block_pool import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.sequence import Sequence
 from liteinfer.outputs import RequestOutput
 from liteinfer.sampling.params import SamplingParams
@@ -31,16 +31,16 @@ from tests.integration.sequences import running_sequence
 _TOLERANCE = {"rtol": 0, "atol": 1e-4}
 
 
-def _runner(model_dir: Path, **overrides) -> ContinuousModelRunner:
+def _runner(model_dir: Path, **overrides) -> ModelRunner:
     config = {"max_num_seqs": 4, "max_model_len": 64, "block_size": 4, **overrides}
-    runner = ContinuousModelRunner(
+    runner = ModelRunner(
         EngineConfig(model=str(model_dir), device="cpu", dtype=torch.float32, **config)  # type: ignore[arg-type]
     )
     runner.load_model()
     return runner
 
 
-def _decoding(runner: ContinuousModelRunner) -> Sequence:
+def _decoding(runner: ModelRunner) -> Sequence:
     """A sequence whose prompt is cached and whose sampled token is not yet."""
     seq = running_sequence("decoding", prompt_len=11, offset=0)
     runner.execute([seq])

@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from liteinfer.models.attention import PagedKV, eager_attention
-from liteinfer.models.paged_decode import _MAX_SPLITS, choose_num_splits, paged_decode
+from liteinfer.models.paged_kernels import _MAX_SPLITS, choose_num_splits, paged_decode
 
 pytestmark = pytest.mark.gpu
 

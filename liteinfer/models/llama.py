@@ -17,7 +17,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from liteinfer.models.attention import UNIVERSAL_IMPLEMENTATION, resolve
 
 if TYPE_CHECKING:
-    from liteinfer.cache.continuous_kv_cache import KVPayload
+    from liteinfer.cache.kv_cache import KVPayload
 
 
 @dataclass
@@ -156,7 +156,7 @@ class LlamaAttention(nn.Module):
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
         # The payload stores this pass's K/V and says where every token each
-        # sequence holds lives (see `cache/continuous_kv_cache.py`).
+        # sequence holds lives (see `cache/kv_cache.py`).
         kv = past_key_values.update(k, v, self.layer_idx)
         attn_output = self.attention(q, kv, self.scaling, self.num_kv_groups)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch, seq_len, -1)

@@ -24,7 +24,7 @@ class EngineConfig:
     # cap beside `max_num_seqs`, and both bind. A prompt larger than what is left
     # of it is not deferred but chunked across steps. None caps nothing
     # `max_num_seqs x max_model_len` does not already cap, so no prompt is ever
-    # chunked; see `token_budget` and `engine/continuous_scheduler.py`.
+    # chunked; see `token_budget` and `engine/scheduler.py`.
     max_num_batched_tokens: int | None = None
 
     seed: int = 42
@@ -52,7 +52,7 @@ class EngineConfig:
     # kernel, or None to choose from the batch width, the context bound and the
     # device. Splitting buys the parallelism a narrow batch cannot supply;
     # pinning it is what lets a benchmark row keep measuring one grid. See
-    # `models/paged_decode.py`.
+    # `models/paged_kernels.py`.
     paged_decode_splits: int | None = None
 
     collect_stats: bool = True

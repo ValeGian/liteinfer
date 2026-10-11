@@ -126,7 +126,7 @@ class DecodeProfilePayload:
         return PagedKV(self._key_pool, self._value_pool, self._slots, self._context_lens)
 
 
-class ContinuousKVCache:
+class KVCache:
     """Per-sequence block-allocated KV cache for continuous batching."""
 
     def __init__(self, pool: BlockPool) -> None:
@@ -266,7 +266,7 @@ class _PackedPayload:
 
     def __init__(
         self,
-        cache: ContinuousKVCache,
+        cache: KVCache,
         addresses: PackedAddresses,
         host_context_lens: tuple[int, ...],
         host_query_lens: tuple[int, ...],
@@ -302,7 +302,7 @@ class _DecodePayload:
 
     def __init__(
         self,
-        cache: ContinuousKVCache,
+        cache: KVCache,
         write_slots: torch.Tensor,
         slots: torch.Tensor,
         context_lens: torch.Tensor,

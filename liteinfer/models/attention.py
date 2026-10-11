@@ -10,7 +10,7 @@ fastest one that runs here", which `select_implementation` resolves once per
 engine from the device. Naming one asks for it specifically, and is refused
 rather than downgraded when it cannot run.
 
-`paged` reads the pool in place, in Triton (see `models/paged_decode.py`), and
+`paged` reads the pool in place, in Triton (see `models/paged_kernels.py`), and
 takes its bounds as device tensors, which is what lets a decode step be
 captured and split. `eager` and `sdpa` copy the contexts out of the pool: a
 decode step all at once, each row bounded by its context length, and a packed
@@ -222,7 +222,7 @@ def _paged_decode_step(
     # Imported here rather than at module scope: the kernel needs Triton, which
     # torch's CPU-only builds do not ship, and the other kernels must keep
     # importing on those machines.
-    from liteinfer.models.paged_decode import paged_decode
+    from liteinfer.models.paged_kernels import paged_decode
 
     attn_output = paged_decode(
         query.squeeze(2),
@@ -240,7 +240,7 @@ def _paged_decode_step(
 def _paged_chunks(query: torch.Tensor, kv: PagedKV, scaling: float, num_kv_groups: int) -> torch.Tensor:
     """Packed queries, ``[1, heads, total_queries, dim]``, with their boundaries on `kv`."""
     assert kv.query_start_loc is not None, "the caller dispatched on it"
-    from liteinfer.models.paged_decode import paged_prefill
+    from liteinfer.models.paged_kernels import paged_prefill
 
     # The layers speak `[1, heads, tokens, dim]`; the kernel wants the token axis first.
     attn_output = paged_prefill(

@@ -1,5 +1,5 @@
 # pyright: reportPrivateImportUsage=false
-"""ContinuousModelRunner — forward-pass execution for continuous batching.
+"""ModelRunner — forward-pass execution for continuous batching.
 
 ``execute(seqs, num_tokens)`` runs one step: the next ``num_tokens`` of each
 sequence, which is a chunk of its prompt (the whole prompt unless the
@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import (
-    ContinuousKVCache,
+from liteinfer.cache.kv_cache import (
     DecodeProfilePayload,
+    KVCache,
     ProfilePayload,
 )
 from liteinfer.config import EngineConfig
@@ -29,7 +29,7 @@ from liteinfer.hub import resolve_model_path
 from liteinfer.models import LAST_POSITION
 from liteinfer.models.attention import reads_pool_in_place
 from liteinfer.models.loader import load_hf_model
-from liteinfer.models.paged_decode import choose_num_splits
+from liteinfer.models.paged_kernels import choose_num_splits
 from liteinfer.tokenizer import Tokenizer
 
 if TYPE_CHECKING:
@@ -86,14 +86,14 @@ def _head_dim(hf_config: PretrainedConfig) -> int:
     )
 
 
-class ContinuousModelRunner:
+class ModelRunner:
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.device = config.resolved_device()
         self.model: torch.nn.Module | None = None
         self.hf_config = None
         self.tokenizer: Tokenizer | None = None
-        self._cache: ContinuousKVCache | None = None
+        self._cache: KVCache | None = None
         self._graphs: DecodeGraphs | None = None
         self._forward_bytes = 0
 
@@ -104,7 +104,7 @@ class ContinuousModelRunner:
         # Measured before the pool exists, because the pool gets whatever the
         # forward turns out not to need.
         self._forward_bytes = self._profile_forward_bytes()
-        self._cache = ContinuousKVCache(self._create_block_pool())
+        self._cache = KVCache(self._create_block_pool())
         self._graphs = self._create_decode_graphs()
 
     @property
@@ -190,12 +190,7 @@ class ContinuousModelRunner:
         return chunks
 
     def _packed_forward(self, request_ids: list[str], chunks: list[_Chunk]) -> torch.Tensor:
-        """Every chunk as one flat run of tokens, with no padding.
-
-        Padding the batch to its longest prompt would compute `len(seqs) *
-        max(prompt_lens)` positions to keep `sum(prompt_lens)` of them. On prompts
-        whose lengths vary — which is what real traffic is — that ratio reaches
-        13.4x at 32 sequences.
+        """Every chunk as one flat run of tokens: each position computed is one kept.
 
         A sampled token is a chunk of one, so a step that admits prompts while
         others decode is still one pass, every row read out of the pool.

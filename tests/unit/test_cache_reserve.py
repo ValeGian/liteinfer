@@ -7,21 +7,21 @@ import pytest
 import torch
 
 from liteinfer.cache.block_pool import BlockPool, BlockPoolExhaustedError
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
+from liteinfer.cache.kv_cache import KVCache
 
 CPU = torch.device("cpu")
 BLOCK_SIZE = 4
 
 
-def _cache(num_blocks: int) -> ContinuousKVCache:
+def _cache(num_blocks: int) -> KVCache:
     pool = BlockPool(
         num_blocks=num_blocks, block_size=BLOCK_SIZE, num_layers=1, num_kv_heads=1, head_dim=2,
         dtype=torch.float32, device=CPU,
     )
-    return ContinuousKVCache(pool)
+    return KVCache(pool)
 
 
-def _holding(cache: ContinuousKVCache, totals: dict[str, int]) -> ContinuousKVCache:
+def _holding(cache: KVCache, totals: dict[str, int]) -> KVCache:
     for request_id, total in totals.items():
         cache.reserve([request_id], [total])
     return cache

@@ -15,19 +15,19 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 
 pytestmark = pytest.mark.gpu
 
 
-def _runner(model_dir: Path, **overrides) -> ContinuousModelRunner:
+def _runner(model_dir: Path, **overrides) -> ModelRunner:
     defaults = {
         "device": "cuda",
         "dtype": torch.float32,
         "max_num_seqs": 4,
         "max_model_len": 64,
     }
-    runner = ContinuousModelRunner(
+    runner = ModelRunner(
         EngineConfig(model=str(model_dir), **{**defaults, **overrides})  # type: ignore[arg-type]
     )
     runner.load_model()
@@ -56,7 +56,7 @@ def test_the_engine_still_serves_after_being_profiled(tiny_llama_dir: Path) -> N
     assert runner._cache is not None
 
 
-def _full_width_decode_copy_bytes(runner: ContinuousModelRunner) -> int:
+def _full_width_decode_copy_bytes(runner: ModelRunner) -> int:
     """K and V of every row's whole context, which a dense decode step holds at once (fp32)."""
     hf_config = runner.hf_config
     assert hf_config is not None

@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.sampling.params import SamplingParams
 
@@ -28,7 +28,7 @@ _DECODE_STEPS = 24
 
 def _runner(
     model_dir: Path, *, capture: bool, max_num_seqs: int, splits: int | None = None
-) -> ContinuousModelRunner:
+) -> ModelRunner:
     config = EngineConfig(
         model=str(model_dir),
         device="cuda",
@@ -38,7 +38,7 @@ def _runner(
         enable_cuda_graphs=capture,
         paged_decode_splits=splits,
     )
-    runner = ContinuousModelRunner(config)
+    runner = ModelRunner(config)
     runner.load_model()
     return runner
 
@@ -57,7 +57,7 @@ def _sequences(prompt_lens: tuple[int, ...]) -> list[Sequence]:
     ]
 
 
-def _greedy_tokens(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) -> list[list[int]]:
+def _greedy_tokens(runner: ModelRunner, prompt_lens: tuple[int, ...]) -> list[list[int]]:
     """Decode greedily for a fixed number of steps and return each sequence's tokens."""
     seqs = _sequences(prompt_lens)
     logits = runner.execute(seqs)
@@ -70,7 +70,7 @@ def _greedy_tokens(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) 
     return [list(seq.output_token_ids) for seq in seqs]
 
 
-def _decode_logits(runner: ContinuousModelRunner, prompt_lens: tuple[int, ...]) -> torch.Tensor:
+def _decode_logits(runner: ModelRunner, prompt_lens: tuple[int, ...]) -> torch.Tensor:
     """Every decode step's logits over fixed input tokens, stacked as ``[steps, batch, vocab]``.
 
     Fixed inputs rather than greedy ones, so the two runs stay comparable step by
@@ -215,7 +215,7 @@ def test_capture_is_off_when_a_dense_kernel_is_pinned(tiny_llama_dir: Path):
         max_model_len=64,
         attn_implementation="sdpa",
     )
-    runner = ContinuousModelRunner(config)
+    runner = ModelRunner(config)
     runner.load_model()
 
     assert runner.captured_decode_widths == []

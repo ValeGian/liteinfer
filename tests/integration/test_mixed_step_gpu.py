@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
+from liteinfer.engine.model_runner import ModelRunner
 from tests.integration.sequences import running_sequence
 
 pytestmark = pytest.mark.gpu
@@ -39,7 +39,7 @@ _DRIFT_ALLOWANCE = 2.0
 _SAME_RUN_TOLERANCE = {"rtol": 0, "atol": 0.02}
 
 
-def _runner(model_dir: Path, is_reference: bool, capture: bool = True) -> ContinuousModelRunner:
+def _runner(model_dir: Path, is_reference: bool, capture: bool = True) -> ModelRunner:
     """The bf16 engine under test, or the reference: fp32 through `eager`.
 
     The reference names its kernel because the default one packs in fp32 too,
@@ -49,7 +49,7 @@ def _runner(model_dir: Path, is_reference: bool, capture: bool = True) -> Contin
     kernel = {"dtype": torch.float32, "attn_implementation": "eager"} if is_reference else {
         "dtype": torch.bfloat16, "enable_cuda_graphs": capture
     }
-    runner = ContinuousModelRunner(
+    runner = ModelRunner(
         EngineConfig(
             model=str(model_dir), device="cuda", max_num_seqs=4, max_model_len=64,
             **kernel,  # type: ignore[arg-type]

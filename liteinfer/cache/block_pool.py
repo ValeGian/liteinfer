@@ -20,7 +20,7 @@ class BlockPoolExhaustedError(RuntimeError):
     """The pool cannot hold what was asked of it.
 
     Raised by `allocate` with no free block left, and by
-    `ContinuousKVCache.reserve` before it allocates anything, when a step's
+    `KVCache.reserve` before it allocates anything, when a step's
     tokens need more blocks than are free.
     """
 

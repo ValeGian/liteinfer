@@ -145,12 +145,12 @@ listed.
 - **PRs.** _none yet_
 - **Why.** The scheduler admits by slots and by the token budget, never by free
   KV blocks, so a step can be scheduled that the pool cannot hold. Since §1.3,
-  `ContinuousKVCache.reserve` refuses such a step whole and the engine fails its least invested
+  `KVCache.reserve` refuses such a step whole and the engine fails its least invested
   tier — every sequence the step would have started, even where one fewer would
   have fitted, and without retrying them once blocks free up. Before §1.3 a
   refused prefill pass failed every prompt in it, so this is not a regression,
   but it is a request failed for want of waiting.
-- **Scope.** `ContinuousScheduler.schedule()` asks the cache how many blocks a
+- **Scope.** `Scheduler.schedule()` asks the cache how many blocks a
   grant needs (`_blocks_short_of` already computes it, from the total the
   sequence will hold) and stops admitting when the free pool would run out,
   leaving the rest waiting. The scheduler is built before the model loads and the
@@ -289,7 +289,7 @@ listed.
   §2.3 because inductor functionalises the in-place pool write into a copy of the
   whole pool; excluding the cache mutation recovered 1.02x and then recompiled
   once per `layer_idx`. If this is built, build it as three Triton kernels against
-  a dense reference — the shape `models/paged_decode.py` already established.
+  a dense reference — the shape `models/paged_kernels.py` already established.
 - **PRs.** _none yet_
 - **What it measured.** `torch.compile` on the decode forward is 206.66 ms
   against eager's 12.87 ms at a fixed shape — and it is *not* recompiling.
@@ -313,7 +313,7 @@ listed.
   the model's arithmetic. §3.2 has since collected the launch half of that, which
   is what makes the remaining half the thing worth measuring: re-profile inside a
   captured forward before sizing this.
-- **Scope.** Wrap the `ContinuousModelRunner` forward passes in `torch.compile`,
+- **Scope.** Wrap the `ModelRunner` forward passes in `torch.compile`,
   gated by `EngineConfig.enable_torch_compile`. First call pays
   compile cost; subsequent calls run the compiled graph.
 - **Risk.** Dynamic shapes (variable sequence length) defeat compile
@@ -324,7 +324,7 @@ listed.
 ### 3.4 Tensor parallelism (single-node)
 - **Status.** `planned`
 - **PRs.** _none yet_
-- **Scope.** Per-rank `ContinuousModelRunner` plus a process group. Layer
+- **Scope.** Per-rank `ModelRunner` plus a process group. Layer
   weights sharded along output dim (column-parallel) or input dim
   (row-parallel) per HF `_tp_plan`. Already declared in vendored
   models.
@@ -525,14 +525,6 @@ listed.
   listener have no callers outside their own tests. §1.3 removed the per-phase
   totals and averages, whose meaning a mixed step broke; `on_step` is what §6.2
   plans to read, so decide it with §6.2.
-- Drop the `Continuous*` prefix from `ContinuousScheduler`,
-  `ContinuousSchedulerOutput`, `ContinuousModelRunner`, `ContinuousKVCache` and
-  their modules: it named a choice against static batching that no longer
-  exists. Rename `models/paged_decode.py`, which holds `paged_prefill` too, and
-  fix the text that still describes retired code: the history in
-  `engine/cuda_graphs.py`'s module docstring, `_packed_forward`'s argument against
-  padding, `engine/__init__.py`'s "one prefill or decode forward pass" and
-  `models/__init__.py`'s `qwen.py`. Mechanical, its own PR, nothing measured.
 - `hf_config` and `tokenizer` are optional on the runner because `load_model`
   assigns them, so reads of them carry asserts for the type checker. Building the
   runner already loaded — `load_hf_model` returning the model, its shape and the

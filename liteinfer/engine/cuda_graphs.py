@@ -23,14 +23,10 @@ table can be a single fixed ``[max_num_seqs, max_model_len]`` buffer. Its unused
 columns are never even read: the table is left-aligned and the kernel stops at
 ``context_len``, so a wide table costs nothing and needs no zeroing between steps.
 
-That is why this is worth doing now and measured 1.06x when it was first tried.
-Until §2.3 the decode read *gathered* each sequence's KV history into a
-contiguous tensor, so the table's width was the size of a copy: a fixed-width
-table meant padding real bytes every layer of every step, and the item had to
-bucket the KV length and pay for the padding anyway. The paged kernel reads the
-pool where it lies and skips what `context_lens` excludes, so there are no KV
-buckets here, and no padded rows to discard either — capturing per exact batch
-width means every row of every capture is a real sequence.
+So there are no KV-length buckets here: the paged kernel reads the pool where it
+lies and skips what `context_lens` excludes, and a wider table moves no bytes. Nor
+are there padded rows to discard — capturing per exact batch width means every
+row of every capture is a real sequence.
 
 Which is also the precondition. The dense kernels slice each sequence's context
 on the host, a shape that changes every step and a capture cannot hold; only the
@@ -44,7 +40,7 @@ from collections.abc import Callable
 
 import torch
 
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache
+from liteinfer.cache.kv_cache import KVCache
 from liteinfer.models import LAST_POSITION
 from liteinfer.models.attention import reads_pool_in_place
 
@@ -119,7 +115,7 @@ class DecodeGraphs:
     def __init__(
         self,
         model: torch.nn.Module,
-        cache: ContinuousKVCache,
+        cache: KVCache,
         *,
         device: torch.device,
         max_num_seqs: int,

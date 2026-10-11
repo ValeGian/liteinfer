@@ -33,14 +33,14 @@ from collections.abc import AsyncGenerator
 
 from liteinfer.cache.block_pool import BlockPoolExhaustedError
 from liteinfer.config import EngineConfig
-from liteinfer.engine.continuous_model_runner import ContinuousModelRunner
-from liteinfer.engine.continuous_scheduler import ContinuousScheduler
 from liteinfer.engine.metrics import (
     EngineStats,
     StepMetrics,
     StepTimer,
     peak_gpu_memory_bytes,
 )
+from liteinfer.engine.model_runner import ModelRunner
+from liteinfer.engine.scheduler import Scheduler
 from liteinfer.engine.sequence import Sequence, SequenceStatus
 from liteinfer.engine.stopping import resolve_stop_status
 from liteinfer.outputs import StreamEvent
@@ -90,8 +90,8 @@ class AsyncLLMEngine:
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
-        self.scheduler = ContinuousScheduler(config)
-        self.model_runner = ContinuousModelRunner(config)
+        self.scheduler = Scheduler(config)
+        self.model_runner = ModelRunner(config)
         self.sampler = Sampler()
         self._step_idx = 0
         self.stats = EngineStats()
