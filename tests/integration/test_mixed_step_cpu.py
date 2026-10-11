@@ -1,9 +1,9 @@
 # pyright: reportPrivateImportUsage=false
-"""A step holding prompts and sampled tokens together, on the engine that pads.
+"""A step holding prompts and sampled tokens together, on CPU.
 
-CPU pads, so a mixed step runs as two passes inside `execute`; what must hold is
-that its caller cannot tell. The one-forward packed path needs CUDA and is
-checked in `test_mixed_step_gpu.py`.
+A mixed step is one packed forward here too, read through the dense loop; what
+must hold is that its caller cannot tell it from separate passes. The paged
+kernel's version needs CUDA and is checked in `test_mixed_step_gpu.py`.
 """
 
 from __future__ import annotations
@@ -24,7 +24,11 @@ from liteinfer.outputs import RequestOutput
 from liteinfer.sampling.params import SamplingParams
 from tests.integration.sequences import running_sequence
 
-_TOLERANCE = {"rtol": 0, "atol": 1e-5}
+# One forward and three run their GEMMs over different token counts, and CPU
+# BLAS blocks the reduction differently per shape, so fp32 sums round
+# differently: observed 1.5e-5 on logits near 74. A row out of place differs at
+# the scale of the logits themselves.
+_TOLERANCE = {"rtol": 0, "atol": 1e-4}
 
 
 def _runner(model_dir: Path) -> ContinuousModelRunner:
@@ -66,7 +70,7 @@ def test_a_chunk_crossing_from_prompt_into_output_is_refused(tiny_llama_dir: Pat
 
 
 def test_a_mixed_step_answers_each_sequence_in_the_order_it_was_given(tiny_llama_dir: Path):
-    """Two passes inside, scattered back: a row out of place would hand a sequence another's logits."""
+    """One pass, rows in the given order: a row out of place would hand a sequence another's logits."""
     mixed_runner, separate_runner = _runner(tiny_llama_dir), _runner(tiny_llama_dir)
     mixed = mixed_runner.execute(
         [running_sequence("prompt-a", 9, 30), _decoding(mixed_runner), running_sequence("prompt-b", 6, 60)]

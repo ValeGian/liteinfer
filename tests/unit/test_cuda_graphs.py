@@ -28,9 +28,9 @@ def test_a_cpu_device_cannot_capture():
     assert "CUDA device" in (unsupported_reason(_CPU, "paged") or "")
 
 
-def test_a_gathering_kernel_cannot_capture():
-    """The dense kernels take a mask as wide as the batch's longest context."""
-    assert "attention mask" in (unsupported_reason(_CUDA, "sdpa") or "")
+def test_a_dense_kernel_cannot_capture():
+    """The dense kernels slice each sequence's context on the host, a shape that changes every step."""
+    assert "slices each sequence" in (unsupported_reason(_CUDA, "sdpa") or "")
 
 
 def test_the_paged_kernel_on_cuda_can_capture():

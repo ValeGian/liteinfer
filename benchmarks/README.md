@@ -24,10 +24,10 @@ bench report --out docs/index.html
 ### Two dataset shapes, and when each one lies
 
 `--isl 128` gives every prompt in a run the same length, which isolates one
-shape and is what a kernel measurement wants. It also makes left-padding free:
-a batch padded to its longest prompt wastes nothing when every prompt is the
-longest. Anything that attacks padding measures **1.00x** on these datasets no
-matter how well it works.
+shape and is what a kernel measurement wants. It also makes padding free: a
+batch padded to its longest prompt wastes nothing when every prompt is the
+longest, so a change to how batches are laid out measures **1.00x** on these
+datasets no matter how well it works.
 
 `--isl mixed` keeps whole corpus turns instead, so the run carries the length
 spread real traffic has — median 18 tokens, p99 1,567, capped by `--max-isl`
