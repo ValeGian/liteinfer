@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, ProfilePayload
+from liteinfer.cache.continuous_kv_cache import (
+    ContinuousKVCache,
+    DecodeProfilePayload,
+    ProfilePayload,
+)
 from liteinfer.config import EngineConfig
 from liteinfer.engine.cuda_graphs import DecodeGraphs, graphs_are_enabled
 from liteinfer.engine.sequence import Sequence
@@ -298,6 +303,7 @@ class ContinuousModelRunner:
     # ------------------------------------------------------------------
 
     def _create_block_pool(self) -> BlockPool:
+        assert self.hf_config is not None
         num_layers: int = self.hf_config.num_hidden_layers
         num_kv_heads: int = self.hf_config.num_key_value_heads
         head_dim = _head_dim(self.hf_config)
@@ -381,55 +387,85 @@ class ContinuousModelRunner:
         """Peak allocation the widest step needs, beyond the weights.
 
         `schedule()` hands out up to `token_budget` tokens per step, so the
-        widest step is not hypothetical — it is what a cold engine does when that
-        many prompt tokens are already waiting. Running it here turns the
-        activation budget from a fraction someone guessed into a number this
-        device measured, through the kernel the engine will serve with.
+        widest packed pass is not hypothetical — it is what a cold engine does
+        when that many prompt tokens are already waiting. A kernel that copies
+        each row's context out of the pool has a second worst case the budget
+        does not cap: a decode step at full width (see `DecodeProfilePayload`).
+        Running both here turns the activation budget from a fraction someone
+        guessed into a number this device measured, through the kernel the engine
+        will serve with, and the larger of the two is what the pool leaves free.
 
-        The payload does not write to a cache, so this needs no pool: every
-        sequence is a whole prompt, whose attention reads only the K/V the pass
-        just computed, and `ProfilePayload` hands exactly that back.
+        The payloads write to no cache, so this needs no pool. That is what lets
+        the measurement happen before the pool is sized.
 
         A forward that will not fit is not fatal. It means the configuration
         cannot serve its own worst case, which is worth saying rather than
-        crashing on — sizing falls back to the fraction alone, and the WARNING in
+        crashing on — that forward is left out of the budget, and the WARNING in
         `_compute_num_blocks` still reports what the pool can serve.
         """
         if self.device.type != "cuda":
             return 0
-        assert self.model is not None
-
-        lengths = self._widest_step()
         try:
             # The first forward in a process allocates cuBLAS workspaces that every
             # later one reuses, and they land in the peak. Unwarmed, a narrow config
             # measured 8.49 MiB where a config sixteen times wider measured 5.77 —
             # so the first engine in a process would have been handed the smallest
-            # pool. One throwaway pass absorbs that.
-            self._profile_forward([min(self.config.max_model_len, _PROFILE_WARMUP_TOKENS)])
-            torch.cuda.reset_peak_memory_stats(self.device)
-            before = torch.cuda.memory_allocated(self.device)
-            self._profile_forward(lengths)
-            measured = torch.cuda.max_memory_allocated(self.device) - before
-        except torch.OutOfMemoryError:
-            _LOGGER.warning(
-                "the widest step this config allows — %d tokens as %d sequences — does "
-                "not fit, so the KV pool is sized without a measured activation budget. "
-                "Lower max_num_batched_tokens or max_model_len to serve that case.",
-                sum(lengths), len(lengths),
-            )
-            measured = 0
+            # pool. One throwaway pass absorbs that. It is left to raise: an engine
+            # that cannot run 16 tokens has no worst case worth measuring.
+            self._profile_packed([min(self.config.max_model_len, _PROFILE_WARMUP_TOKENS)])
+            measured = self._measure_widest_packed_step()
+            if not reads_pool_in_place(self.attn_implementation):
+                measured = max(measured, self._measure_widest_decode())
         finally:
             torch.cuda.empty_cache()
+        return measured
 
-        _LOGGER.info(
-            "widest step (%d tokens as %d sequences) needs %.2f GiB of activations",
-            sum(lengths), len(lengths), measured / _GIB,
+    def _measure_widest_packed_step(self) -> int:
+        """Peak allocation of `_widest_packed_step`, or 0 if it does not fit."""
+        lengths = self._widest_packed_step()
+        return self._peak_bytes(
+            lambda: self._profile_packed(lengths),
+            f"packed step ({sum(lengths)} tokens as {len(lengths)} sequences)",
+            "Lower max_num_batched_tokens or max_model_len to serve that case.",
         )
-        return max(0, measured)
 
-    def _widest_step(self) -> list[int]:
-        """The step needing the most activations: a full token budget in the fewest, longest prompts.
+    def _measure_widest_decode(self) -> int:
+        """Peak allocation of a decode step at full width and full context, or 0 if it does not fit."""
+        assert self.hf_config is not None
+        batch, width = self.config.max_num_seqs, self.config.max_model_len
+        payload = DecodeProfilePayload(
+            batch,
+            width,
+            self.hf_config.num_key_value_heads,
+            _head_dim(self.hf_config),
+            self.config.dtype,
+            self.device,
+        )
+        return self._peak_bytes(
+            lambda: self._profile_decode(payload, batch, width),
+            f"decode step ({batch} sequences x {width} tokens of context)",
+            "Lower max_num_seqs or max_model_len, or serve with the paged kernel, which reads "
+            "the pool in place.",
+        )
+
+    def _peak_bytes(self, forward: Callable[[], None], step: str, remedy: str) -> int:
+        """What `forward` allocates at its peak beyond what was resident, or 0 if it does not fit."""
+        torch.cuda.reset_peak_memory_stats(self.device)
+        before = torch.cuda.memory_allocated(self.device)
+        try:
+            forward()
+        except torch.OutOfMemoryError:
+            _LOGGER.warning(
+                "the widest %s this config allows does not fit, so the KV pool is sized "
+                "without measuring it. %s", step, remedy,
+            )
+            return 0
+        measured = max(0, torch.cuda.max_memory_allocated(self.device) - before)
+        _LOGGER.info("widest %s needs %.2f GiB of activations", step, measured / _GIB)
+        return measured
+
+    def _widest_packed_step(self) -> list[int]:
+        """The packed step needing the most activations: a full token budget in the fewest, longest prompts.
 
         The linear layers cost the same however a step's tokens are split, but
         attention costs more the longer each sequence is — the dense kernels copy
@@ -441,7 +477,7 @@ class ContinuousModelRunner:
         full, rest = divmod(budget, longest)
         return [longest] * full + ([rest] if rest else [])
 
-    def _profile_forward(self, lengths: list[int]) -> None:
+    def _profile_packed(self, lengths: list[int]) -> None:
         """One packed forward over whole prompts of dummy tokens, writing to no cache."""
         assert self.model is not None
         payload = ProfilePayload(lengths, self.device)
@@ -451,6 +487,17 @@ class ContinuousModelRunner:
                 position_ids=payload.positions,
                 past_key_values=payload,
                 logits_positions=payload.query_start_loc[1:] - 1,
+            )
+
+    def _profile_decode(self, payload: DecodeProfilePayload, batch: int, width: int) -> None:
+        """One decode forward of dummy tokens, each row the last position of a `width`-token context."""
+        assert self.model is not None
+        with torch.inference_mode():
+            self.model(
+                input_ids=torch.zeros((batch, 1), dtype=torch.long, device=self.device),
+                position_ids=torch.full((batch, 1), width - 1, dtype=torch.long, device=self.device),
+                past_key_values=payload,
+                logits_positions=LAST_POSITION,
             )
 
     def _log_pool(self, num_blocks: int, bytes_per_block: int, reason: str) -> None:

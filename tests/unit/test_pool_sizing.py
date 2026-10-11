@@ -139,15 +139,15 @@ def test_a_cpu_engine_profiles_nothing() -> None:
     assert runner._profile_forward_bytes() == 0
 
 
-def test_the_widest_step_is_whole_prompts_of_the_longest_length() -> None:
+def test_the_widest_packed_step_is_whole_prompts_of_the_longest_length() -> None:
     """Attention costs more the longer each sequence is, so the worst case packs the fewest, longest."""
     runner = _runner(max_num_seqs=4, max_model_len=64, max_num_batched_tokens=100)
 
-    assert runner._widest_step() == [64, 36]
+    assert runner._widest_packed_step() == [64, 36]
 
 
-def test_the_widest_step_never_holds_more_sequences_than_can_run() -> None:
+def test_the_widest_packed_step_never_holds_more_sequences_than_can_run() -> None:
     """A budget past `max_num_seqs x max_model_len` is tokens no step can be given."""
     runner = _runner(max_num_seqs=2, max_model_len=64, max_num_batched_tokens=1000)
 
-    assert runner._widest_step() == [64, 64]
+    assert runner._widest_packed_step() == [64, 64]

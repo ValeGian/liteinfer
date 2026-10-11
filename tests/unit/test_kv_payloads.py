@@ -13,7 +13,11 @@ from __future__ import annotations
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
-from liteinfer.cache.continuous_kv_cache import ContinuousKVCache, ProfilePayload
+from liteinfer.cache.continuous_kv_cache import (
+    ContinuousKVCache,
+    DecodeProfilePayload,
+    ProfilePayload,
+)
 from liteinfer.models.attention import PagedKV
 
 _BLOCK_SIZE = 4
@@ -174,6 +178,30 @@ def test_the_profile_payload_positions_count_from_each_prompt_s_start():
     payload = ProfilePayload([3, 2], torch.device("cpu"))
 
     assert payload.positions.tolist() == [[0, 1, 2, 0, 1]]
+
+
+def _decode_profile(batch: int, width: int) -> PagedKV:
+    payload = DecodeProfilePayload(
+        batch, width, _NUM_KV_HEADS, _HEAD_DIM, torch.float32, torch.device("cpu")
+    )
+    return payload.update(*_decode_token(batch), _LAYER)
+
+
+def test_the_decode_profile_payload_gives_every_row_a_full_width_context():
+    """The worst decode step a dense kernel copies out is every row at the longest context."""
+    assert _decode_profile(batch=3, width=10).context_lens.tolist() == [10, 10, 10]
+
+
+def test_the_decode_profile_payload_reads_a_full_width_row_per_sequence():
+    """One table row per sequence, each as wide as the context, is what sizes the copy."""
+    assert _decode_profile(batch=3, width=10).slot_table.shape == (3, 10)
+
+
+def test_the_decode_profile_payload_addresses_only_its_own_stand_in_pool():
+    """Every row reads the same slots, so the pool needs one context's worth and no more."""
+    kv = _decode_profile(batch=3, width=10)
+
+    assert int(kv.slot_table.max()) < kv.key_pool.shape[0]
 
 
 # --- whole prompts, packed ---------------------------------------------------

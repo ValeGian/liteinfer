@@ -100,18 +100,25 @@ class BlockPool:
         return self._keys[layer_idx], self._values[layer_idx]
 
 
-def _padded_blocks(block_tables: Sequence[Sequence[int]], device: torch.device) -> torch.Tensor:
-    """Every sequence's block table as one ``[B, max_blocks]`` tensor, in one transfer.
+def _padded_blocks(
+    block_tables: Sequence[Sequence[int]], device: torch.device, *leading: Sequence[int]
+) -> torch.Tensor:
+    """Every sequence's block table as one ``[B, len(leading) + max_blocks]`` tensor, in one transfer.
 
     Padded on the host and moved once: a row-by-row copy costs one
     host-to-device transfer per sequence — and those are pageable, so each one
-    blocks — where this costs one for the batch. The padding is block 0, which
-    is a real block; no answer depends on it, because every read is bounded by
-    its sequence's context length.
+    blocks — where this costs one for the batch. Each of `leading` is one more
+    integer per sequence riding in the same transfer, as the first columns, for
+    the same reason. The padding is block 0, which is a real block; no answer
+    depends on it, because every read is bounded by its sequence's context length.
     """
     width = max(len(table) for table in block_tables)
-    padded = [list(table) + [0] * (width - len(table)) for table in block_tables]
-    return torch.tensor(padded, dtype=torch.long, device=device)
+    fronts = list(zip(*leading, strict=True)) if leading else [()] * len(block_tables)
+    rows = [
+        [*front, *table, *[0] * (width - len(table))]
+        for front, table in zip(fronts, block_tables, strict=True)
+    ]
+    return torch.tensor(rows, dtype=torch.long, device=device)
 
 
 def _slots_of(blocks: torch.Tensor, max_total: int, block_size: int) -> torch.Tensor:
@@ -199,8 +206,8 @@ def packed_addresses(
     every token at once — plus the owner's start. The total and the widest
     context come from the Python counts, so nothing here waits on the device.
     """
-    blocks = _padded_blocks(block_tables, device)
-    count, start = torch.tensor([list(counts), list(starts)], dtype=torch.long, device=device)
+    moved = _padded_blocks(block_tables, device, counts, starts)
+    count, start, blocks = moved[:, 0], moved[:, 1], moved[:, 2:]
     total = sum(counts)
     owner = torch.repeat_interleave(torch.arange(len(counts), device=device), count, output_size=total)
     run_ends = torch.cumsum(count, 0)

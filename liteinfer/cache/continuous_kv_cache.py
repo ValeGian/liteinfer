@@ -81,6 +81,7 @@ class ProfilePayload:
         slots = (run_ends - lens).unsqueeze(1) + torch.arange(max(lengths), device=device)
         self._slots = slots.clamp_(max=sum(lengths) - 1)
         self._context_lens = lens.to(torch.int32)
+        self._max_query_len = max(lengths)
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
         return PagedKV(
@@ -89,10 +90,39 @@ class ProfilePayload:
             self._slots,
             self._context_lens,
             query_start_loc=self.query_start_loc,
-            max_query_len=max(self._lengths),
+            max_query_len=self._max_query_len,
             host_context_lens=self._lengths,
             host_query_lens=self._lengths,
         )
+
+
+class DecodeProfilePayload:
+    """A decode step being measured: `batch` rows, each reading a `width`-token context.
+
+    A kernel that copies each row's context out of the pool copies ``batch x
+    width`` tokens of K and V in a decode step, however small the token budget —
+    so for those kernels the widest packed pass does not bound the widest step.
+    The stand-in pool holds only `width` slots and every row reads all of them:
+    the copy's size follows from how many slots each row reads, not which.
+    Nothing is written, as with `ProfilePayload`.
+    """
+
+    def __init__(
+        self,
+        batch: int,
+        width: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self._key_pool = torch.zeros((width, num_kv_heads, head_dim), dtype=dtype, device=device)
+        self._value_pool = torch.zeros_like(self._key_pool)
+        self._slots = torch.arange(width, device=device).expand(batch, width)
+        self._context_lens = torch.full((batch,), width, dtype=torch.int32, device=device)
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
+        return PagedKV(self._key_pool, self._value_pool, self._slots, self._context_lens)
 
 
 class ContinuousKVCache:
@@ -277,6 +307,7 @@ class _PackedPayload:
         self.addresses = addresses
         self._host_context_lens = host_context_lens
         self._host_query_lens = host_query_lens
+        self._max_query_len = max(host_query_lens)
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> PagedKV:
         """Store this pass's tokens; return where every token each sequence holds lives."""
@@ -288,7 +319,7 @@ class _PackedPayload:
             self.addresses.slot_table,
             self.addresses.context_lens,
             query_start_loc=self.addresses.query_start_loc,
-            max_query_len=max(self._host_query_lens),
+            max_query_len=self._max_query_len,
             host_context_lens=self._host_context_lens,
             host_query_lens=self._host_query_lens,
         )

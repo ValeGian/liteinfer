@@ -1620,7 +1620,10 @@ whole `max_model_len` prompts, through the kernel the engine serves with. At
 32 x 4,096 on Llama-3.2-1B it reserves **8.03 GiB** under `paged` and `sdpa`,
 against 9.03 for the padded `sdpa` forward it replaces. Under `eager` the padded
 forward did not fit at all — the pool was sized with no measured activations —
-and the per-sequence one measures 8.03 GiB too.
+and the per-sequence one measures 8.03 GiB too. The dense kernels also measure a
+decode step at full width: it copies `max_num_seqs x max_model_len` tokens of K/V
+out of the pool however small the token budget, which a budgeted packed pass
+does not bound, and the larger of the two peaks is what the pool leaves free.
 
 ### A stable run is not a comparable one
 
