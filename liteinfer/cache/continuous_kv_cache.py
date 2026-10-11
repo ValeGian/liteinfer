@@ -1,12 +1,13 @@
 # pyright: reportPrivateImportUsage=false
 """Per-sequence paged KV cache for continuous batching.
 
-Sequences are keyed by ``request_id`` and can register or deregister at any
-time, which is what the scheduler's slot-filling policy requires. A pass first
-`advance`s the sequences it computes by the tokens it will write, then asks for
-a payload; every payload addresses each sequence's *newest* tokens, so a whole
-prompt, a chunk continuing one, and a decode step are the same request with
-different counts.
+The cache owns each sequence's blocks and nothing else: how many tokens a
+sequence holds is `Sequence.num_computed_tokens`, and every method that needs it
+is handed it. A pass first `reserve`s room for what each sequence will hold once
+it is written, then asks for a payload; every payload addresses each sequence's
+*newest* tokens, so a whole prompt, a chunk continuing one, and a decode step are
+the same request with different counts. A sequence's block table exists from its
+first reservation to its `release`.
 
 Payload protocol
 ----------------
@@ -131,32 +132,18 @@ class ContinuousKVCache:
     def __init__(self, pool: BlockPool) -> None:
         self._pool = pool
         self._block_tables: dict[str, list[int]] = {}
-        self._token_counts: dict[str, int] = {}
 
     # ------------------------------------------------------------------
-    # Sequence lifecycle
+    # Blocks
     # ------------------------------------------------------------------
 
-    def register(self, request_id: str) -> None:
-        """Start tracking a sequence that holds nothing yet; `advance` allocates for it."""
-        self._block_tables[request_id] = []
-        self._token_counts[request_id] = 0
-
-    def deregister(self, request_id: str) -> None:
+    def release(self, request_id: str) -> None:
         """Free all blocks belonging to a finished sequence."""
         for block_idx in self._block_tables.pop(request_id, []):
             self._pool.free(block_idx)
-        self._token_counts.pop(request_id, None)
 
-    def is_registered(self, request_id: str) -> bool:
-        return request_id in self._token_counts
-
-    def seq_total_len(self, request_id: str) -> int:
-        """Cached token count for a registered sequence."""
-        return self._token_counts[request_id]
-
-    def advance(self, request_ids: list[str], counts: list[int]) -> None:
-        """Account for the tokens a pass is about to write, allocating blocks to hold them.
+    def reserve(self, request_ids: list[str], totals: list[int]) -> None:
+        """Give each sequence the blocks to hold `totals[i]` tokens, before a pass writes them.
 
         Called before the payload is made, because the payload addresses each
         sequence's newest tokens and those must already have somewhere to live.
@@ -165,51 +152,45 @@ class ContinuousKVCache:
         All or nothing: when the pool cannot hold every sequence's tokens, it
         raises `BlockPoolExhaustedError` before anything changes. A step carries
         running sequences and newly admitted ones in one pass, so a caller can
-        then drop the newcomers and keep the rest rather than lose the whole step,
-        and a cache left half-advanced would account for tokens no pass wrote.
+        then drop the newcomers and keep the rest rather than lose the whole step.
         """
         block_size = self._pool.block_size
-        windows = list(zip(request_ids, counts, strict=True))
-        needed = sum(self._blocks_short_of(request_id, count) for request_id, count in windows)
+        wanted = list(zip(request_ids, totals, strict=True))
+        needed = sum(self._blocks_short_of(request_id, total) for request_id, total in wanted)
         if needed > self._pool.num_free_blocks:
             raise BlockPoolExhaustedError(
                 f"KV block pool exhausted: this step needs {needed} more blocks and "
                 f"{self._pool.num_free_blocks} of {self._pool.num_blocks} are free. "
                 "Increase num_gpu_blocks or reduce max_num_seqs / max_model_len."
             )
-        for request_id, count in windows:
-            total = self._token_counts[request_id] + count
-            table = self._block_tables[request_id]
+        for request_id, total in wanted:
+            table = self._block_tables.setdefault(request_id, [])
             while len(table) * block_size < total:
                 table.append(self._pool.allocate())
-            self._token_counts[request_id] = total
 
-    def _blocks_short_of(self, request_id: str, count: int) -> int:
-        """Blocks a sequence must be given before it can hold `count` more tokens."""
-        total = self._token_counts[request_id] + count
-        held = len(self._block_tables[request_id])
+    def _blocks_short_of(self, request_id: str, total: int) -> int:
+        """Blocks a sequence must be given before it can hold `total` tokens."""
+        held = len(self._block_tables.get(request_id, ()))
         return max(0, -(-total // self._pool.block_size) - held)
 
     # ------------------------------------------------------------------
     # Payload factory
     # ------------------------------------------------------------------
 
-    def make_packed_payload(self, request_ids: list[str], counts: list[int]) -> _PackedPayload:
-        """Return a payload for each sequence's newest `counts` tokens, laid end to end.
+    def make_packed_payload(
+        self, request_ids: list[str], starts: list[int], counts: list[int]
+    ) -> _PackedPayload:
+        """Return a payload for each sequence's `counts` tokens from `starts`, laid end to end.
 
         The payload carries the run's `PackedAddresses`, whose positions and
         boundaries the caller also needs for RoPE and for picking each
         sequence's last token, so they are built once per pass.
         """
-        totals = [self._token_counts[r] for r in request_ids]
         addresses = packed_addresses(
-            [self._block_tables[r] for r in request_ids],
-            [total - count for total, count in zip(totals, counts, strict=True)],
-            counts,
-            self._pool.block_size,
-            self._pool.device,
+            self._tables(request_ids), starts, counts, self._pool.block_size, self._pool.device
         )
-        return _PackedPayload(self, addresses, tuple(totals), tuple(counts))
+        totals = tuple(start + count for start, count in zip(starts, counts, strict=True))
+        return _PackedPayload(self, addresses, totals, tuple(counts))
 
     def make_decode_payload(
         self,
@@ -231,31 +212,18 @@ class ContinuousKVCache:
     # Addresses a decode step builds
     # ------------------------------------------------------------------
 
-    def newest_slots_for(self, request_ids: list[str]) -> torch.Tensor:
-        """Each sequence's newest token's slot, ``[1, B]`` — where a decode step writes."""
+    def newest_slots_for(self, request_ids: list[str], positions: list[int]) -> torch.Tensor:
+        """The slot of each sequence's token at `positions[i]`, ``[1, B]`` — where a decode step writes."""
         return newest_slots(
-            [self._block_tables[r] for r in request_ids],
-            [self._token_counts[r] - 1 for r in request_ids],
-            self._pool.block_size,
-            self._pool.device,
+            self._tables(request_ids), positions, self._pool.block_size, self._pool.device
         )
 
-    def slot_table_for(self, request_ids: list[str]) -> torch.Tensor:
-        """Every cached token of each sequence, left-aligned. See `block_pool.slot_table`."""
-        return slot_table(
-            [self._block_tables[rid] for rid in request_ids],
-            [self._token_counts[rid] for rid in request_ids],
-            self._pool.block_size,
-            self._pool.device,
-        )
+    def slot_table_for(self, request_ids: list[str], totals: list[int]) -> torch.Tensor:
+        """Each sequence's first `totals[i]` tokens, left-aligned. See `block_pool.slot_table`."""
+        return slot_table(self._tables(request_ids), totals, self._pool.block_size, self._pool.device)
 
-    def context_lens_for(self, request_ids: list[str]) -> torch.Tensor:
-        """Cached-token count per sequence, as ``[B]`` on the pool's device."""
-        return torch.tensor(
-            [self._token_counts[rid] for rid in request_ids],
-            dtype=torch.int32,
-            device=self._pool.device,
-        )
+    def _tables(self, request_ids: list[str]) -> list[list[int]]:
+        return [self._block_tables[request_id] for request_id in request_ids]
 
     # ------------------------------------------------------------------
     # Pool access shared by payloads

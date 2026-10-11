@@ -57,13 +57,6 @@ def _prompt_kv(lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.randn(shape, generator=generator), torch.randn(shape, generator=generator)
 
 
-def _registered(cache: ContinuousKVCache, request_ids: list[str], counts: list[int]) -> None:
-    """Register sequences and account for a first pass of `counts` tokens, as `execute` does."""
-    for request_id in request_ids:
-        cache.register(request_id)
-    cache.advance(request_ids, counts)
-
-
 def _read_back_keys(kv: PagedKV, lengths: list[int]) -> torch.Tensor:
     """Every key a `PagedKV` addresses, packed `[1, H, sum, D]` as a pass computes them.
 
@@ -77,23 +70,27 @@ def _read_back_keys(kv: PagedKV, lengths: list[int]) -> torch.Tensor:
 # --- decode ------------------------------------------------------------------
 
 
+_MID_DECODE_PROMPT_LENS = [2, 6]
+_MID_DECODE_TOTALS = [length + 1 for length in _MID_DECODE_PROMPT_LENS]
+
+
 def _two_sequences_mid_decode() -> tuple[ContinuousKVCache, list[str]]:
-    """A cache holding two prefilled sequences of different lengths, ready to decode."""
+    """A cache holding two prefilled sequences of different lengths, with room for one more token each."""
     cache = _cache()
-    request_ids, prompt_lens = ["short", "long"], [2, 6]
-    _registered(cache, request_ids, prompt_lens)
+    request_ids, prompt_lens = ["short", "long"], _MID_DECODE_PROMPT_LENS
+    cache.reserve(request_ids, prompt_lens)
     prompt_kv = torch.zeros(1, _NUM_KV_HEADS, sum(prompt_lens), _HEAD_DIM)
-    cache.make_packed_payload(request_ids, prompt_lens).update(prompt_kv, prompt_kv, _LAYER)
-    cache.advance(request_ids, [1, 1])
+    cache.make_packed_payload(request_ids, [0, 0], prompt_lens).update(prompt_kv, prompt_kv, _LAYER)
+    cache.reserve(request_ids, _MID_DECODE_TOTALS)
     return cache, request_ids
 
 
 def _decode_payload(cache: ContinuousKVCache, request_ids: list[str], num_splits=None):
     """The payload `execute` builds for a decode step, from the same addresses."""
     return cache.make_decode_payload(
-        cache.newest_slots_for(request_ids),
-        cache.slot_table_for(request_ids),
-        cache.context_lens_for(request_ids),
+        cache.newest_slots_for(request_ids, [total - 1 for total in _MID_DECODE_TOTALS]),
+        cache.slot_table_for(request_ids, _MID_DECODE_TOTALS),
+        torch.tensor(_MID_DECODE_TOTALS, dtype=torch.int32),
         num_splits,
     )
 
@@ -211,14 +208,14 @@ def _packed_whole_prompts(
     cache: ContinuousKVCache, request_ids: list[str], lengths: list[int], keys, values
 ) -> PagedKV:
     """What a packed pass over whole prompts hands attention: the pool, addresses and boundaries."""
-    return cache.make_packed_payload(request_ids, lengths).update(keys, values, _LAYER)
+    cache.reserve(request_ids, lengths)
+    return cache.make_packed_payload(request_ids, [0] * len(lengths), lengths).update(keys, values, _LAYER)
 
 
 def test_packed_payload_reports_where_each_prompt_starts():
     """`query_start_loc` marks where each prompt starts; nothing else separates them."""
     cache = _cache()
     request_ids, lengths = ["a", "b"], [2, 5]
-    _registered(cache, request_ids, lengths)
 
     kv = _packed_whole_prompts(cache, request_ids, lengths, *_prompt_kv(lengths))
 
@@ -229,7 +226,6 @@ def test_a_whole_prompt_attends_to_exactly_the_tokens_its_own_pass_wrote():
     """Nothing was cached before the pass, so each prompt's context is the prompt itself."""
     cache = _cache()
     request_ids, lengths = ["a", "b"], [2, 5]
-    _registered(cache, request_ids, lengths)
 
     kv = _packed_whole_prompts(cache, request_ids, lengths, *_prompt_kv(lengths))
 
@@ -240,7 +236,6 @@ def test_a_whole_prompt_addresses_the_keys_its_own_pass_wrote():
     """Read through its addresses, the pool holds exactly the K/V the pass computed."""
     cache = _cache()
     request_ids, lengths = ["a", "b"], [2, 5]
-    _registered(cache, request_ids, lengths)
     keys, values = _prompt_kv(lengths)
 
     kv = _packed_whole_prompts(cache, request_ids, lengths, keys, values)
@@ -251,7 +246,6 @@ def test_a_whole_prompt_addresses_the_keys_its_own_pass_wrote():
 def test_packed_payload_hands_the_dense_kernels_each_query_count_on_the_host():
     cache = _cache()
     request_ids, lengths = ["a", "b"], [2, 5]
-    _registered(cache, request_ids, lengths)
 
     kv = _packed_whole_prompts(cache, request_ids, lengths, *_prompt_kv(lengths))
 
@@ -278,14 +272,14 @@ def _chunked_packed(cache: ContinuousKVCache) -> PagedKV:
     """Prefill `_CHUNKED_LENGTHS` in two packed passes; return what the second one hands attention."""
     request_ids = ["a", "b"]
     keys, values = _prompt_kv(_CHUNKED_LENGTHS)
-    _registered(cache, request_ids, _FIRST_CHUNK)
+    cache.reserve(request_ids, _FIRST_CHUNK)
     first = [slice(0, count) for count in _FIRST_CHUNK]
-    cache.make_packed_payload(request_ids, _FIRST_CHUNK).update(
+    cache.make_packed_payload(request_ids, [0, 0], _FIRST_CHUNK).update(
         _ragged_chunk(keys, first), _ragged_chunk(values, first), _LAYER
     )
-    cache.advance(request_ids, _SECOND_CHUNK)
+    cache.reserve(request_ids, _CHUNKED_LENGTHS)
     second = [slice(count, None) for count in _FIRST_CHUNK]
-    return cache.make_packed_payload(request_ids, _SECOND_CHUNK).update(
+    return cache.make_packed_payload(request_ids, _FIRST_CHUNK, _SECOND_CHUNK).update(
         _ragged_chunk(keys, second), _ragged_chunk(values, second), _LAYER
     )
 

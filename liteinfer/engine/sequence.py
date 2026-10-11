@@ -43,7 +43,9 @@ class Sequence:
     detokenizer: IncrementalDetokenizer = field(default_factory=IncrementalDetokenizer)
     num_computed_tokens: int = 0
     """Tokens whose K/V are in the cache. What is left of `len(self)` is what the
-    next step has to compute: the rest of the prompt, or the one sampled token."""
+    next step has to compute: the rest of the prompt, or the one sampled token.
+    The only record of it — the cache holds the blocks, not the count — and
+    `ContinuousModelRunner.execute` advances it once the pass that wrote them returns."""
 
     @property
     def output_text(self) -> str:

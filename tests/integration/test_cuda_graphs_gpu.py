@@ -140,7 +140,7 @@ def test_a_narrowing_batch_captures_each_width_it_visits(tiny_llama_dir: Path):
         runner.execute(seqs)
         for seq in seqs:
             seq.output_token_ids.append(3)
-        runner.deregister_sequence(seqs.pop())  # retire one, as the scheduler would
+        runner.release_sequence(seqs.pop())  # retire one, as the scheduler would
     runner.execute(seqs)
 
     assert sorted(runner.captured_decode_widths) == [1, 2, 3]
@@ -233,7 +233,7 @@ def test_a_short_sequence_replayed_after_a_long_one_ignores_the_columns_it_left(
     for step in range(_DECODE_STEPS):
         long_run[0].output_token_ids.append(3 + step)
         reused.execute(long_run)
-    reused.deregister_sequence(long_run[0])
+    reused.release_sequence(long_run[0])
 
     after_long = _decode_logits(reused, (4,))
     fresh = _decode_logits(_runner(tiny_llama_dir, capture=True, max_num_seqs=1), (4,))
