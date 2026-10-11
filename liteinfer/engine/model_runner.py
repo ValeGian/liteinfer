@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from liteinfer.cache.block_pool import BlockPool
+from liteinfer.cache.block_tables import BlockTables
 from liteinfer.cache.kv_cache import (
     DecodeProfilePayload,
     KVCache,
@@ -93,6 +94,7 @@ class ModelRunner:
         self.model: torch.nn.Module | None = None
         self.hf_config = None
         self.tokenizer: Tokenizer | None = None
+        self._block_tables: BlockTables | None = None
         self._cache: KVCache | None = None
         self._graphs: DecodeGraphs | None = None
         self._forward_bytes = 0
@@ -104,8 +106,20 @@ class ModelRunner:
         # Measured before the pool exists, because the pool gets whatever the
         # forward turns out not to need.
         self._forward_bytes = self._profile_forward_bytes()
-        self._cache = KVCache(self._create_block_pool())
+        pool = self._create_block_pool()
+        self._block_tables = BlockTables(pool.num_blocks, pool.block_size)
+        self._cache = KVCache(pool, self._block_tables)
         self._graphs = self._create_decode_graphs()
+
+    @property
+    def block_tables(self) -> BlockTables:
+        """Which blocks each sequence holds and which are free; the scheduler admits by it.
+
+        Built by `load_model`, because how many blocks there are is only known
+        once the activation profile has said what the forward needs.
+        """
+        assert self._block_tables is not None, "load_model() builds the block tables"
+        return self._block_tables
 
     @property
     def attn_implementation(self) -> str:
@@ -129,11 +143,6 @@ class ModelRunner:
         """
         return [] if self._graphs is None else self._graphs.captured_widths
 
-    def release_sequence(self, seq: Sequence) -> None:
-        """Free paged KV blocks allocated for a finished sequence."""
-        assert self._cache is not None
-        self._cache.release(seq.request_id)
-
     @torch.inference_mode()
     def execute(self, seqs: list[Sequence], num_tokens: list[int] | None = None) -> torch.Tensor:
         """One step's forward over the next `num_tokens` tokens of each sequence.
@@ -144,7 +153,9 @@ class ModelRunner:
         sequence, the sampled token for one past its prompt. Once the forward
         returns, each sequence's `num_computed_tokens` counts what the pass wrote:
         the runner is what knows the pass ran, and a pass that raises leaves the
-        counts where they were.
+        counts where they were. The blocks the pass writes are reserved here, all
+        or nothing; under the engine the scheduler granted only what is free, so a
+        refusal here is a scheduling bug rather than a full pool.
 
         Returns logits ``[len(seqs), vocab_size]`` at each sequence's last token,
         in `seqs` order. Only a sequence whose prompt is now complete has a next
@@ -161,7 +172,7 @@ class ModelRunner:
 
         request_ids = [s.request_id for s in seqs]
         chunks = self._next_chunks(seqs, num_tokens)
-        self._cache.reserve(request_ids, [chunk.end for chunk in chunks])
+        self.block_tables.reserve(request_ids, [chunk.end for chunk in chunks])
 
         if all(len(chunk.token_ids) == 1 for chunk in chunks):
             logits = self._decode(request_ids, chunks)

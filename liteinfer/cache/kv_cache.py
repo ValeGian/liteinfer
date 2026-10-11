@@ -1,13 +1,13 @@
 # pyright: reportPrivateImportUsage=false
 """Per-sequence paged KV cache for continuous batching.
 
-The cache owns each sequence's blocks and nothing else: how many tokens a
-sequence holds is `Sequence.num_computed_tokens`, and every method that needs it
-is handed it. A pass first `reserve`s room for what each sequence will hold once
-it is written, then asks for a payload; every payload addresses each sequence's
-*newest* tokens, so a whole prompt, a chunk continuing one, and a decode step are
-the same request with different counts. A sequence's block table exists from its
-first reservation to its `release`.
+The cache turns block tables into addresses over the device pool, and holds
+nothing else: which blocks a sequence holds is `BlockTables`, how many tokens it
+holds is `Sequence.num_computed_tokens`, and every method that needs a count is
+handed it. A pass first reserves room for what each sequence will hold once it is
+written (`BlockTables.reserve`), then asks for a payload; every payload addresses
+each sequence's *newest* tokens, so a whole prompt, a chunk continuing one, and a
+decode step are the same request with different counts.
 
 Payload protocol
 ----------------
@@ -38,12 +38,12 @@ import torch
 
 from liteinfer.cache.block_pool import (
     BlockPool,
-    BlockPoolExhaustedError,
     PackedAddresses,
     newest_slots,
     packed_addresses,
     slot_table,
 )
+from liteinfer.cache.block_tables import BlockTables
 from liteinfer.models.attention import PagedKV
 
 
@@ -127,51 +127,11 @@ class DecodeProfilePayload:
 
 
 class KVCache:
-    """Per-sequence block-allocated KV cache for continuous batching."""
+    """Payloads and addresses over a `BlockPool`, read through `BlockTables`."""
 
-    def __init__(self, pool: BlockPool) -> None:
+    def __init__(self, pool: BlockPool, blocks: BlockTables) -> None:
         self._pool = pool
-        self._block_tables: dict[str, list[int]] = {}
-
-    # ------------------------------------------------------------------
-    # Blocks
-    # ------------------------------------------------------------------
-
-    def release(self, request_id: str) -> None:
-        """Free all blocks belonging to a finished sequence."""
-        for block_idx in self._block_tables.pop(request_id, []):
-            self._pool.free(block_idx)
-
-    def reserve(self, request_ids: list[str], totals: list[int]) -> None:
-        """Give each sequence the blocks to hold `totals[i]` tokens, before a pass writes them.
-
-        Called before the payload is made, because the payload addresses each
-        sequence's newest tokens and those must already have somewhere to live.
-        Allocation is host-side bookkeeping, and it stays out of the forward.
-
-        All or nothing: when the pool cannot hold every sequence's tokens, it
-        raises `BlockPoolExhaustedError` before anything changes. A step carries
-        running sequences and newly admitted ones in one pass, so a caller can
-        then drop the newcomers and keep the rest rather than lose the whole step.
-        """
-        block_size = self._pool.block_size
-        wanted = list(zip(request_ids, totals, strict=True))
-        needed = sum(self._blocks_short_of(request_id, total) for request_id, total in wanted)
-        if needed > self._pool.num_free_blocks:
-            raise BlockPoolExhaustedError(
-                f"KV block pool exhausted: this step needs {needed} more blocks and "
-                f"{self._pool.num_free_blocks} of {self._pool.num_blocks} are free. "
-                "Increase num_gpu_blocks or reduce max_num_seqs / max_model_len."
-            )
-        for request_id, total in wanted:
-            table = self._block_tables.setdefault(request_id, [])
-            while len(table) * block_size < total:
-                table.append(self._pool.allocate())
-
-    def _blocks_short_of(self, request_id: str, total: int) -> int:
-        """Blocks a sequence must be given before it can hold `total` tokens."""
-        held = len(self._block_tables.get(request_id, ()))
-        return max(0, -(-total // self._pool.block_size) - held)
+        self._blocks = blocks
 
     # ------------------------------------------------------------------
     # Payload factory
@@ -223,7 +183,7 @@ class KVCache:
         return slot_table(self._tables(request_ids), totals, self._pool.block_size, self._pool.device)
 
     def _tables(self, request_ids: list[str]) -> list[list[int]]:
-        return [self._block_tables[request_id] for request_id in request_ids]
+        return [self._blocks.table(request_id) for request_id in request_ids]
 
     # ------------------------------------------------------------------
     # Pool access shared by payloads

@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 
 from liteinfer.cache.block_pool import BlockPool, newest_slots, packed_addresses, slot_table
+from liteinfer.cache.block_tables import BlockTables
 from liteinfer.cache.kv_cache import KVCache
 
 CPU = torch.device("cpu")
@@ -16,15 +17,12 @@ def _table(block_tables, totals):
     return slot_table(block_tables, totals, BLOCK_SIZE, CPU)
 
 
-def _cache_with(totals: list[int]) -> KVCache:
+def _cache_holding(blocks: BlockTables) -> KVCache:
     pool = BlockPool(
-        num_blocks=16, block_size=BLOCK_SIZE, num_layers=1, num_kv_heads=1, head_dim=2,
-        dtype=torch.float32, device=CPU,
+        num_blocks=blocks.num_blocks, block_size=BLOCK_SIZE, num_layers=1, num_kv_heads=1,
+        head_dim=2, dtype=torch.float32, device=CPU,
     )
-    cache = KVCache(pool)
-    for i, total in enumerate(totals):
-        cache.reserve([f"r{i}"], [total])
-    return cache
+    return KVCache(pool, blocks)
 
 
 def test_slots_follow_block_index_times_block_size() -> None:
@@ -59,28 +57,6 @@ def test_max_total_comes_from_the_counts_not_the_device() -> None:
     assert table.shape[1] == 9
 
 
-def test_reserve_allocates_a_block_only_when_the_last_one_fills() -> None:
-    """Block allocation is host-side bookkeeping, and must stay out of the forward."""
-    pool = BlockPool(
-        num_blocks=8, block_size=4, num_layers=1, num_kv_heads=1, head_dim=2,
-        dtype=torch.float32, device=CPU,
-    )
-    cache = KVCache(pool)
-    cache.reserve(["r0"], [4])                   # one block, exactly full
-    blocks_after_prompt = len(cache._block_tables["r0"])
-
-    cache.reserve(["r0"], [5])                   # token 5 needs a second block
-
-    assert len(cache._block_tables["r0"]) == blocks_after_prompt + 1
-
-
-def test_reserve_allocates_every_block_a_chunk_needs_at_once() -> None:
-    """A prompt chunk can span several blocks; a decode step never more than one."""
-    cache = _cache_with([9])
-
-    assert len(cache._block_tables["r0"]) == 3
-
-
 # --- where a decode step writes ----------------------------------------------
 
 
@@ -95,8 +71,9 @@ def test_a_decode_write_is_each_sequence_s_newest_position() -> None:
 
 def test_the_cache_writes_a_decode_token_where_its_read_table_puts_that_position() -> None:
     """A decode step's write and read addresses come from the same block table."""
-    cache = _cache_with([3])
-    cache.reserve(["r0"], [4])
+    blocks = BlockTables(num_blocks=16, block_size=BLOCK_SIZE)
+    blocks.reserve(["r0"], [4])
+    cache = _cache_holding(blocks)
     everything = cache.slot_table_for(["r0"], [4])[0].tolist()
 
     assert cache.newest_slots_for(["r0"], [3]).tolist() == [[everything[-1]]]
