@@ -142,7 +142,7 @@ listed.
 
 ### 1.8 Admit by what the pool can hold
 - **Status.** `in-progress` — admission landed; preemption is what is left. Raised in review of §1.3 ([#45](https://github.com/ValeGian/liteinfer/pull/45)).
-- **PRs.** _first half pending_
+- **PRs.** [#50](https://github.com/ValeGian/liteinfer/pull/50) (first half)
 - **Why.** The scheduler admitted by slots and by the token budget, never by
   free KV blocks, so a step could be scheduled that the pool could not hold, and
   the engine then failed the least invested rows of it — requests failed for want
