@@ -1,6 +1,15 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Inside liteinfer</title>
 <meta name="description" content="A field guide to LLM inference: prefill and decode, KV caching, paged memory and continuous batching, each measured on liteinfer, an engine small enough to read in an afternoon.">
+<meta name="author" content="Valerio Giannini">
+<link rel="canonical" href="https://valegian.github.io/liteinfer/inside/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta property="og:title" content="Inside liteinfer">
+<meta property="og:description" content="A field guide to LLM inference: prefill and decode, KV caching, paged memory and continuous batching, each measured on liteinfer, an engine small enough to read in an afternoon.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://valegian.github.io/liteinfer/inside/">
+<meta property="og:site_name" content="Valerio Giannini">
+<meta name="twitter:card" content="summary">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
@@ -138,6 +147,7 @@ p { margin: 0 0 18px; max-width: 66ch; text-wrap: pretty; }
 main a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
 strong { font-weight: 600; }
 code { font-family: var(--mono); font-size: .85em; background: var(--sunken); padding: 1px 5px; border-radius: 3px; }
+p code, li code, figcaption code { overflow-wrap: anywhere; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
 ul.rules { max-width: 66ch; padding-left: 20px; }
 ul.rules li { margin-bottom: 10px; }
@@ -394,7 +404,7 @@ footer p { font-family: var(--sans); }
     turns out to matter too &mdash; each measured against the last, on a real engine small
     enough to read in an afternoon.
   </p>
-  <p style="font-family:var(--sans);font-size:.8rem;color:var(--faint);margin:-12px 0 26px">Written for liteinfer v0.5.0 (September 2026); code links point at that release. Later releases add CUDA graphs and a Triton paged-attention kernel: the <a href="https://github.com/ValeGian/liteinfer" style="color:var(--accent)">repository</a> has the current numbers.</p>
+  <p style="font-family:var(--sans);font-size:.8rem;color:var(--faint);margin:-12px 0 26px">By <a href="https://valegian.github.io/" style="color:var(--accent)">Valerio Giannini</a>. Written for liteinfer v0.5.0 (September 2026); code links point at that release. Later releases add CUDA graphs and a Triton paged-attention kernel: the <a href="https://github.com/ValeGian/liteinfer" style="color:var(--accent)">repository</a> has the current numbers.</p>
   <div class="strip">
     <div><span class="k">Model</span><span class="v">Llama-3.2-1B</span></div>
     <div><span class="k">Hardware</span><span class="v">1&times; A40</span></div>
@@ -703,7 +713,8 @@ footer p { font-family: var(--sans); }
       <figcaption>
         Arithmetic saved runs away quadratically; measured speedup crawls. At this size a decode
         step is bound by kernel launches and weight traffic, not by the tokens it re-reads, so
-        cutting 99.6% of the arithmetic buys 15%. The measured curve does climb &mdash; 1.15&times;,
+        cutting 99.6% of the arithmetic buys 15% in a separate sweep (the 1.21&times; above is a different run of the
+        same shape). The measured curve does climb &mdash; 1.15&times;,
         1.61&times;, 2.88&times; at 256, 512 and 1024 tokens out &mdash; which is what a
         length-dependent win looks like when you actually sweep it.
       </figcaption>
