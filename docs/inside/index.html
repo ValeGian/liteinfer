@@ -1,0 +1,2943 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Inside liteinfer</title>
+<meta name="description" content="A field guide to LLM inference: prefill and decode, KV caching, paged memory and continuous batching, each measured on liteinfer, an engine small enough to read in an afternoon.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+
+<style>
+:root {
+  --ground: #f4f5f7;
+  --surface: #ffffff;
+  --sunken: #eceef2;
+  --ink: #15171c;
+  --muted: #5a626e;
+  --faint: #858d99;
+  --rule: #dfe3e9;
+  --accent: #0e6e63;
+  --accent-soft: #d5e8e4;
+  --cost: #b5651d;
+  --cost-soft: #f2e2cf;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --serif: "Source Serif 4", Georgia, serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --cell-run: #167064;
+  --cell-run-ink: #ffffff;
+  --cell-idle-bg: #f4e3d0;
+  --cell-idle-line: #d9ab74;
+  --cell-idle-ink: #8c4d11;
+  --cell-void-bd: #dde1e8;
+  --ctl-bg: #ffffff;
+  --ctl-bd: #cbd2dc;
+  --ctl-ink: #2c333e;
+  --ctl-bg-hover: #eaeef3;
+  --ctl-bg-on: #0e6e63;
+  --ctl-ink-on: #ffffff;
+  --cursor: #b5651d;
+  --slot-free: #e7eaef;
+  --slot-free-bd: #d3d9e1;
+  --tip-bg: #1d2128;
+  --tip-ink: #f2f4f7;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #101216; --surface: #181b21; --sunken: #1f232a;
+    --ink: #e8eaee; --muted: #98a0ac; --faint: #6f7885; --rule: #2a2f38;
+    --accent: #3fb8a6; --accent-soft: #16332f; --cost: #e0954a; --cost-soft: #3a2c1a;
+    --cell-run: #2f9184; --cell-run-ink: #f2fbf9; --cell-idle-bg: #3d2e1c;
+    --cell-idle-line: #7a5527; --cell-idle-ink: #e0954a; --cell-void-bd: #262b33;
+    --ctl-bg: #1c2027; --ctl-bd: #363c46; --ctl-ink: #dfe3e9; --ctl-bg-hover: #262c35;
+    --ctl-bg-on: #2f9184; --ctl-ink-on: #06201d; --cursor: #e0954a;
+    --slot-free: #1c2027; --slot-free-bd: #2f353e;
+    --tip-bg: #2b313a; --tip-ink: #f2f4f7;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] {
+  --ground: #101216; --surface: #181b21; --sunken: #1f232a;
+  --ink: #e8eaee; --muted: #98a0ac; --faint: #6f7885; --rule: #2a2f38;
+  --accent: #3fb8a6; --accent-soft: #16332f; --cost: #e0954a; --cost-soft: #3a2c1a;
+  --cell-run: #2f9184; --cell-run-ink: #f2fbf9; --cell-idle-bg: #3d2e1c;
+  --cell-idle-line: #7a5527; --cell-idle-ink: #e0954a; --cell-void-bd: #262b33;
+  --ctl-bg: #1c2027; --ctl-bd: #363c46; --ctl-ink: #dfe3e9; --ctl-bg-hover: #262c35;
+  --ctl-bg-on: #2f9184; --ctl-ink-on: #06201d; --cursor: #e0954a;
+  --slot-free: #1c2027; --slot-free-bd: #2f353e;
+  --tip-bg: #2b313a; --tip-ink: #f2f4f7;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--ground); color: var(--ink); font-family: var(--serif);
+  font-size: 18px; line-height: 1.62; margin: 0; -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 96px; }
+
+/* ---------- reading progress ---------- */
+#prog {
+  position: fixed; top: 0; left: 0; height: 3px; width: 0%;
+  background: var(--accent); z-index: 60; transition: width .1s linear;
+}
+@media (prefers-reduced-motion: reduce) { #prog { transition: none; } }
+
+/* ---------- masthead ---------- */
+.masthead { padding: 52px 0 32px; border-bottom: 1px solid var(--rule); }
+.eyebrow {
+  font-family: var(--sans); font-size: .75rem; font-weight: 600;
+  letter-spacing: .13em; text-transform: uppercase; color: var(--accent); margin: 0 0 14px;
+}
+h1 {
+  font-family: var(--sans); font-weight: 700; font-size: clamp(2.1rem, 5vw, 3.1rem);
+  letter-spacing: -.03em; line-height: 1.05; margin: 0 0 18px; text-wrap: balance;
+}
+.standfirst { font-size: 1.22rem; color: var(--muted); max-width: 62ch; margin: 0 0 28px; text-wrap: pretty; }
+.strip { display: flex; flex-wrap: wrap; gap: 12px 40px; font-family: var(--sans); }
+.strip div { display: flex; flex-direction: column; gap: 2px; }
+.strip .k { font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+.strip .v { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+
+.howto {
+  margin: 26px 0 0; padding: 14px 18px; border: 1px solid var(--rule); border-radius: 10px;
+  background: var(--surface); font-family: var(--sans); font-size: .84rem; color: var(--muted);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+}
+.howto p { margin: 0; max-width: 52ch; font-family: var(--sans); }
+.howto .grow { flex: 1 1 20px; }
+.howto b { color: var(--ink); font-weight: 600; }
+
+/* ---------- layout ---------- */
+.cols { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: 56px; margin-top: 44px; }
+@media (max-width: 900px) { .cols { grid-template-columns: 1fr; gap: 0; } }
+
+nav.rail { position: sticky; top: 24px; align-self: start; font-family: var(--sans); font-size: .82rem; }
+@media (max-width: 900px) {
+  nav.rail { position: static; margin: 0 0 36px; padding: 16px 18px; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
+}
+nav.rail p { font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin: 0 0 12px; }
+nav.rail ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+nav.rail a {
+  color: var(--muted); text-decoration: none; display: flex; gap: 7px; align-items: baseline;
+  border-left: 2px solid var(--rule); padding: 1px 0 1px 12px;
+}
+nav.rail a:hover { color: var(--accent); border-left-color: var(--accent); }
+nav.rail a.here { color: var(--ink); font-weight: 600; border-left-color: var(--accent); }
+nav.rail .num { color: var(--faint); font-variant-numeric: tabular-nums; }
+nav.rail a.here .num { color: var(--accent); }
+nav.rail .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--cursor); margin-left: auto; align-self: center; opacity: 0; }
+nav.rail a.ix .dot { opacity: .8; }
+
+main { min-width: 0; }
+section { padding-top: 12px; margin-bottom: 60px; scroll-margin-top: 20px; }
+h2 { font-family: var(--sans); font-weight: 600; font-size: 1.72rem; letter-spacing: -.024em; line-height: 1.16; margin: 0 0 6px; text-wrap: balance; }
+h2 .step { display: block; font-size: .7rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+h3 { font-family: var(--sans); font-weight: 600; font-size: 1.06rem; letter-spacing: -.01em; margin: 34px 0 8px; text-wrap: balance; }
+p { margin: 0 0 18px; max-width: 66ch; text-wrap: pretty; }
+main a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+strong { font-weight: 600; }
+code { font-family: var(--mono); font-size: .85em; background: var(--sunken); padding: 1px 5px; border-radius: 3px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+ul.rules { max-width: 66ch; padding-left: 20px; }
+ul.rules li { margin-bottom: 10px; }
+
+/* ---------- glossary terms ---------- */
+button.term {
+  font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: help;
+  border-bottom: 1px dashed var(--accent); line-height: inherit;
+}
+button.term:hover { color: var(--accent); }
+#tip {
+  position: fixed; z-index: 70; max-width: 300px; background: var(--tip-bg); color: var(--tip-ink);
+  font-family: var(--sans); font-size: .8rem; line-height: 1.45; padding: 10px 13px;
+  border-radius: 8px; box-shadow: 0 6px 22px rgba(0,0,0,.24); pointer-events: none;
+}
+#tip b { display: block; font-size: .68rem; letter-spacing: .09em; text-transform: uppercase; opacity: .72; margin-bottom: 3px; }
+
+/* ---------- figures ---------- */
+figure { margin: 26px 0; }
+figure svg { display: block; width: 100%; height: auto; color: var(--ink); }
+figcaption { font-family: var(--sans); font-size: .82rem; color: var(--muted); margin-top: 10px; padding-left: 12px; border-left: 2px solid var(--rule); max-width: 62ch; }
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 22px 24px; overflow-x: auto; }
+.floor { text-align: center; font-family: var(--mono); font-size: .95rem; }
+
+/* ---------- verdicts + predictions ---------- */
+.verdict {
+  font-family: var(--sans); display: flex; flex-wrap: wrap; align-items: baseline;
+  gap: 8px 14px; margin: 22px 0; padding: 14px 18px; border-radius: 8px;
+  background: var(--accent-soft); border-left: 3px solid var(--accent);
+}
+.verdict.loss { background: var(--cost-soft); border-left-color: var(--cost); }
+.verdict .ratio { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.02em; color: var(--accent); }
+.verdict.loss .ratio { color: var(--cost); }
+.verdict .what { font-size: .92rem; color: var(--ink); }
+.verdict .what em { font-style: normal; font-family: var(--mono); font-size: .85em; }
+
+.predict { margin: 24px 0; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); padding: 16px 18px; }
+.predict .pq { font-family: var(--sans); font-size: .92rem; font-weight: 600; margin: 0 0 4px; max-width: 60ch; }
+.predict .ph { font-family: var(--sans); font-size: .76rem; color: var(--faint); margin: 0 0 12px; max-width: 60ch; }
+.predict .pbtns { display: flex; flex-wrap: wrap; gap: 8px; }
+.predict button {
+  font-family: var(--sans); font-size: .8rem; font-weight: 500; padding: 8px 13px; border-radius: 6px;
+  cursor: pointer; background: var(--ctl-bg); color: var(--ctl-ink); border: 1px solid var(--ctl-bd);
+}
+.predict button:hover { background: var(--ctl-bg-hover); }
+.predict button.picked { background: var(--ctl-bg-on); color: var(--ctl-ink-on); border-color: var(--ctl-bg-on); }
+.predict button.skip { border-style: dashed; color: var(--muted); }
+.predict .mark { font-family: var(--sans); font-size: .82rem; margin: 12px 0 0; color: var(--muted); }
+.predict .mark.right { color: var(--accent); font-weight: 600; }
+.predict .mark.wrong { color: var(--cost); font-weight: 600; }
+.predict .verdict { margin-bottom: 0; }
+
+/* ---------- go deeper ---------- */
+details.deep {
+  margin: 22px 0; border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+  border-radius: 0 9px 9px 0; background: var(--surface); overflow: hidden;
+}
+details.deep > summary {
+  font-family: var(--sans); font-size: .85rem; font-weight: 600; color: var(--accent);
+  padding: 11px 16px; cursor: pointer; list-style: none; display: flex; gap: 9px; align-items: baseline;
+}
+details.deep > summary::-webkit-details-marker { display: none; }
+details.deep > summary::before { content: "+"; font-family: var(--mono); font-weight: 400; color: var(--faint); }
+details.deep[open] > summary::before { content: "\2212"; }
+details.deep > summary::after {
+  content: "go deeper"; margin-left: auto; font-size: .64rem; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--faint);
+}
+details.deep > summary:hover { background: var(--sunken); }
+details.deep .body { padding: 2px 18px 6px; border-top: 1px solid var(--rule); }
+details.deep .body p { font-size: .94rem; margin: 14px 0; }
+details.deep .body pre { margin: 14px 0; }
+details.deep .body table { margin: 8px 0 14px; }
+
+/* ---------- tables ---------- */
+.tablewrap { overflow-x: auto; margin: 22px 0; }
+table { border-collapse: collapse; width: 100%; font-family: var(--sans); font-size: .87rem; }
+th, td { padding: 9px 14px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+th:first-child, td:first-child { text-align: left; }
+thead th { font-size: .68rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); border-bottom: 1px solid var(--rule); }
+tbody td { border-bottom: 1px solid var(--rule); }
+tbody tr:last-child td { border-bottom: none; }
+td.name { font-family: var(--mono); font-size: .8rem; }
+td.gone, tr.gone td { color: var(--faint); }
+.pill { font-family: var(--sans); font-size: .68rem; font-weight: 600; letter-spacing: .04em; padding: 2px 7px; border-radius: 20px; background: var(--sunken); color: var(--muted); }
+.pill.live { background: var(--accent-soft); color: var(--accent); }
+
+/* ---------- code ---------- */
+pre {
+  font-family: var(--mono); font-size: .8rem; line-height: 1.6; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; overflow-x: auto; margin: 20px 0;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+.cmt { color: var(--faint); }
+.kw { color: var(--accent); }
+.srcline { font-family: var(--sans); font-size: .74rem; color: var(--faint); margin: -14px 0 20px; }
+
+/* ---------- closing ---------- */
+.map { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin: 24px 0; }
+.map div { background: var(--surface); padding: 16px 18px; }
+.map h4 { font-family: var(--mono); font-size: .8rem; font-weight: 500; margin: 0 0 5px; }
+.map h4 a { color: var(--accent); text-decoration: none; }
+.map h4 a:hover { text-decoration: underline; }
+.map p { font-family: var(--sans); font-size: .82rem; color: var(--muted); margin: 0; max-width: none; }
+.gloss { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin: 24px 0; }
+.gloss div { background: var(--surface); padding: 14px 16px; }
+.gloss h4 { font-family: var(--sans); font-size: .84rem; font-weight: 600; margin: 0 0 4px; color: var(--ink); }
+.gloss p { font-family: var(--sans); font-size: .81rem; color: var(--muted); margin: 0; max-width: none; line-height: 1.5; }
+footer { margin-top: 60px; padding-top: 24px; border-top: 1px solid var(--rule); font-family: var(--sans); font-size: .84rem; color: var(--muted); }
+footer p { font-family: var(--sans); }
+
+/* ---------- scrolling diagrams ---------- */
+.figscroll { overflow-x: auto; overscroll-behavior-x: contain; }
+.figscroll > svg { min-width: 660px; }
+.figscroll > .gridwrap { min-width: 610px; }
+.figscroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.scrollhint { font-family: var(--sans); font-size: .72rem; color: var(--faint); margin: 6px 0 0; display: none; }
+@media (max-width: 760px) { .scrollhint { display: block; } .tl-head .tag { display: block; margin-top: 3px; } }
+
+/* ---------- interactive figures ---------- */
+.widget { margin: 30px 0; padding: 20px 22px 18px; background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; }
+.widget h4 { font-family: var(--sans); font-size: 1rem; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; color: var(--ink); display: flex; align-items: baseline; gap: 9px; }
+.widget h4::after { content: "interactive"; font-size: .6rem; font-weight: 600; letter-spacing: .11em; text-transform: uppercase; color: var(--accent); background: var(--accent-soft); padding: 2px 7px; border-radius: 20px; }
+.widget .wnote { font-family: var(--sans); font-size: .78rem; color: var(--faint); margin: 0 0 14px; max-width: 68ch; }
+.widget .wnote b { color: var(--cost); font-weight: 600; }
+.widget figcaption { margin-top: 16px; }
+
+.wctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-bottom: 16px; }
+.wctl button, .wctl .seg button {
+  font-family: var(--sans); font-size: .78rem; font-weight: 500; line-height: 1; padding: 7px 11px;
+  border-radius: 6px; cursor: pointer; background: var(--ctl-bg); color: var(--ctl-ink); border: 1px solid var(--ctl-bd);
+}
+.wctl button:hover:not(:disabled) { background: var(--ctl-bg-hover); }
+.wctl button:disabled { opacity: .42; cursor: default; }
+.wctl button[aria-pressed="true"], .wctl button.on { background: var(--ctl-bg-on); color: var(--ctl-ink-on); border-color: var(--ctl-bg-on); }
+.wctl .spacer { flex: 1 1 12px; }
+.wctl .seg { display: flex; gap: 6px; flex-wrap: wrap; }
+.wctl label { font-family: var(--sans); font-size: .74rem; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.wctl input[type=range] { width: 170px; accent-color: var(--accent); }
+.readout { font-family: var(--mono); font-size: .78rem; color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* --- generic HTML bar chart: no overlapping text, ever --- */
+.rows { display: flex; flex-direction: column; gap: 9px; margin: 4px 0 2px; }
+.row { display: grid; grid-template-columns: minmax(84px, 128px) minmax(0, 1fr) minmax(74px, auto); gap: 12px; align-items: center; }
+@media (max-width: 560px) { .row { grid-template-columns: 1fr; gap: 2px; } .row .rlab { font-size: .72rem; } }
+.row .rlab { font-family: var(--mono); font-size: .74rem; color: var(--muted); overflow-wrap: anywhere; }
+.row .rtrack { background: var(--sunken); border-radius: 4px; height: 20px; position: relative; overflow: hidden; }
+.row .rbar { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 4px; }
+.row .rbar.cost { background: var(--cost); }
+.row .rbar.pale { background: var(--accent); opacity: .34; }
+.row .rbar.ghost { background: none; border: 1px dashed var(--cost); }
+.row .rval { font-family: var(--mono); font-size: .76rem; font-variant-numeric: tabular-nums; text-align: right; }
+.row .rval.cost { color: var(--cost); }
+.row .rval.good { color: var(--accent); }
+.row.is-cur .rlab { color: var(--ink); font-weight: 600; }
+.row.is-cur .rtrack { box-shadow: 0 0 0 2px var(--cursor); }
+.rowsub { font-family: var(--sans); font-size: .72rem; color: var(--faint); margin: 10px 0 0; }
+
+.wevent { font-family: var(--sans); font-size: .8rem; color: var(--ink); background: var(--sunken); border-left: 3px solid var(--cursor); padding: 9px 13px; border-radius: 0 6px 6px 0; margin: 16px 0 0; min-height: 1.2em; }
+.wevent b { font-weight: 600; }
+.wstats { display: flex; flex-wrap: wrap; gap: 10px 26px; margin-top: 14px; }
+.wstats div { font-family: var(--sans); }
+.wstats .k { display: block; font-size: .64rem; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--faint); }
+.wstats .v { font-size: 1.12rem; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.wstats .v.bad { color: var(--cost); }
+.wstats .v.good { color: var(--accent); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 14px; font-family: var(--sans); font-size: .72rem; color: var(--muted); }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.legend i { width: 15px; height: 11px; border-radius: 2px; display: inline-block; flex: none; }
+.legend i.run { background: var(--cell-run); }
+.legend i.idle { background: var(--cell-idle-bg); background-image: repeating-linear-gradient(45deg, transparent 0 3px, var(--cell-idle-line) 3px 4px); }
+.legend i.void { border: 1px dashed var(--cell-void-bd); }
+.legend i.acc { background: var(--accent); }
+.legend i.cost { background: var(--cost); }
+.legend i.pale { background: var(--accent); opacity: .34; }
+
+/* --- checkbox group (Amdahl) --- */
+.chks { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; margin-bottom: 14px; }
+.chk { font-family: var(--sans); font-size: .8rem; display: flex; align-items: center; gap: 9px; padding: 9px 11px; border: 1px solid var(--ctl-bd); border-radius: 7px; background: var(--ctl-bg); cursor: pointer; }
+.chk:hover { background: var(--ctl-bg-hover); }
+.chk input { accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+.chk .pct { margin-left: auto; font-family: var(--mono); font-size: .74rem; color: var(--faint); }
+.chk.on { border-color: var(--accent); background: var(--accent-soft); }
+.chk.on .pct { color: var(--accent); }
+
+/* --- the batching timeline --- */
+.gridwrap { display: flex; flex-direction: column; gap: 18px; }
+.tl { display: grid; gap: 10px 0; }
+.tl-head { font-family: var(--sans); font-size: .68rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 0 0 7px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; position: sticky; left: 0; }
+.tl-head .tag { font-size: .64rem; letter-spacing: .04em; text-transform: none; font-weight: 500; color: var(--faint); }
+.tl-grid { display: grid; gap: 2px; align-items: center; }
+.tl-lab { font-family: var(--mono); font-size: .68rem; color: var(--muted); padding-right: 8px; text-align: right; white-space: nowrap; }
+.cell { height: 21px; border-radius: 2px; position: relative; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 8.5px; letter-spacing: -.02em; }
+.cell.run { background: var(--cell-run); color: var(--cell-run-ink); }
+.cell.run.start { border-top-left-radius: 5px; border-bottom-left-radius: 5px; }
+.cell.run.end { border-top-right-radius: 5px; border-bottom-right-radius: 5px; }
+.cell.idle { background: var(--cell-idle-bg); color: var(--cell-idle-ink); background-image: repeating-linear-gradient(45deg, transparent 0 3px, var(--cell-idle-line) 3px 4px); }
+.cell.void { border: 1px dashed var(--cell-void-bd); }
+.cell.cur { box-shadow: 0 0 0 2px var(--cursor); z-index: 2; }
+.tl-axis { font-family: var(--mono); font-size: 7.5px; color: var(--faint); text-align: center; }
+.tl-axis.cur { color: var(--cursor); font-weight: 700; }
+.tl-done { font-family: var(--sans); font-size: .68rem; color: var(--accent); font-weight: 600; white-space: nowrap; padding-left: 8px; }
+.queue { position: sticky; left: 0; display: flex; align-items: center; gap: 5px; margin-top: 8px; flex-wrap: wrap; font-family: var(--sans); font-size: .7rem; color: var(--muted); }
+.qchip { font-family: var(--mono); font-size: .66rem; padding: 2px 6px; border-radius: 10px; background: var(--sunken); color: var(--muted); border: 1px solid var(--rule); }
+.qchip.none { background: none; border-color: transparent; font-style: italic; }
+
+/* --- the block-table explorer --- */
+.bx-row { margin-bottom: 15px; }
+.bx-lab { font-family: var(--sans); font-size: .66rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin: 0 0 7px; }
+.bx-lab em { font-style: normal; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.toks { display: flex; gap: 3px; flex-wrap: wrap; }
+.tok { font-family: var(--mono); font-size: .68rem; width: 30px; height: 26px; padding: 0; border-radius: 4px; cursor: pointer; background: var(--ctl-bg); border: 1px solid var(--ctl-bd); color: var(--ctl-ink); }
+.tok:hover { background: var(--ctl-bg-hover); }
+.tok[aria-checked="true"] { background: var(--ctl-bg-on); color: var(--ctl-ink-on); border-color: var(--ctl-bg-on); font-weight: 600; }
+.tok.brk { margin-left: 11px; }
+.btab { display: flex; gap: 11px; flex-wrap: wrap; }
+.bent { font-family: var(--mono); font-size: .68rem; padding: 5px 9px; border-radius: 5px; border: 1px solid var(--rule); background: var(--sunken); color: var(--muted); white-space: nowrap; }
+.bent.frag { background: none; border-style: dashed; color: var(--cost); }
+.bent.hot { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.bent b { font-weight: 600; }
+.calc { font-family: var(--mono); font-size: .95rem; padding: 12px 14px; border-radius: 7px; background: var(--sunken); border: 1px solid var(--rule); color: var(--ink); overflow-x: auto; white-space: nowrap; }
+.calc .p { color: var(--accent); font-weight: 600; }
+.calc .o { color: var(--cost); font-weight: 600; }
+.calc .r { color: var(--cursor); font-weight: 700; }
+.pool { display: grid; grid-template-columns: repeat(10, 1fr); gap: 7px 10px; min-width: 660px; }
+.blk { display: flex; flex-direction: column; gap: 3px; }
+.blk .bn { font-family: var(--mono); font-size: .58rem; color: var(--faint); text-align: center; }
+.blk .slots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; }
+.sl { height: 17px; border-radius: 2px; background: var(--slot-free); border: 1px solid var(--slot-free-bd); }
+.sl.a { background: var(--accent-soft); border-color: var(--accent); }
+.sl.b { background: var(--cost-soft); border-color: var(--cost); }
+.sl.dim { opacity: .34; }
+.sl.hit { box-shadow: 0 0 0 2px var(--cursor); border-color: var(--cursor); z-index: 2; position: relative; }
+.blk.nul .sl { border-style: dashed; background: none; }
+.blk.own .bn { color: var(--ink); font-weight: 600; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .cell, .sl, .tok, .bent, .rbar { transition: background-color .13s linear, box-shadow .13s linear, opacity .13s linear, width .18s ease; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div id="prog" role="presentation"></div>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">A field guide to LLM inference</p>
+  <h1>Inside liteinfer</h1>
+  <p class="standfirst">
+    An inference engine is mostly one question asked over and over: how do you avoid
+    re-reading 2.5&nbsp;GB of weights to produce a single token? This walks through five
+    answers, two changes that buy no speed at all, and the machinery around the model that
+    turns out to matter too &mdash; each measured against the last, on a real engine small
+    enough to read in an afternoon.
+  </p>
+  <p style="font-family:var(--sans);font-size:.8rem;color:var(--faint);margin:-12px 0 26px">Written for liteinfer v0.5.0 (September 2026); code links point at that release. Later releases add CUDA graphs and a Triton paged-attention kernel: the <a href="https://github.com/ValeGian/liteinfer" style="color:var(--accent)">repository</a> has the current numbers.</p>
+  <div class="strip">
+    <div><span class="k">Model</span><span class="v">Llama-3.2-1B</span></div>
+    <div><span class="k">Hardware</span><span class="v">1&times; A40</span></div>
+    <div><span class="k">Engine source</span><span class="v">2,272 lines</span></div>
+    <div><span class="k">First step &rarr; last</span><span class="v">24&times;</span></div>
+  </div>
+
+  <div class="howto">
+    <p>
+      <b>Two levels.</b> The main thread assumes PyTorch and no serving experience.
+      Every <b>go deeper</b> block adds the arithmetic, the trade-off or the real source
+      line behind it. Dotted words carry a definition &mdash; hover or tap.
+      Eight figures are interactive: drag them, step them, and guess before the number lands.
+    </p>
+    <span class="grow"></span>
+    <button type="button" id="expand-all" class="term" style="border:1px solid var(--ctl-bd);border-radius:6px;padding:7px 12px;font-family:var(--sans);font-size:.78rem;font-weight:500;background:var(--ctl-bg);color:var(--ctl-ink);cursor:pointer">
+      Open all deep dives
+    </button>
+  </div>
+</header>
+
+<div class="cols">
+  <nav class="rail" aria-label="Contents">
+    <p>Contents</p>
+    <ol id="rail">
+      <li><a href="#job"><span class="num">01</span>The job<span class="dot"></span></a></li>
+      <li><a href="#cache"><span class="num">02</span>Don't recompute<span class="dot"></span></a></li>
+      <li><a href="#native"><span class="num">03</span>A measured zero<span class="dot"></span></a></li>
+      <li><a href="#paged"><span class="num">04</span>Pages, not arrays<span class="dot"></span></a></li>
+      <li><a href="#static"><span class="num">05</span>Share the weight read<span class="dot"></span></a></li>
+      <li><a href="#continuous"><span class="num">06</span>Never idle a slot<span class="dot"></span></a></li>
+      <li><a href="#profile"><span class="num">07</span>Where time goes<span class="dot"></span></a></li>
+      <li><a href="#fused"><span class="num">08</span>No matrix at all<span class="dot"></span></a></li>
+      <li><a href="#loop"><span class="num">09</span>The other profile<span class="dot"></span></a></li>
+      <li><a href="#ceiling"><span class="num">10</span>The ceiling<span class="dot"></span></a></li>
+      <li><a href="#method"><span class="num">11</span>How we know<span class="dot"></span></a></li>
+      <li><a href="#code"><span class="num">12</span>Read the code<span class="dot"></span></a></li>
+      <li><a href="#glossary"><span class="num">13</span>Glossary<span class="dot"></span></a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+  <!-- ================= 01 ================= -->
+  <section id="job">
+    <h2><span class="step">01 &middot; The job</span>Two phases, and only one of them is fast</h2>
+
+    <p>
+      Generating text has two phases that look similar and behave nothing alike.
+      <button class="term" data-t="prefill">Prefill</button> reads the whole prompt in one
+      forward pass. <button class="term" data-t="decode">Decode</button> then produces one token
+      at a time, and each token needs its own pass through the entire model.
+    </p>
+
+    <figure>
+      <div class="figscroll" tabindex="0" role="group" aria-label="Prefill and decode diagram, scrollable">
+      <svg viewBox="0 0 640 246" role="img" aria-label="Prefill processes all prompt tokens in a single forward pass; decode runs one pass per generated token, each re-reading the full model weights.">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path>
+          </marker>
+        </defs>
+        <text x="0" y="14" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">PREFILL &mdash; one pass</text>
+        <g>
+          <rect x="0" y="28" width="150" height="30" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+          <text x="75" y="48" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">128 prompt tokens</text>
+          <line x1="152" y1="43" x2="228" y2="43" stroke="currentColor" stroke-width="1.4" marker-end="url(#ar)"></line>
+          <rect x="232" y="24" width="120" height="38" rx="4" fill="var(--accent)" opacity="0.14"></rect>
+          <rect x="232" y="24" width="120" height="38" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.6"></rect>
+          <text x="292" y="41" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="currentColor">read 2.48 GB</text>
+          <text x="292" y="55" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">of weights</text>
+          <line x1="354" y1="43" x2="430" y2="43" stroke="currentColor" stroke-width="1.4" marker-end="url(#ar)"></line>
+          <rect x="434" y="28" width="86" height="30" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+          <text x="477" y="48" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">1 token</text>
+          <text x="530" y="47" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.75">128 tokens of work</text>
+        </g>
+
+        <line x1="0" y1="84" x2="640" y2="84" stroke="currentColor" stroke-width="1" opacity="0.2"></line>
+
+        <text x="0" y="108" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">DECODE &mdash; one pass per token, 255 times</text>
+        <g>
+          <rect x="0" y="122" width="150" height="26" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+          <text x="75" y="139" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">1 token</text>
+          <line x1="152" y1="135" x2="228" y2="135" stroke="currentColor" stroke-width="1.4" marker-end="url(#ar)"></line>
+          <rect x="232" y="116" width="120" height="38" rx="4" fill="var(--accent)" opacity="0.14"></rect>
+          <rect x="232" y="116" width="120" height="38" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.6"></rect>
+          <text x="292" y="133" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="currentColor">read 2.48 GB</text>
+          <text x="292" y="147" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">of weights</text>
+          <line x1="354" y1="135" x2="430" y2="135" stroke="currentColor" stroke-width="1.4" marker-end="url(#ar)"></line>
+          <rect x="434" y="122" width="86" height="26" rx="4" fill="none" stroke="currentColor" stroke-width="1.4"></rect>
+          <text x="477" y="139" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">1 token</text>
+          <text x="530" y="139" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="var(--cost)">1 token of work</text>
+        </g>
+        <g opacity="0.45">
+          <rect x="0" y="158" width="150" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="232" y="158" width="120" height="20" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.2"></rect>
+          <rect x="434" y="158" width="86" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+        </g>
+        <g opacity="0.22">
+          <rect x="0" y="182" width="150" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="232" y="182" width="120" height="20" rx="4" fill="none" stroke="var(--accent)" stroke-width="1.2"></rect>
+          <rect x="434" y="182" width="86" height="20" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+        </g>
+        <text x="292" y="222" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="currentColor" opacity="0.8">&hellip; 255 passes, each reading every weight again</text>
+      </svg>
+      </div>
+      <p class="scrollhint">Chart scrolls sideways &rarr;</p>
+      <figcaption>
+        Both phases read the full model. Prefill amortises that read over 128 tokens;
+        decode pays it for one. That asymmetry is what every optimisation on this page attacks.
+      </figcaption>
+    </figure>
+
+    <h3>The number that bounds everything</h3>
+    <p>
+      Llama-3.2-1B in <button class="term" data-t="bf16">bfloat16</button> is
+      <strong>2.48&nbsp;GB</strong> of weights. An A40 moves <strong>696&nbsp;GB/s</strong>.
+      If a decode step does nothing but stream the weights once:
+    </p>
+    <div class="panel floor">
+      2.48&nbsp;GB &divide; 696&nbsp;GB/s = <strong style="color:var(--accent)">3.56&nbsp;ms</strong> per token, per sequence
+    </div>
+    <p style="margin-top:18px">
+      No arithmetic trick beats that floor for a single sequence &mdash; it is a
+      <button class="term" data-t="membound">memory-bandwidth problem</button>, not a FLOPs
+      problem. Which points at the escape route the whole field uses:
+      <strong>if you must read all the weights anyway, use them for more than one sequence
+      at a time.</strong> Sections 05 and 06 are that idea, cashed in.
+    </p>
+
+    <figure class="widget" id="bw">
+      <h4>The bandwidth budget</h4>
+      <p class="wnote">
+        Every decode step reads the same 2.48&nbsp;GB, whether it serves one sequence or sixty-four.
+        Drag the width: the read is fixed, the tokens it pays for are not.
+      </p>
+
+      <div class="wctl">
+        <label>sequences per step
+          <input type="range" id="bw-r" min="0" max="6" value="0" step="1" aria-label="Sequences per decode step">
+        </label>
+        <output class="readout" id="bw-out">B = 1</output>
+      </div>
+
+      <div class="wstats" id="bw-stats"></div>
+
+      <div class="rows" id="bw-rows" style="margin-top:18px"></div>
+      <div class="legend">
+        <span><i class="pale"></i> hardware ceiling &mdash; weights streamed once per step</span>
+        <span><i class="acc"></i> liteinfer, measured</span>
+        <span><i class="cost"></i> vLLM, measured</span>
+      </div>
+
+      <div class="wevent" id="bw-say" role="status" aria-live="polite"></div>
+
+      <figcaption>
+        The ceiling is <em>B</em>&nbsp;&divide;&nbsp;3.56&nbsp;ms: one weight read, shared. It counts
+        weights only &mdash; no KV traffic, no prefill, no launch overhead &mdash; so it is a bound
+        nothing can beat, not a prediction of what an engine will do. Measured bars exist only at
+        the three widths the benchmark actually ran.
+      </figcaption>
+    </figure>
+
+    <details class="deep">
+      <summary>Where 2.48&nbsp;GB comes from, and why the GPU is bored</summary>
+      <div class="body">
+        <p>
+          Llama-3.2-1B holds about 1.24&nbsp;billion parameters. At two bytes each in bfloat16 that
+          is 2.48&nbsp;GB, and every one of them is touched on every forward pass, because a
+          transformer has no branch a token can skip.
+        </p>
+        <p>
+          Now count the arithmetic. A matrix-vector product does roughly two floating-point
+          operations per weight, so one decode token costs about <strong>2.5&nbsp;GFLOP</strong>.
+          An A40 does about 150&nbsp;TFLOP/s in bfloat16. The maths takes
+          <strong>0.017&nbsp;ms</strong>; the reading takes <strong>3.56&nbsp;ms</strong>. The GPU
+          spends over 99% of a decode step waiting for memory.
+        </p>
+        <p>
+          That ratio &mdash; FLOPs per byte moved &mdash; is called <em>arithmetic intensity</em>,
+          and it is the reason batching works at all. Adding a sequence adds arithmetic, which is
+          free here, and adds no weight traffic, which is not. Prefill is the opposite regime: 128
+          tokens of work against the same read, which is why a prompt is cheap per token and a
+          reply is not.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 02 ================= -->
+  <section id="cache">
+    <h2><span class="step">02 &middot; Step one</span>Don't recompute what you already computed</h2>
+
+    <p>
+      Attention at position <em>t</em> needs the keys and values of every earlier token. The naive
+      engine gets them by re-running the model over the whole sequence each step. Step 200 redoes
+      the work of steps 1&ndash;199.
+    </p>
+    <p>
+      The fix is the <button class="term" data-t="kv">KV cache</button>: keep each layer's keys and
+      values after computing them once, then feed only the new token and read the rest from memory.
+    </p>
+
+    <figure>
+      <div class="figscroll" tabindex="0" role="group" aria-label="KV cache diagram, scrollable">
+      <svg viewBox="0 0 640 214" role="img" aria-label="Without a cache, each decode step re-feeds every previous token. With a KV cache, each step feeds only the newest token and reads stored keys and values.">
+        <text x="0" y="14" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">NO CACHE &mdash; work grows every step</text>
+        <g font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor">
+          <rect x="0" y="24" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="26" y="24" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="52" y="24" width="24" height="18" rx="2" fill="var(--accent)" opacity="0.2"></rect>
+          <text x="90" y="37" font-family="IBM Plex Sans, sans-serif" font-size="10">step 3 &rarr; 3 tokens in</text>
+
+          <rect x="0" y="46" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="26" y="46" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="52" y="46" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="78" y="46" width="24" height="18" rx="2" fill="var(--accent)" opacity="0.2"></rect>
+          <text x="116" y="59" font-family="IBM Plex Sans, sans-serif" font-size="10">step 4 &rarr; 4 tokens in</text>
+
+          <rect x="0" y="68" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="26" y="68" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="52" y="68" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="78" y="68" width="24" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+          <rect x="104" y="68" width="24" height="18" rx="2" fill="var(--accent)" opacity="0.2"></rect>
+          <text x="142" y="81" font-family="IBM Plex Sans, sans-serif" font-size="10">step 5 &rarr; 5 tokens in</text>
+        </g>
+
+        <line x1="0" y1="104" x2="640" y2="104" stroke="currentColor" stroke-width="1" opacity="0.2"></line>
+
+        <text x="0" y="128" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">KV CACHE &mdash; work is constant</text>
+        <g>
+          <rect x="0" y="140" width="200" height="24" rx="3" fill="var(--accent)" opacity="0.12"></rect>
+          <rect x="0" y="140" width="200" height="24" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.4"></rect>
+          <text x="100" y="156" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10.5" fill="currentColor">stored K/V for tokens 1&hellip;t-1</text>
+          <rect x="206" y="140" width="24" height="24" rx="3" fill="var(--cost)" opacity="0.25"></rect>
+          <rect x="206" y="140" width="24" height="24" rx="3" fill="none" stroke="var(--cost)" stroke-width="1.4"></rect>
+          <text x="242" y="156" font-family="IBM Plex Sans, sans-serif" font-size="10.5" fill="currentColor">only the new token is computed</text>
+        </g>
+        <text x="0" y="192" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="currentColor" opacity="0.8">
+          Cost: 32 KB of memory per token &mdash; 16 layers &times; 8 KV heads &times; 64 dims &times; 2 (K and V) &times; 2 bytes.
+        </text>
+      </svg>
+      </div>
+      <p class="scrollhint">Chart scrolls sideways &rarr;</p>
+      <figcaption>
+        The cache trades memory for compute. At 32&nbsp;KB per token, a 4,096-token sequence
+        holds 128&nbsp;MB of keys and values &mdash; which is why later sections care so much
+        about how that memory is allocated.
+      </figcaption>
+    </figure>
+
+    <div class="predict" data-answer="tiny" data-explain="1.21&times; at this shape &mdash; a real win, and a small one. Make the reply 1,024 tokens instead of 256 and the same cache is worth 2.88&times;.">
+      <p class="pq">Before the number: how much faster does the KV cache make this engine?</p>
+      <p class="ph">Workload: 128-token prompt, 256 generated tokens, one sequence at a time.</p>
+      <div class="pbtns">
+        <button type="button" data-v="tiny">under 1.5&times;</button>
+        <button type="button" data-v="big">2&ndash;5&times;</button>
+        <button type="button" data-v="huge">more than 10&times;</button>
+        <button type="button" class="skip" data-v="">just show me</button>
+      </div>
+      <div class="pans" hidden>
+        <div class="verdict">
+          <span class="ratio">1.21&times;</span>
+          <span class="what">throughput, <em>60.5 &rarr; 73.4 tok/s</em> &middot; inter-token latency <em>16.5 &rarr; 13.7 ms</em></span>
+        </div>
+      </div>
+      <p class="mark" hidden></p>
+    </div>
+
+    <p>
+      Textbooks imply the KV cache is a bigger win than 21%. It <em>is</em> &mdash; at longer
+      sequences. At 128 in / 256 out on a 1B model, a decode step is so dominated by fixed
+      overhead that re-reading a few hundred tokens barely registers, and the cache adds its own
+      cost by growing a tensor every step. <strong>The size of a speedup is a property of the
+      workload, not of the idea.</strong> That is the first lesson of measuring rather than
+      assuming &mdash; and the figure below is the same lesson with the dial in your hand.
+    </p>
+
+    <figure class="widget" id="kv">
+      <h4>Work saved vs. time saved</h4>
+      <p class="wnote">
+        Set how many tokens the reply is. The left column counts arithmetic; the right column is
+        what the stopwatch said. <b>They are not the same shape</b>, and the gap between them is
+        the whole point.
+      </p>
+
+      <div class="wctl">
+        <label>reply length
+          <input type="range" id="kv-r" min="1" max="16" value="4" step="1" aria-label="Generated tokens">
+        </label>
+        <output class="readout" id="kv-out">256 tokens out</output>
+        <span class="spacer"></span>
+        <div class="seg" role="group" aria-label="Jump to a measured length">
+          <button type="button" data-osl="256">256</button>
+          <button type="button" data-osl="512">512</button>
+          <button type="button" data-osl="1024">1024</button>
+        </div>
+      </div>
+
+      <div class="rows" id="kv-rows"></div>
+      <p class="rowsub">Token-passes through the model over the whole reply &mdash; a 128-token prompt, one sequence.</p>
+
+      <div class="wstats" id="kv-stats"></div>
+      <div class="wevent" id="kv-say" role="status" aria-live="polite"></div>
+
+      <figcaption>
+        Arithmetic saved runs away quadratically; measured speedup crawls. At this size a decode
+        step is bound by kernel launches and weight traffic, not by the tokens it re-reads, so
+        cutting 99.6% of the arithmetic buys 15%. The measured curve does climb &mdash; 1.15&times;,
+        1.61&times;, 2.88&times; at 256, 512 and 1024 tokens out &mdash; which is what a
+        length-dependent win looks like when you actually sweep it.
+      </figcaption>
+    </figure>
+
+    <details class="deep">
+      <summary>32&nbsp;KB per token, and why it isn't 128&nbsp;KB</summary>
+      <div class="body">
+        <p>
+          Per token, per layer, the cache stores one key and one value vector for each KV head:
+          <code>8 heads &times; 64 dims &times; 2 tensors &times; 2 bytes = 2&nbsp;KB</code>.
+          Times 16 layers, that is <strong>32&nbsp;KB per token</strong>, or 128&nbsp;MB for a
+          full 4,096-token sequence &mdash; per sequence, and 32 of those is 4&nbsp;GB of GPU
+          memory doing nothing but remembering.
+        </p>
+        <p>
+          Eight KV heads, but the model has <strong>32 query heads</strong>. That is
+          <button class="term" data-t="gqa">grouped-query attention</button>: four queries share
+          each key/value head, so the cache is a quarter of the size it would be with one KV head
+          per query head. It is the single largest reason a 1B model can hold dozens of concurrent
+          sequences on one card &mdash; and, as section 07 shows, it also costs 10% of GPU time,
+          because something has to expand those 8 heads back to 32 before the multiply.
+        </p>
+        <p>
+          The measured sweep, from <code>docs/benchmarks.md</code>, taken on the last commit where
+          the no-cache path still existed:
+        </p>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Tokens out</th><th>no cache</th><th>KV cache</th><th>cache is worth</th></tr></thead>
+            <tbody>
+              <tr><td>256</td><td>60.7</td><td>69.5</td><td>1.15&times;</td></tr>
+              <tr><td>512</td><td>44.6</td><td>71.9</td><td>1.61&times;</td></tr>
+              <tr><td>1024</td><td>24.1</td><td>69.6</td><td><strong>2.88&times;</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Read the columns, not the ratio: cached throughput barely moves with length, while the
+          recompute path collapses. The cache is not getting better; the alternative is getting
+          worse.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 03 ================= -->
+  <section id="native">
+    <h2><span class="step">03 &middot; Step two</span>A measured zero, reported as a zero</h2>
+
+    <p>
+      The first cache wrapped a HuggingFace <code>DynamicCache</code>. The second stored keys and
+      values as plain tensors instead &mdash; fewer layers of indirection, no dependency on a
+      library's internals, and full control of the memory layout.
+    </p>
+
+    <div class="predict" data-answer="same" data-explain="Nothing measurable. Three independent measurements, all inside run-to-run variance.">
+      <p class="pq">A cleaner rewrite of the same data structure. What does the stopwatch say?</p>
+      <p class="ph">Same workload, same kernels, same arithmetic &mdash; only the container changed.</p>
+      <div class="pbtns">
+        <button type="button" data-v="faster">measurably faster</button>
+        <button type="button" data-v="same">no change</button>
+        <button type="button" data-v="slower">measurably slower</button>
+        <button type="button" class="skip" data-v="">just show me</button>
+      </div>
+      <div class="pans" hidden>
+        <div class="verdict loss">
+          <span class="ratio">1.00&times;</span>
+          <span class="what">throughput <em>73.4 &rarr; 72.7 tok/s</em> &middot; inter-token latency <em>13.7 &rarr; 13.7 ms</em> &mdash; inside noise</span>
+        </div>
+      </div>
+      <p class="mark" hidden></p>
+    </div>
+
+    <p>
+      Nothing. Three independent measurements, all within run-to-run variance. The rewrite was
+      still worth doing &mdash; it removed a coupling and became the foundation the paged cache
+      was built on &mdash; but it did not make anything faster, and the documentation says so.
+    </p>
+    <p>
+      This is worth pausing on, because it is the part of engineering that gets quietly edited out
+      of write-ups. A change can be correct, necessary, and <em>not</em> an optimisation.
+      An engine whose docs claim a win for every merge is an engine whose numbers you cannot trust.
+    </p>
+
+    <details class="deep">
+      <summary>What "inside noise" means here, precisely</summary>
+      <div class="body">
+        <p>
+          Re-running the same configuration alone versus inside a parallel sweep moved throughput
+          by 2.0% and inter-token latency by 3.8%, in opposite directions. So the harness treats
+          <strong>&plusmn;4% as the resolution floor</strong>: below roughly 1.1&times;, a
+          difference is a measurement, not a result. Every speedup claimed on this page clears that
+          floor, except the two explicitly reported as zeroes.
+        </p>
+        <p>
+          A rewrite that buys nothing today can still be the precondition for something that buys a
+          lot &mdash; here, owning the memory layout is what made a paged cache writable at all.
+          The honest way to record that is a zero in the results table and a sentence about why the
+          code stayed.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 04 ================= -->
+  <section id="paged">
+    <h2><span class="step">04 &middot; Step three</span>Pages instead of arrays &mdash; a deliberate local loss</h2>
+
+    <p>
+      A contiguous per-sequence cache wastes memory in three distinguishable ways, and they are
+      worth naming separately because the fix kills them at different rates.
+      <strong>Reserved</strong> space is held for tokens the sequence will eventually generate:
+      it does get used, just not yet, and until then nobody else can have it.
+      <button class="term" data-t="internal">Internal fragmentation</button> is the gap between
+      what you reserved and what the reply actually needed &mdash; reserve 4,096 tokens for an
+      answer that stops at 30 and 99% of that allocation is never touched at all.
+      <button class="term" data-t="external">External fragmentation</button> is the unusable holes
+      left between differently-sized contiguous allocations. Multiply by the number of concurrent
+      slots and the GPU runs out of room long before it runs out of compute.
+    </p>
+    <p>
+      Operating systems solved this with paging, and inference engines borrow it wholesale. Cut
+      memory into fixed-size <strong>blocks</strong>. Give each sequence a
+      <button class="term" data-t="blocktable">block table</button> mapping its <em>logical</em>
+      blocks 0,&nbsp;1,&nbsp;2&hellip; to whatever <em>physical</em> blocks the pool had free. The
+      sequence addresses its cache as if it were one contiguous run; the table quietly does the
+      translation. Sequences grow a block at a time, blocks come from one shared pool, and nothing
+      needs to be adjacent to anything.
+    </p>
+
+    <figure class="panel">
+      <div class="figscroll" tabindex="0" role="group" aria-label="Block table diagram, scrollable">
+      <svg viewBox="0 0 640 344" role="img" aria-label="A shared pool of physical blocks sits above two sequences' block tables. Arrows show seq A's logical blocks 0 and 1 pointing at physical blocks 3 and 7, and seq B's logical block 0 pointing at physical block 5. A token's physical slot is its block index times the block size plus its offset.">
+        <defs>
+          <marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"></path>
+          </marker>
+          <marker id="arC" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cost)"></path>
+          </marker>
+        </defs>
+
+        <text x="0" y="14" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">PHYSICAL POOL &mdash; one flat array of token slots</text>
+        <g font-family="IBM Plex Mono, monospace" font-size="9" fill="currentColor">
+          <rect x="0" y="28" width="60" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 3" opacity="0.55"></rect>
+          <text x="30" y="45" text-anchor="middle" opacity="0.7">null</text>
+          <rect x="64" y="28" width="60" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity="0.35"></rect>
+          <text x="94" y="45" text-anchor="middle" opacity="0.5">1</text>
+          <rect x="128" y="28" width="60" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity="0.35"></rect>
+          <text x="158" y="45" text-anchor="middle" opacity="0.5">2</text>
+          <rect x="192" y="28" width="60" height="26" rx="3" fill="var(--accent)" opacity="0.18"></rect>
+          <rect x="192" y="28" width="60" height="26" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.4"></rect>
+          <text x="222" y="45" text-anchor="middle">block 3</text>
+          <rect x="256" y="28" width="60" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity="0.35"></rect>
+          <text x="286" y="45" text-anchor="middle" opacity="0.5">4</text>
+          <rect x="320" y="28" width="60" height="26" rx="3" fill="var(--cost)" opacity="0.2"></rect>
+          <rect x="320" y="28" width="60" height="26" rx="3" fill="none" stroke="var(--cost)" stroke-width="1.4"></rect>
+          <text x="350" y="45" text-anchor="middle">block 5</text>
+          <rect x="384" y="28" width="60" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity="0.35"></rect>
+          <text x="414" y="45" text-anchor="middle" opacity="0.5">6</text>
+          <rect x="448" y="28" width="60" height="26" rx="3" fill="var(--accent)" opacity="0.18"></rect>
+          <rect x="448" y="28" width="60" height="26" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.4"></rect>
+          <text x="478" y="45" text-anchor="middle">block 7</text>
+          <rect x="512" y="28" width="60" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1" opacity="0.35"></rect>
+          <text x="542" y="45" text-anchor="middle" opacity="0.5">8</text>
+        </g>
+
+        <g fill="none" stroke-width="1.5">
+          <path d="M 286 186 C 286 140 240 108 222 60" stroke="var(--accent)" marker-end="url(#arA)"></path>
+          <path d="M 346 186 C 346 130 430 118 478 60" stroke="var(--accent)" marker-end="url(#arA)"></path>
+          <path d="M 286 224 C 302 180 322 126 350 60" stroke="var(--cost)" marker-end="url(#arC)"></path>
+        </g>
+
+        <text x="0" y="152" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">BLOCK TABLES</text>
+        <text x="0" y="168" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.75">what each sequence</text>
+        <text x="0" y="182" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.75">believes it owns</text>
+
+        <g font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor">
+          <text x="210" y="204" font-size="10.5">seq A</text>
+          <rect x="260" y="190" width="52" height="20" rx="3" fill="var(--accent)" opacity="0.18"></rect>
+          <rect x="260" y="190" width="52" height="20" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.2"></rect>
+          <text x="286" y="204" text-anchor="middle">0&rarr;3</text>
+          <rect x="320" y="190" width="52" height="20" rx="3" fill="var(--accent)" opacity="0.18"></rect>
+          <rect x="320" y="190" width="52" height="20" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.2"></rect>
+          <text x="346" y="204" text-anchor="middle">1&rarr;7</text>
+
+          <text x="210" y="242" font-size="10.5">seq B</text>
+          <rect x="260" y="228" width="52" height="20" rx="3" fill="var(--cost)" opacity="0.2"></rect>
+          <rect x="260" y="228" width="52" height="20" rx="3" fill="none" stroke="var(--cost)" stroke-width="1.2"></rect>
+          <text x="286" y="242" text-anchor="middle">0&rarr;5</text>
+        </g>
+        <text x="400" y="205" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.7">logical block &rarr; physical block</text>
+
+        <text x="0" y="272" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.75">Block 0 is the null block &mdash; never allocated, it absorbs writes from padded batch positions.</text>
+
+        <text x="0" y="296" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="currentColor">ONE INTEGER</text>
+        <rect x="0" y="304" width="372" height="34" rx="4" fill="var(--sunken)" stroke="var(--rule)" stroke-width="1"></rect>
+        <text x="186" y="326" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor">slot = block_idx &times; block_size + offset</text>
+        <text x="388" y="318" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="currentColor" opacity="0.85">Token 2 of block 7, block_size 16</text>
+        <text x="388" y="334" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="currentColor" opacity="0.85">&rarr; slot 114</text>
+      </svg>
+      </div>
+      <p class="scrollhint">Diagram scrolls sideways &rarr;</p>
+      <figcaption>
+        The sequence sees logical blocks 0, 1, 2&hellip; in order; the pool hands out whatever
+        physical block is free, in any order. Storage is one flat array of token slots, and a
+        block is just <code>block_size</code> consecutive slots &mdash; so an address collapses to
+        a single integer, which is what lets the cache move a whole batch in one tensor operation.
+      </figcaption>
+    </figure>
+
+    <div class="predict" data-answer="slower" data-explain="Paging cost 8% here. It is a memory win bought with speed &mdash; and it is what makes section 06 possible.">
+      <p class="pq">Paging fixes the memory waste. What does it do to throughput?</p>
+      <p class="ph">Same model, same batch of one, blocks of 16 tokens instead of one contiguous array.</p>
+      <div class="pbtns">
+        <button type="button" data-v="faster">faster</button>
+        <button type="button" data-v="same">no change</button>
+        <button type="button" data-v="slower">slower</button>
+        <button type="button" class="skip" data-v="">just show me</button>
+      </div>
+      <div class="pans" hidden>
+        <div class="verdict loss">
+          <span class="ratio">0.92&times;</span>
+          <span class="what">throughput <em>72.7 &rarr; 66.8 tok/s</em> &middot; inter-token latency <em>13.7 &rarr; 15.3 ms</em> &mdash; paging <strong>costs</strong> 8%</span>
+        </div>
+      </div>
+      <p class="mark" hidden></p>
+    </div>
+
+    <figure class="widget" id="bx">
+      <h4>Resolve a token to its physical slot</h4>
+      <p class="wnote">
+        Pick any logical position. Watch it become one integer. Then append tokens and watch a
+        block boundary get crossed. <b>block_size is 4 here</b> so the slots fit on screen; the
+        engine runs 16.
+      </p>
+
+      <div class="wctl" role="group" aria-label="Sequence and growth controls">
+        <div class="seg" role="group" aria-label="Choose sequence">
+          <button type="button" data-seq="A" aria-pressed="true">seq A</button>
+          <button type="button" data-seq="B" aria-pressed="false">seq B</button>
+        </div>
+        <span class="spacer"></span>
+        <button type="button" id="bx-grow">+ append a token</button>
+        <button type="button" id="bx-free">free the other sequence</button>
+        <button type="button" id="bx-reset">&#8635; reset</button>
+      </div>
+
+      <div class="bx-row">
+        <p class="bx-lab">Logical view <em>&mdash; what <span id="bx-seqname">seq A</span> believes it has: one contiguous run</em></p>
+        <div class="toks" id="bx-toks" role="radiogroup" aria-label="Logical token position"></div>
+      </div>
+
+      <div class="bx-row">
+        <p class="bx-lab">Block table <em>&mdash; logical block &rarr; physical block</em></p>
+        <div class="btab" id="bx-tab"></div>
+      </div>
+
+      <div class="bx-row">
+        <p class="bx-lab">The arithmetic</p>
+        <div class="calc" id="bx-calc"></div>
+      </div>
+
+      <div class="bx-row" style="margin-bottom:6px">
+        <p class="bx-lab">Physical pool <em>&mdash; 10 blocks of 4 slots, one shared array</em></p>
+        <div class="figscroll" tabindex="0" role="group" aria-label="Physical slot pool, scrollable">
+          <div class="pool" id="bx-pool"></div>
+        </div>
+        <p class="scrollhint">Pool scrolls sideways &rarr;</p>
+      </div>
+
+      <div class="wstats" id="bx-stats"></div>
+      <div class="wevent" id="bx-say" role="status" aria-live="polite"></div>
+
+      <figcaption>
+        Nothing in the logical row is contiguous in the pool, and nothing needs to be. Append
+        tokens until a block fills and the next one is taken from wherever the free list happens
+        to point &mdash; the sequence never notices. Free the other sequence and its blocks return
+        to that same list, ready to be handed to whoever asks next: that is the property section 06
+        is built on. The unfilled tail of the last block is the only waste paging cannot remove,
+        and it is bounded by <code>block_size</code>, not by how long the reply might have been.
+      </figcaption>
+    </figure>
+
+    <p>
+      Paging made this engine <em>slower</em>. Blocks are scattered, so before attention runs, the
+      keys and values have to be gathered back into a contiguous tensor &mdash; every layer, every
+      step. Production engines avoid that by teaching the attention kernel to walk the block table
+      itself, so the blocks are never materialised as one tensor at all; liteinfer has not written
+      that kernel yet, so it pays the gather on every single layer of every single step.
+    </p>
+    <p>
+      What it does buy is memory. Reserved space and external fragmentation go to zero: a block is
+      allocated only when the previous one fills, and every block is the same size, so there are no
+      awkward holes. Internal fragmentation survives &mdash; but it shrinks from <em>the difference
+      between the reply you got and the longest one you might have got</em> to <em>at most
+      block_size &minus; 1 unused slots in the last block</em>. That is the whole trade, and it is
+      why the block size is a knob rather than a constant.
+    </p>
+    <p>
+      It was still the right move, and this is the subtle part: <strong>an optimisation can lose
+      locally and win globally.</strong> Paging is what makes it possible to admit and evict
+      sequences independently &mdash; and that unlocks section 06, which is worth 5&times;. Judging
+      paging on its own 8% loss would have meant never getting there.
+    </p>
+
+    <details class="deep">
+      <summary>The whole address translation, in one tensor op</summary>
+      <div class="body">
+        <p>
+          Because a block is <code>block_size</code> consecutive slots in one flat array, a token's
+          address is a single integer and the translation for an entire batch is arithmetic on a
+          tensor &mdash; no Python loop over sequences, no loop over blocks. This is
+          <code>slot_table</code>, the only place in the engine that knows how blocks are addressed:
+        </p>
+        <pre><code><span class="cmt"># cache/block_pool.py — every read and write goes through this</span>
+logical = torch.arange(max_total, device=device) - (max_total - count).unsqueeze(1)
+is_real = logical &gt;= 0
+logical = logical.clamp(min=0)
+slots   = blocks.gather(1, logical // block_size) * block_size + logical % block_size
+<span class="kw">return</span> torch.where(is_real, slots, 0)   <span class="cmt"># 0 = the null block</span></code></pre>
+        <p>
+          Three details earn their place. The rows are <strong>right-aligned</strong>, so the newest
+          token is always the last column &mdash; which is what the left-padded attention mask
+          expects. Positions that do not exist yet are pointed at <strong>slot 0</strong>, the null
+          block, so padded batch positions can be written and read without anyone masking them.
+          And the pool is allocated with one extra block behind the scenes, so that null block
+          costs no usable capacity.
+        </p>
+        <p>
+          An earlier version of the same lookup walked the block tables in Python, once per layer,
+          once per step. Vectorising it is what made continuous batching 7&times; faster &mdash;
+          see section 12.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 05 ================= -->
+  <section id="static">
+    <h2><span class="step">05 &middot; Step four</span>Make one weight read serve many sequences</h2>
+
+    <p>
+      Back to the floor from section 01. A decode step streams 2.48&nbsp;GB of weights to produce
+      <em>one</em> token. Run four sequences through the same pass and the same read produces
+      <em>four</em>. The weights are the expensive part and they are shared.
+    </p>
+
+    <figure class="panel">
+      <p class="bx-lab" style="margin-bottom:12px">One sequence at a time &mdash; output tokens/second</p>
+      <div class="rows">
+        <div class="row"><span class="rlab">no cache</span><span class="rtrack"><span class="rbar pale" style="width:82.4%"></span></span><span class="rval">60.5</span></div>
+        <div class="row"><span class="rlab">KV cache</span><span class="rtrack"><span class="rbar" style="width:100%"></span></span><span class="rval good">73.4</span></div>
+        <div class="row"><span class="rlab">plain tensors</span><span class="rtrack"><span class="rbar" style="width:99.0%"></span></span><span class="rval">72.7</span></div>
+        <div class="row"><span class="rlab">paged</span><span class="rtrack"><span class="rbar cost" style="width:91.0%"></span></span><span class="rval cost">66.8</span></div>
+      </div>
+      <figcaption>
+        The first three sections, plotted. Caching helps, the rewrite is flat, paging costs &mdash;
+        and every bar here is still under 74 tokens per second.
+      </figcaption>
+    </figure>
+
+    <div class="verdict">
+      <span class="ratio">3.84&times;</span>
+      <span class="what">four sequences at once, <em>73.4 &rarr; 281.6 tok/s</em></span>
+    </div>
+
+    <p>
+      Near-linear in the batch size, which tells you the GPU was never the constraint &mdash; it was
+      idling on memory. This is <button class="term" data-t="static">static batching</button>:
+      gather a group of requests, run them together, return them together.
+    </p>
+    <p>
+      And that last word is the flaw. A batch finishes when its <em>slowest</em> member finishes.
+      A request that wanted 20 tokens sits occupying a slot until the one that wanted 500 is done.
+      The GPU is busy; much of what it computes is padding. The next section lets you step through
+      exactly that, one iteration at a time.
+    </p>
+
+    <details class="deep">
+      <summary>Why 4&times; the sequences is 3.84&times; the tokens, and not 4&times;</summary>
+      <div class="body">
+        <p>
+          The missing 4% is everything that does <em>not</em> get shared: the KV cache reads grow
+          with the batch, the sampler now picks four tokens instead of one, the mask is bigger, and
+          the batch runs at the length of its longest member so some positions are padding. vLLM
+          measures 3.84&times; on the identical transition, which is a useful sanity check &mdash;
+          when your scaling matches the reference implementation's scaling, the residual is
+          physics rather than a bug in your loop.
+        </p>
+        <p>
+          The interesting question is where the near-linearity stops. It stops when the weight read
+          is no longer the dominant cost &mdash; at large enough batch or long enough context, the
+          KV cache traffic overtakes the weights, and throughput flattens. On a 1B model with
+          128-token prompts that point is far away, which is why section 06 can go to 32 slots and
+          keep gaining.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 06 ================= -->
+  <section id="continuous">
+    <h2><span class="step">06 &middot; Step five</span>Never leave a slot idle</h2>
+
+    <p>
+      <button class="term" data-t="continuous">Continuous batching</button> removes the batch
+      boundary. The scheduler holds a set of slots; on <em>every</em> step it evicts whichever
+      sequences finished and admits waiting ones into the freed slots. Requests join and leave
+      mid-flight.
+    </p>
+    <p>
+      The name to hold on to is the mechanism, not the effect: batch membership is re-decided once
+      per <em>iteration</em>, which is why the same idea travels under
+      <em>iteration-level scheduling</em> and <em>in-flight batching</em> as well. Nothing about the
+      forward pass changes. The only change is who is in it.
+    </p>
+
+    <figure class="widget" id="cb">
+      <h4>Step the scheduler: static vs continuous</h4>
+      <p class="wnote">
+        Seven requests, four slots, identical work in both grids. Press <em>play</em>, or step
+        through with the arrow keys. <b>An illustrative schedule, not a measurement</b> &mdash; the
+        measured numbers are below.
+      </p>
+
+      <div class="wctl" role="group" aria-label="Timeline controls">
+        <button type="button" data-act="start">&#8635; start</button>
+        <button type="button" data-act="prev">&#9664; back</button>
+        <button type="button" data-act="play" id="cb-play">&#9654; play</button>
+        <button type="button" data-act="next">step &#9654;</button>
+        <button type="button" data-act="end">end &#9197;</button>
+        <label>step
+          <input type="range" id="cb-range" min="1" max="18" value="1" step="1" aria-label="Scheduler step">
+        </label>
+        <output class="readout" id="cb-out">step 1 / 18</output>
+      </div>
+
+      <div class="figscroll" tabindex="0" role="group" aria-label="Scheduler timelines, scrollable">
+        <div class="gridwrap" id="cb-grids"></div>
+      </div>
+      <p class="scrollhint">Timelines scroll sideways &rarr;</p>
+
+      <div class="legend">
+        <span><i class="run"></i> a forward pass that produces a token</span>
+        <span><i class="idle"></i> slot held, no useful work</span>
+        <span><i class="void"></i> nothing scheduled</span>
+      </div>
+
+      <div class="wevent" id="cb-say" role="status" aria-live="polite"></div>
+
+      <div class="wstats" id="cb-stats"></div>
+      <p class="wnote" style="margin:12px 0 0">Each pair reads <em>static</em> &rarr; <em>continuous</em>, counted up to the current step.</p>
+
+      <figcaption>
+        Both schedules do exactly the same 40 token-passes. Static holds every slot until the
+        slowest member of the batch finishes, so a short request keeps a slot warm for nothing;
+        continuous decides membership again on every iteration, so a slot that frees at step 3 is
+        working again at step 4. The hatched area is the whole argument.
+      </figcaption>
+    </figure>
+
+    <div class="verdict">
+      <span class="ratio">5.01&times;</span>
+      <span class="what">32 slots instead of 4, <em>252.9 &rarr; 1,268.3 tok/s</em></span>
+    </div>
+
+    <p>
+      This is also where paging pays for itself. Admitting and evicting sequences independently
+      requires per-sequence memory that can be handed back in pieces &mdash; exactly what block
+      tables provide, and exactly what a contiguous per-sequence array cannot do.
+    </p>
+
+    <figure class="panel">
+      <p class="bx-lab" style="margin-bottom:12px">Adding concurrency &mdash; output tokens/second</p>
+      <div class="rows">
+        <div class="row"><span class="rlab">1 seq</span><span class="rtrack"><span class="rbar pale" style="width:5.8%"></span></span><span class="rval">73.4</span></div>
+        <div class="row"><span class="rlab">4 seqs</span><span class="rtrack"><span class="rbar pale" style="width:22.2%"></span></span><span class="rval">281.6</span></div>
+        <div class="row"><span class="rlab">4, paged</span><span class="rtrack"><span class="rbar pale" style="width:19.9%"></span></span><span class="rval">252.9</span></div>
+        <div class="row"><span class="rlab">32, continuous</span><span class="rtrack"><span class="rbar" style="width:100%"></span></span><span class="rval good">1,268.3</span></div>
+      </div>
+      <figcaption>
+        Same scale throughout. Concurrency, not arithmetic, is where the order of magnitude lives:
+        21&times; from the first bar on this page to the last.
+      </figcaption>
+    </figure>
+
+    <details class="deep">
+      <summary>The scheduler, in full &mdash; it really is this small</summary>
+      <div class="body">
+        <p>
+          There is no queueing theory in here. Every step: fill any empty slot from the waiting
+          list, then split whoever is running into the ones that need a prefill pass and the ones
+          that need a decode pass.
+        </p>
+        <pre><code><span class="cmt"># engine/continuous_scheduler.py</span>
+<span class="kw">def</span> schedule(self) -&gt; ContinuousSchedulerOutput:
+    available = self.config.max_num_seqs - len(self.running)
+    <span class="kw">if</span> available &gt; 0 <span class="kw">and</span> self.waiting:
+        n = min(available, len(self.waiting))
+        admitted, self.waiting = self.waiting[:n], self.waiting[n:]
+        <span class="kw">for</span> seq <span class="kw">in</span> admitted:
+            seq.status = SequenceStatus.RUNNING
+        self.running.extend(admitted)
+
+    prefill_seqs = [s <span class="kw">for</span> s <span class="kw">in</span> self.running <span class="kw">if</span> <span class="kw">not</span> s.is_finished <span class="kw">and</span> <span class="kw">not</span> s.output_token_ids]
+    decode_seqs  = [s <span class="kw">for</span> s <span class="kw">in</span> self.running <span class="kw">if</span> <span class="kw">not</span> s.is_finished <span class="kw">and</span> s.output_token_ids]
+    <span class="kw">return</span> ContinuousSchedulerOutput(prefill_seqs, decode_seqs)</code></pre>
+        <p>
+          The companion is <code>remove_finished</code>, which evicts sequences individually
+          instead of waiting for the batch &mdash; three lines, and the entire difference between
+          this section and the last one.
+        </p>
+        <p>
+          Splitting prefill from decode is also the one place liteinfer scales slightly below vLLM:
+          when both kinds of work are pending it issues <em>two</em> forward passes in a step where
+          vLLM would issue one mixed pass. That is worth 5.01&times; against vLLM's 6.17&times; on
+          the same 4&nbsp;&rarr;&nbsp;32 transition, and the fix has a name &mdash; chunked prefill.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 07 ================= -->
+  <section id="profile">
+    <h2><span class="step">07 &middot; Reality check</span>Where the time actually goes</h2>
+
+    <p>
+      Intuition says a forward pass is matrix multiplication. A profiler disagrees. Here is GPU
+      time during decode, by operation:
+    </p>
+
+    <figure class="panel">
+      <p class="bx-lab" style="margin-bottom:12px">Share of GPU time during decode</p>
+      <div class="rows">
+        <div class="row"><span class="rlab">projections</span><span class="rtrack"><span class="rbar" style="width:100%"></span></span><span class="rval">49%</span></div>
+        <div class="row"><span class="rlab">cache copies</span><span class="rtrack"><span class="rbar cost" style="width:30.6%"></span></span><span class="rval cost">15%</span></div>
+        <div class="row"><span class="rlab">tensor clones</span><span class="rtrack"><span class="rbar cost" style="width:20.4%"></span></span><span class="rval cost">10%</span></div>
+        <div class="row"><span class="rlab">attention</span><span class="rtrack"><span class="rbar" style="width:18.4%"></span></span><span class="rval">9%</span></div>
+        <div class="row"><span class="rlab">sampling</span><span class="rtrack"><span class="rbar cost" style="width:14.3%"></span></span><span class="rval cost">7%</span></div>
+        <div class="row"><span class="rlab">reshape, cast</span><span class="rtrack"><span class="rbar cost" style="width:20.4%"></span></span><span class="rval cost">10%</span></div>
+      </div>
+      <div class="legend">
+        <span><i class="acc"></i> arithmetic the model needs</span>
+        <span><i class="cost"></i> moving data around it</span>
+      </div>
+      <figcaption>
+        Roughly 42% of GPU time is spent shuffling tensors rather than computing with them &mdash;
+        and that excludes time the GPU spends idle waiting for Python to issue the next operation.
+      </figcaption>
+    </figure>
+
+    <p>
+      Two findings hide in there. <strong>Sampling costs 7%</strong> &mdash; picking the
+      highest-scoring token out of a 128,256-wide vocabulary is not free. And
+      <strong>a tenth of the time is <code>clone</code></strong>, almost all of it one line:
+      this model has 32 query heads sharing 8 key/value heads, and attention materialises a
+      4&times; copy of K and V so the shapes line up. Section 08 removes the larger of the two
+      memory costs in attention; this copy is the smaller one, and it is still there &mdash;
+      a fused kernel can broadcast those heads internally instead, which is the next change
+      queued on this file.
+    </p>
+
+    <figure class="widget" id="am">
+      <h4>Suppose you made it free</h4>
+      <p class="wnote">
+        Tick the parts of the profile you would optimise away entirely &mdash; the best case, not a
+        realistic one. The ceiling is <button class="term" data-t="amdahl">Amdahl's law</button>:
+        <b>1 &divide; (1 &minus; the fraction you removed)</b>.
+      </p>
+
+      <div class="chks" id="am-chks"></div>
+
+      <div class="rows" id="am-rows"></div>
+      <div class="wstats" id="am-stats"></div>
+      <div class="wevent" id="am-say" role="status" aria-live="polite"></div>
+
+      <figcaption>
+        Delete <em>every</em> byte-shuffling operation in the profile &mdash; all four, perfectly,
+        for free &mdash; and the engine gets 1.72&times; faster. vLLM is about 3&times; faster.
+        So the remaining gap is not hiding in this chart: it is in the 49% marked
+        <em>projections</em>, which is where CUDA graphs, <code>torch.compile</code> and fused
+        kernels do their work. That is the difference between reading a profile and reading it
+        arithmetically.
+      </figcaption>
+    </figure>
+
+    <p>
+      The lesson generalises past this codebase: <strong>profile before you optimise.</strong>
+      Nobody guesses "the sampler" or "a shape-fixing copy" when asked where the time goes.
+    </p>
+
+    <details class="deep">
+      <summary>The clone that costs 10%, and why it exists</summary>
+      <div class="body">
+        <p>
+          Grouped-query attention stores 8 KV heads for 32 query heads. Before the multiply, the
+          two sides have to agree on head count, so the engine expands the KV heads back to 32:
+        </p>
+        <pre><code><span class="cmt"># models/attention.py — _repeat_kv</span>
+<span class="kw">return</span> (
+    hidden_states[:, :, <span class="kw">None</span>, :, :]
+    .expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    .reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+)</code></pre>
+        <p>
+          <code>expand</code> is free &mdash; it is a view with a zero stride. <code>reshape</code>
+          is not: the tensor is no longer contiguous, so PyTorch materialises a real 4&times; copy
+          of every key and value in the batch, on every layer, on every step. That copy is the
+          <code>clone</code> in the profile.
+        </p>
+        <p>
+          A kernel that broadcasts the heads internally never makes the copy &mdash; which is
+          exactly what a purpose-built paged-attention kernel does, and one of the two remaining
+          items on this file's roadmap.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 08 ================= -->
+  <section id="fused">
+    <h2><span class="step">08 &middot; Step six</span>Attention that never writes the matrix down</h2>
+
+    <p>
+      Every design so far attacked <em>how often</em> the model runs. This one attacks what a
+      single attention call keeps in memory &mdash; and unlike the others, it is not a speedup.
+      It is the difference between running and not running.
+    </p>
+    <p>
+      Written out plainly, attention builds a score for every (query, key) pair: one
+      <code>[batch, heads, queries, keys]</code> tensor, and the
+      <button class="term" data-t="softmax">softmax</button> upcasts it to fp32 to stay
+      numerically safe. That tensor is <em>the largest thing in the forward pass</em>, and it
+      grows with the <strong>square</strong> of sequence length. At 32 sequences &times; 32 heads
+      &times; 1024&sup2;, it is <strong>4.00&nbsp;GiB in a single allocation</strong> &mdash; and
+      liteinfer died there, out of memory, on a prompt length vLLM handled without noticing.
+    </p>
+    <p>
+      The fix is the idea behind <button class="term" data-t="flash">FlashAttention</button>, and it
+      is worth stating carefully because the name suggests a faster multiply, which it is not. The
+      scores are computed in <strong>tiles</strong> that fit in the GPU's on-chip
+      <button class="term" data-t="sram">SRAM</button>. Each tile is scored, softmaxed and folded
+      into a running output right there; then it is discarded. The softmax is kept correct across
+      tiles by carrying a running maximum and a running sum, and rescaling the accumulated output
+      when a later tile raises the maximum &mdash; the <em>online softmax</em> trick. The full
+      matrix is never assembled anywhere, so peak memory stops depending on sequence length at all.
+    </p>
+
+    <figure class="panel">
+      <div class="figscroll" tabindex="0" role="group" aria-label="Eager versus tiled attention diagram, scrollable">
+      <svg viewBox="0 0 640 300" role="img" aria-label="Eager attention writes the whole queries-by-keys score matrix to GPU memory before the softmax, so peak memory grows with sequence length squared. Tiled attention scores one small tile at a time inside on-chip SRAM, folds it into a running output and discards it, so peak memory is one tile regardless of sequence length.">
+        <defs>
+          <marker id="arF" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path>
+          </marker>
+        </defs>
+
+        <text x="0" y="13" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="var(--cost)">EAGER</text>
+        <text x="0" y="29" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.8">writes the whole matrix out</text>
+        <rect x="0" y="40" width="180" height="140" rx="4" fill="var(--cost)" opacity="0.2"></rect>
+        <rect x="0" y="40" width="180" height="140" rx="4" fill="none" stroke="var(--cost)" stroke-width="1.5"></rect>
+        <text x="90" y="104" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">queries &times; keys</text>
+        <text x="90" y="121" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.8">all of it, at once</text>
+        <text x="0" y="202" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">written out, then read back</text>
+        <text x="0" y="218" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">softmax upcasts it to fp32</text>
+        <text x="0" y="238" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="var(--cost)">peak grows with length&sup2;</text>
+
+        <line x1="203" y1="36" x2="203" y2="246" stroke="currentColor" stroke-width="1" opacity="0.18"></line>
+
+        <text x="222" y="13" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="var(--accent)">TILED &mdash; SDPA / FlashAttention</text>
+        <text x="222" y="29" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.8">one tile at a time, in on-chip SRAM</text>
+        <g stroke="var(--accent)" stroke-width="1.1" fill="none" opacity="0.4">
+          <rect x="222" y="40" width="34" height="34" rx="2"></rect><rect x="260" y="40" width="34" height="34" rx="2"></rect>
+          <rect x="298" y="40" width="34" height="34" rx="2"></rect><rect x="336" y="40" width="34" height="34" rx="2"></rect>
+          <rect x="222" y="78" width="34" height="34" rx="2"></rect>
+          <rect x="298" y="78" width="34" height="34" rx="2"></rect><rect x="336" y="78" width="34" height="34" rx="2"></rect>
+          <rect x="222" y="116" width="34" height="34" rx="2"></rect><rect x="260" y="116" width="34" height="34" rx="2"></rect>
+          <rect x="298" y="116" width="34" height="34" rx="2"></rect><rect x="336" y="116" width="34" height="34" rx="2"></rect>
+          <rect x="222" y="154" width="34" height="34" rx="2"></rect><rect x="260" y="154" width="34" height="34" rx="2"></rect>
+          <rect x="298" y="154" width="34" height="34" rx="2"></rect><rect x="336" y="154" width="34" height="34" rx="2"></rect>
+        </g>
+        <rect x="260" y="78" width="34" height="34" rx="2" fill="var(--accent)" opacity="0.9"></rect>
+        <text x="277" y="99" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="9" font-weight="600" fill="var(--surface)">live</text>
+        <text x="222" y="202" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">only the filled tile exists</text>
+        <text x="222" y="218" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">&mdash; the outlines never do</text>
+        <text x="222" y="238" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="var(--accent)">peak is one tile, at any length</text>
+
+        <line x1="378" y1="110" x2="410" y2="110" stroke="currentColor" stroke-width="1.4" marker-end="url(#arF)"></line>
+        <rect x="418" y="70" width="212" height="76" rx="5" fill="var(--accent)" opacity="0.12"></rect>
+        <rect x="418" y="70" width="212" height="76" rx="5" fill="none" stroke="var(--accent)" stroke-width="1.4"></rect>
+        <text x="524" y="90" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10.5" font-weight="600" fill="currentColor">running output</text>
+        <text x="524" y="106" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="currentColor">+ running max</text>
+        <text x="524" y="120" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="currentColor">+ running sum</text>
+        <text x="524" y="136" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="9" fill="currentColor" opacity="0.75">rescaled when a tile raises the max</text>
+        <text x="418" y="168" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.8">tile folded in, then thrown away</text>
+
+        <line x1="0" y1="256" x2="640" y2="256" stroke="currentColor" stroke-width="1" opacity="0.18"></line>
+        <text x="0" y="274" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="currentColor">MEASURED, ONE ATTENTION CALL &mdash; 4 seqs &times; 32 heads &times; 2048 tokens</text>
+        <text x="0" y="294" font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor">eager <tspan fill="var(--cost)" font-weight="600">5,192 MiB</tspan> &rarr; tiled <tspan fill="var(--accent)" font-weight="600">96 MiB</tspan> &mdash; 54&times; less, same answer</text>
+      </svg>
+      </div>
+      <p class="scrollhint">Diagram scrolls sideways &rarr;</p>
+      <figcaption>
+        The two kernels compute the same function. The only difference is whether the
+        queries&times;keys matrix is ever assembled &mdash; and that decides how long a prompt the
+        engine can accept. Measured by allocating one attention call's worth of tensors and
+        recording peak GPU memory for each kernel.
+      </figcaption>
+    </figure>
+
+    <figure class="widget" id="at">
+      <h4>Size the score matrix yourself</h4>
+      <p class="wnote">
+        The eager kernel's peak is dominated by one term: <b>batch &times; 32 heads &times;
+        length&sup2;</b>, at 4 bytes once the softmax upcasts. Push either dial and watch a
+        quadratic do what quadratics do.
+      </p>
+
+      <div class="wctl">
+        <label>sequences
+          <input type="range" id="at-b" min="0" max="5" value="5" step="1" aria-label="Sequences in the batch">
+        </label>
+        <label>prompt length
+          <input type="range" id="at-l" min="1" max="32" value="8" step="1" aria-label="Prompt length in tokens">
+        </label>
+        <output class="readout" id="at-out">32 seqs &times; 1024 tokens</output>
+      </div>
+
+      <div class="rows" id="at-rows"></div>
+      <p class="rowsub">Peak GPU memory for a single attention call, against the A40's 46&nbsp;GB &mdash; of which the weights and the KV pool have already taken their share.</p>
+
+      <div class="wstats" id="at-stats"></div>
+      <div class="wevent" id="at-say" role="status" aria-live="polite"></div>
+
+      <figcaption>
+        The model is calibrated against the two measured points &mdash; 5,192&nbsp;MiB eager and
+        96&nbsp;MiB tiled at 4&nbsp;&times;&nbsp;32&nbsp;&times;&nbsp;2048 &mdash; and reproduces
+        the two allocations that actually killed the engine: 4.00&nbsp;GiB at 32&nbsp;&times;&nbsp;1024
+        and 16.02&nbsp;GiB at 32&nbsp;&times;&nbsp;2048. The tiled bar is linear in length; the eager
+        bar is quadratic. Every doubling of the prompt quadruples one and doubles the other.
+      </figcaption>
+    </figure>
+
+    <p>
+      In liteinfer this is one call: <code>torch.nn.functional.scaled_dot_product_attention</code>,
+      which dispatches to a fused CUDA backend. One detail is worth knowing because it surprises
+      people reading a profile. Prompts of different lengths are left-padded, so liteinfer passes
+      an explicit additive mask &mdash; and FlashAttention proper accepts no such mask, only a
+      causal flag. PyTorch therefore falls to its <em>memory-efficient</em> backend, which does
+      take a mask and tiles the same way. Different kernel, same property: no matrix.
+    </p>
+
+    <div class="predict" data-answer="same" data-explain="No faster at any shape that already ran &mdash; and that is not the point of the change.">
+      <p class="pq">A fused attention kernel replaces plain matmuls. Faster?</p>
+      <p class="ph">Same 32 slots, same prompts, same output length &mdash; shapes the eager kernel could already serve.</p>
+      <div class="pbtns">
+        <button type="button" data-v="faster">yes, clearly</button>
+        <button type="button" data-v="same">no &mdash; inside noise</button>
+        <button type="button" data-v="slower">slower</button>
+        <button type="button" class="skip" data-v="">just show me</button>
+      </div>
+      <div class="pans" hidden>
+        <div class="verdict loss">
+          <span class="ratio">1.0&times;</span>
+          <span class="what">throughput at every shape that already ran &mdash; <em>1.08&times;, 1.02&times;, 1.10&times;, 1.03&times;</em> &mdash; all inside noise</span>
+        </div>
+      </div>
+      <p class="mark" hidden></p>
+    </div>
+
+    <p>
+      Which is the honest headline, and the second measured zero on this page. Every shape the
+      engine could already serve, it serves at the same rate. Tiling does not make the arithmetic
+      cheaper; it changes where the intermediate lives.
+    </p>
+
+    <figure class="panel">
+      <p class="bx-lab" style="margin-bottom:12px">Output tokens/second by prompt length &mdash; 32 slots</p>
+      <div class="rows">
+        <div class="row"><span class="rlab">ISL 128</span><span class="rtrack"><span class="rbar pale" style="width:93.0%;height:9px;bottom:auto"></span><span class="rbar" style="width:100%;top:auto;height:9px;bottom:0"></span></span><span class="rval">1,344 &rarr; 1,446</span></div>
+        <div class="row"><span class="rlab">ISL 1024</span><span class="rtrack"><span class="rbar pale" style="width:44.6%;height:9px;bottom:auto"></span><span class="rbar" style="width:49.2%;top:auto;height:9px;bottom:0"></span></span><span class="rval">645 &rarr; 711</span></div>
+        <div class="row"><span class="rlab">ISL 2048</span><span class="rtrack"><span class="rbar" style="width:26.6%;top:auto;height:9px;bottom:0"></span></span><span class="rval cost">OOM &rarr; 385</span></div>
+      </div>
+      <div class="legend">
+        <span><i class="pale"></i> eager (upper half of each bar)</span>
+        <span><i class="acc"></i> tiled (lower strip)</span>
+        <span><i class="void" style="border-color:var(--cost)"></i> no eager bar at ISL 2048: it produced nothing</span>
+      </div>
+      <figcaption>
+        The first two pairs are the same bar twice. The third is the point: one kernel produces a
+        number and the other produces an exception. At ISL 2048 eager asks for 16.02&nbsp;GiB in one
+        allocation &mdash; 32 seqs &times; 32 heads &times; 2048&sup2;, fp32. A change worth shipping
+        does not have to move a metric; it can move the set of inputs the metric exists for.
+      </figcaption>
+    </figure>
+
+    <p>
+      One caution, because it is the kind of credit that gets misassigned. The ISL 1024 rows here
+      run under <em>both</em> kernels &mdash; what unlocked those was a separate fix to how the
+      block pool is sized, which had been claiming 32&nbsp;GB it could never address. ISL 2048 is
+      the first length only the fused kernel reaches. Two memory bugs, stacked; fixing one made
+      the other visible.
+    </p>
+
+    <details class="deep">
+      <summary>Both kernels, side by side &mdash; and the backend PyTorch actually picks</summary>
+      <div class="body">
+        <p>
+          The two implementations sit in the same file and differ by one call. Eager is kept
+          deliberately: it is what the arithmetic looks like, and it is the parity reference the
+          fused path is checked against.
+        </p>
+        <pre><code><span class="cmt"># models/attention.py — eager: every step visible, and the memory ceiling</span>
+scores  = torch.matmul(query, key.transpose(2, 3)) * scaling
+scores  = scores + attention_mask[:, :, :, : key.shape[-2]]
+weights = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+<span class="kw">return</span> torch.matmul(weights, value)
+
+<span class="cmt"># models/attention.py — sdpa: the same function, tiled, no score matrix</span>
+<span class="kw">return</span> nn.functional.scaled_dot_product_attention(
+    query, key, value, attn_mask=mask, scale=scaling)</code></pre>
+        <p>
+          Which backend serves that second call is not the obvious one. Left-padded batches need an
+          explicit additive mask, and FlashAttention takes only <code>is_causal</code>, so PyTorch
+          falls to its memory-efficient backend. Probed on these exact tensors: flash unavailable,
+          mem-efficient available, and forcing the math fallback instead costs
+          +4,872&nbsp;MiB against mem-efficient's +32&nbsp;MiB.
+        </p>
+        <p>
+          The two kernels disagree in exactly one place, and the file says so: on fully masked query
+          rows &mdash; the left padding &mdash; sdpa returns zeros while eager returns the average
+          of every value vector, because the mask is <code>finfo.min</code> rather than
+          <code>-inf</code> and a softmax over equal scores is uniform. A row that attends to
+          nothing has no defined answer; the engine reads logits from the last column, which is
+          never padding, so neither answer reaches the output. Knowing <em>why</em> two kernels
+          differ is what lets you call one of them a reference.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 09 ================= -->
+  <section id="loop">
+    <h2><span class="step">09 &middot; The other profile</span>Once the model is fast, the loop around it isn't</h2>
+
+    <p>
+      Every section so far changed what the model computes or how often it runs. But an engine is
+      not only a model. On every iteration it also decides who is in the batch, turns a row of
+      scores into a token, turns tokens into text, and hands that text to whoever asked for it.
+      Those stages launch few kernels and read like plumbing, so they are the last place anyone
+      looks &mdash; which is exactly why they are where the surprises are.
+    </p>
+    <p>
+      Section 07 profiled <em>GPU operations</em>, and that profile answers one question: which
+      kernel. It cannot answer <em>what fraction of an iteration is inside a kernel at all</em>,
+      because work that never touches the device does not appear in it. The complementary
+      measurement is to charge every stage of the loop to a bucket &mdash; schedule, forward,
+      sample, deliver &mdash; and to print whatever is left over as <code>unattributed</code>.
+      When the buckets account for nearly all of the wall clock, &ldquo;where does the time
+      go&rdquo; stops being a script somebody has to write and becomes a number the engine
+      reports about itself.
+    </p>
+
+    <figure>
+      <div class="figscroll" tabindex="0" role="group" aria-label="Two profiles of one iteration, scrollable">
+      <svg viewBox="0 0 640 268" role="img" aria-label="One iteration of a serving loop divided into four stages: schedule, forward pass, sample and deliver. A kernel profiler sees only inside the forward pass; the other stages issue no GPU work and are invisible to it, so a stage-level accounting of wall time is needed to see them.">
+        <defs>
+          <marker id="arL" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path>
+          </marker>
+        </defs>
+
+        <text x="0" y="13" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">ONE ITERATION, BY STAGE &mdash; wall-clock time</text>
+
+        <rect x="0" y="26" width="14" height="34" rx="3" fill="none" stroke="currentColor" stroke-width="1.3"></rect>
+        <rect x="18" y="26" width="440" height="34" rx="3" fill="var(--accent)" opacity="0.16"></rect>
+        <rect x="18" y="26" width="440" height="34" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.6"></rect>
+        <text x="238" y="48" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">forward pass</text>
+        <rect x="462" y="26" width="46" height="34" rx="3" fill="none" stroke="currentColor" stroke-width="1.3"></rect>
+        <rect x="512" y="26" width="118" height="34" rx="3" fill="var(--cost)" opacity="0.2"></rect>
+        <rect x="512" y="26" width="118" height="34" rx="3" fill="none" stroke="var(--cost)" stroke-width="1.5"></rect>
+        <text x="571" y="48" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="currentColor">deliver</text>
+
+        <text x="0" y="76" font-family="IBM Plex Sans, sans-serif" font-size="9.5" fill="currentColor" opacity="0.75">schedule</text>
+        <text x="485" y="76" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="9.5" fill="currentColor" opacity="0.75">sample</text>
+        <text x="571" y="76" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="9.5" fill="currentColor" opacity="0.75">ids &rarr; text &rarr; caller</text>
+
+        <g stroke="currentColor" stroke-width="1.1" opacity="0.45" fill="none">
+          <path d="M 18 88 L 18 106 L 60 106"></path>
+          <path d="M 458 88 L 458 106 L 416 106"></path>
+        </g>
+        <text x="238" y="110" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.8">a kernel profiler sees only in here</text>
+
+        <text x="0" y="140" font-family="IBM Plex Sans, sans-serif" font-size="12" font-weight="600" fill="currentColor">THE SAME FORWARD PASS, BY OPERATION</text>
+        <g>
+          <rect x="18" y="152" width="216" height="26" rx="3" fill="var(--accent)" opacity="0.3"></rect>
+          <rect x="18" y="152" width="216" height="26" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.3"></rect>
+          <text x="126" y="169" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">projections</text>
+          <rect x="238" y="152" width="66" height="26" rx="3" fill="none" stroke="var(--cost)" stroke-width="1.3"></rect>
+          <text x="271" y="169" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">copies</text>
+          <rect x="308" y="152" width="44" height="26" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.3"></rect>
+          <text x="330" y="169" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor">attn</text>
+          <rect x="356" y="152" width="102" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="3 3" opacity="0.6"></rect>
+          <text x="407" y="169" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.75">reshape, cast&hellip;</text>
+        </g>
+        <text x="18" y="196" font-family="IBM Plex Sans, sans-serif" font-size="10" fill="currentColor" opacity="0.8">&larr; section 07 is entirely this row</text>
+
+        <line x1="0" y1="212" x2="640" y2="212" stroke="currentColor" stroke-width="1" opacity="0.18"></line>
+
+        <text x="0" y="234" font-family="IBM Plex Sans, sans-serif" font-size="11" font-weight="600" fill="var(--cost)">WHAT THE KERNEL PROFILE CANNOT SHOW YOU</text>
+        <text x="0" y="252" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="currentColor">Stages that issue no GPU work are invisible to it &mdash; and one of them grows with the reply.</text>
+        <text x="0" y="266" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="currentColor" opacity="0.8">Two profiles, two questions. Neither substitutes for the other.</text>
+      </svg>
+      </div>
+      <p class="scrollhint">Diagram scrolls sideways &rarr;</p>
+      <figcaption>
+        The widths here are schematic. The structural point is not: a kernel profile is a
+        magnifying glass held over one stage, and a stage that never enters the device driver
+        cannot appear in it however large it grows.
+      </figcaption>
+    </figure>
+
+    <div class="predict" data-answer="text" data-explain="Deciding who is in the batch and passing results through an async queue are the natural suspects, and they are close to free. Turning ids into text is not &mdash; and unlike the others, its cost per token grows with the tokens already produced.">
+      <p class="pq">Outside the model, which stage of a serving loop costs the most?</p>
+      <p class="ph">A continuous-batching loop with a few dozen slots, generating a long reply.</p>
+      <div class="pbtns">
+        <button type="button" data-v="sched">choosing the batch</button>
+        <button type="button" data-v="async">the async plumbing</button>
+        <button type="button" data-v="text">turning tokens into text</button>
+        <button type="button" class="skip" data-v="">just show me</button>
+      </div>
+      <div class="pans" hidden>
+        <div class="verdict">
+          <span class="ratio">&lt;2%</span>
+          <span class="what">scheduler and async plumbing <em>combined</em> &mdash; while the text handoff can pass every other non-model stage, and keeps climbing with reply length</span>
+        </div>
+      </div>
+      <p class="mark" hidden></p>
+    </div>
+
+    <h3>The parts that look like overhead usually aren't</h3>
+    <p>
+      A scheduler that admits and evicts a handful of sequences per iteration is a few list
+      operations weighed against a forward pass that streams gigabytes. An async queue hand-off is
+      a pointer. Measured, they stay in the noise &mdash; and knowing that is worth as much as
+      finding a hotspot, because it is a week you now know not to spend. The reason to suspect them
+      is that they are &ldquo;the code that isn't the model&rdquo;, which is a category, not a
+      measurement.
+    </p>
+
+    <h3>The accidental quadratic</h3>
+    <p>
+      Here is the shape to learn, because it recurs far outside inference:
+      <strong>any per-step operation that re-derives its answer from the entire history is
+      quadratic in the length of the run</strong>, even when the line that does it looks
+      constant-time. Turning generated ids back into text is the classic instance. Decoding
+      <em>all tokens so far</em> on every step is one innocent function call; over a reply, the
+      total work it does grows with the square of the reply length.
+    </p>
+    <p>
+      That is also why it hides. At a short reply it is a rounding error &mdash; a few percent of
+      the loop, comfortably inside the noise floor, indistinguishable from nothing. It only becomes
+      the largest non-model cost when replies get long. The same lesson as section 02, arriving
+      from the other side: <strong>a workload shape you never benchmark is a bug you never
+      find.</strong>
+    </p>
+    <p>
+      The fix is to keep incremental state and decode only what the newest token added &mdash; and
+      the subtlety here is worth more than the speedup, because it is where the obvious version of
+      this optimisation is silently wrong. You cannot simply decode the new token on its own. A
+      UTF-8 character can span two tokens, and a byte-level BPE piece renders differently depending
+      on what precedes it. The robust trick is a sliding window: decode a short window ending at
+      the new token, decode the same window one token shorter, and keep the difference. When the
+      window ends mid-character the decoder emits a replacement character &mdash; which is the
+      signal that this is not text yet, so you hold it back and let the next token complete it.
+      <strong>An optimisation is only worth having if it produces the same bytes.</strong>
+    </p>
+
+    <figure class="widget" id="lp">
+      <h4>Where an iteration's time goes as replies get longer</h4>
+      <p class="wnote">
+        Four stages, one loop. Drag the reply length; switch how the text hand-off is written.
+        <b>An illustrative model, not a measurement</b> &mdash; what matters is which curve is flat
+        and which is not.
+      </p>
+
+      <div class="wctl">
+        <label>reply length
+          <input type="range" id="lp-r" min="1" max="16" value="4" step="1" aria-label="Reply length in tokens">
+        </label>
+        <output class="readout" id="lp-out">256 tokens out</output>
+        <span class="spacer"></span>
+        <div class="seg" role="group" aria-label="How the text hand-off is written">
+          <button type="button" data-mode="naive" aria-pressed="true">re-derives every step</button>
+          <button type="button" data-mode="inc" aria-pressed="false">incremental</button>
+        </div>
+      </div>
+
+      <div class="rows" id="lp-rows"></div>
+      <p class="rowsub">Share of one iteration, averaged over the whole reply.</p>
+
+      <div class="wstats" id="lp-stats"></div>
+      <div class="wevent" id="lp-say" role="status" aria-live="polite"></div>
+
+      <figcaption>
+        Three of the four stages cost the same at every reply length. The fourth does not, and no
+        amount of kernel engineering touches it. Flattening it changes the loop by a ratio that
+        depends entirely on where you measured &mdash; nothing at a short reply, plainly visible at
+        a long one, from exactly the same change to exactly the same code.
+      </figcaption>
+    </figure>
+
+    <h3>A loop over the batch is a loop of round trips</h3>
+    <p>
+      The host and the device are two machines with a bus between them, and a
+      <button class="term" data-t="sync">synchronisation</button> is the CPU standing still until
+      everything it has queued on the GPU has drained. That makes two ordinary-looking Python
+      patterns expensive out of all proportion to the arithmetic in them.
+    </p>
+    <ul class="rules">
+      <li><strong>Reading results back one row at a time.</strong> A loop over the batch that pulls
+        each row's answer out as a number forces one synchronisation <em>per row</em>. The
+        arithmetic is trivial; the waiting is not. Take the whole batch in one operation and bring
+        it back in one transfer.</li>
+      <li><strong>Building inputs one row at a time.</strong> Constructing a small tensor per
+        sequence is one <button class="term" data-t="h2d">host-to-device copy</button> per
+        sequence, and an ordinary copy blocks the caller while it runs. Pad on the host, move the
+        batch once.</li>
+      <li><strong>Asking the device for something the host already knows.</strong> Reading a
+        maximum or a count off a tensor to size a buffer, when plain Python integers were already
+        in hand, buys a full pipeline stall for nothing.</li>
+    </ul>
+    <p>
+      The tell is easy to check and hard to argue with: count transfers, or kernel launches, per
+      step, and see whether the count tracks the batch width. <strong>A per-step cost proportional
+      to the number of sequences is a Python loop wearing a tensor costume.</strong>
+    </p>
+
+    <h3>Measure the component to find the target; measure the engine to size it</h3>
+    <p>
+      One habit is worth carrying away from all of this. Timing an operation in isolation is the
+      right way to <em>find</em> a candidate &mdash; and a systematically bad way to predict what
+      it will be worth. Isolated numbers read high, for two reasons that compound: the isolated
+      version pays synchronisation costs that in the real loop overlap with other work, and, far
+      more often, the ratio is being taken against the wrong denominator. A 30&times; win on
+      something worth 3% of the loop is 1.03&times;. That is
+      <button class="term" data-t="amdahl">Amdahl's law</button> again, this time applied to your
+      estimate rather than your result &mdash; and it is the cheapest way to stop a change from
+      being ranked above the one that actually matters.
+    </p>
+    <p>
+      None of the changes in this section touched a kernel; some are pure Python. That is the point
+      worth generalising. Once the obvious algorithmic wins have landed, the next tranche of speed
+      usually lives in the machinery <em>around</em> the model &mdash; and the only reliable way to
+      find it is to make the machinery report on itself.
+    </p>
+
+    <details class="deep">
+      <summary>What &ldquo;the loop accounts for 99% of its own time&rdquo; actually buys</summary>
+      <div class="body">
+        <p>
+          Self-instrumentation is a feature, not a debugging session. Three details separate a
+          breakdown you can trust from a comforting pie chart.
+        </p>
+        <p>
+          <strong>Keep a residual bucket.</strong> A breakdown whose slices sum to 100% by
+          construction cannot tell you it has missed a stage. Charging stages explicitly and
+          printing the leftover as <em>unattributed</em> means the accounting has to earn its own
+          credibility: if the named stages cover 99% of wall time, the picture is complete; if they
+          cover 70%, the interesting thing is the 30%.
+        </p>
+        <p>
+          <strong>Do not charge a stage for the previous stage's queue.</strong> GPU work is
+          asynchronous, so a naive timer around a stage that issues no device work will happily
+          bill it for whatever the last stage left running. Stages that launch nothing should skip
+          the device synchronisation entirely, or every number after the forward pass is fiction.
+        </p>
+        <p>
+          <strong>Then check the instrument.</strong> It is common to find that a timer measured
+          something other than its name &mdash; a counter labelled &ldquo;forward pass&rdquo; that
+          quietly includes the sampler and the stop check, say. Splitting them is not a cosmetic
+          fix: it is what makes the sampler visible as its own line instead of inflating the
+          model's. Instrumentation is code, and it is wrong in the same ways other code is wrong.
+        </p>
+        <p>
+          The prize is that ranking becomes arithmetic rather than argument. Every item on a
+          performance backlog is implicitly a claim about a share of the total; once the shares are
+          measured, the claims can be checked before the work starts.
+        </p>
+      </div>
+    </details>
+
+    <details class="deep">
+      <summary>The sliding window, and why the obvious version corrupts text</summary>
+      <div class="body">
+        <p>
+          The naive incremental version &mdash; decode the new token, append its text &mdash; is
+          wrong in two distinct ways, both of which produce output that is <em>almost</em> right,
+          which is the worst kind of wrong. A multi-byte character split across two tokens decodes
+          to a replacement character when either half is decoded alone; and byte-level BPE pieces
+          carry no fixed rendering, so the same id contributes different text depending on its
+          neighbour.
+        </p>
+        <p>
+          Decoding a window twice sidesteps both, because the difference between the two decodings
+          is by construction exactly what the new token added <em>in context</em>:
+        </p>
+        <pre><code><span class="cmt"># the text the newest token contributed, in context</span>
+prefix = decode(ids[start : cut])   <span class="cmt"># window, one token shorter</span>
+whole  = decode(ids[start :    ])   <span class="cmt"># window, up to the new token</span>
+
+<span class="kw">if</span> whole.endswith(REPLACEMENT_CHAR):
+    <span class="kw">return</span> ""                    <span class="cmt"># mid-character: hold, let the window grow</span>
+<span class="kw">return</span> whole[len(prefix):]        <span class="cmt"># the difference, and only the difference</span></code></pre>
+        <p>
+          Two consumers usually want that text &mdash; the stop-condition check and whatever streams
+          output to the caller &mdash; and in a first implementation they each tend to rebuild it
+          independently. Advancing it once per step and letting both read the result removes a
+          duplicate decode nobody had counted, which is a reminder that the same computation
+          appearing twice is easier to find in a stage breakdown than in the source.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 10 ================= -->
+  <section id="ceiling">
+    <h2><span class="step">10 &middot; The ceiling</span>How far is this from production?</h2>
+
+    <p>
+      vLLM is the reference implementation of everything on this page, plus the kernel engineering
+      liteinfer hasn't done. Compared at <em>matched batch width</em> &mdash; comparing a 1-slot
+      engine to a 32-slot one measures the slot count, not the engine:
+    </p>
+
+    <figure class="panel">
+      <p class="bx-lab" style="margin-bottom:12px">liteinfer as a fraction of vLLM, at the same batch width</p>
+      <div class="rows">
+        <div class="row"><span class="rlab">1 seq</span><span class="rtrack"><span class="rbar" style="width:35%"></span></span><span class="rval">0.35&times;</span></div>
+        <div class="row"><span class="rlab">4 seqs</span><span class="rtrack"><span class="rbar" style="width:35%"></span></span><span class="rval">0.35&times;</span></div>
+        <div class="row"><span class="rlab">32 seqs</span><span class="rtrack"><span class="rbar" style="width:28%"></span></span><span class="rval">0.28&times;</span></div>
+      </div>
+      <p class="rowsub">Full width of each track = parity with vLLM.</p>
+      <figcaption>
+        The bars are nearly the same length. That flatness is the finding: the deficit is a fixed
+        per-step cost, not something that compounds as concurrency grows.
+      </figcaption>
+    </figure>
+
+    <p>
+      A gap that <em>widened</em> with batch size would mean something scaling with batch &times;
+      sequence length &mdash; an algorithmic problem. A flat ~3&times; means a constant per-step
+      cost: no <button class="term" data-t="cudagraph">CUDA graphs</button>, no fused paged-attention
+      kernel. In bandwidth terms, vLLM sustains about 68% of what the A40 can move; liteinfer
+      manages roughly 26%.
+    </p>
+    <p>
+      Which is a satisfying place for a teaching engine to land. Every <em>idea</em> on this page is
+      the same idea production engines use. The remaining 3&times; is kernel engineering, and it is
+      the least conceptual, most laborious part of the work.
+    </p>
+
+    <details class="deep">
+      <summary>Turning milliseconds into a bandwidth percentage</summary>
+      <div class="body">
+        <p>
+          The floor from section 01 is 3.56&nbsp;ms per decode step: 2.48&nbsp;GB of weights at
+          696&nbsp;GB/s. vLLM's measured inter-token latency is <strong>5.2&nbsp;ms</strong>, so it
+          is running at 3.56&nbsp;/&nbsp;5.2 = <strong>68%</strong> of the card's bandwidth.
+          liteinfer's is <strong>13.7&nbsp;ms</strong> &rarr; <strong>26%</strong>. Same hardware,
+          same model, same arithmetic; the difference is entirely in how much of each step is spent
+          not streaming weights.
+        </p>
+        <p>
+          Where does liteinfer's extra 8.5&nbsp;ms go? Section 07 answers most of it: 42% of GPU
+          time on data movement, plus gaps where the GPU sits idle waiting for Python to issue the
+          next kernel. CUDA graphs attack the second one by replaying a recorded launch sequence
+          instead of re-issuing it; that is why they are the top item on the roadmap.
+        </p>
+        <p>
+          One number in the other direction, and it needs reading narrowly: liteinfer's
+          time-to-first-token is <em>better</em> than vLLM's, 15.7&nbsp;ms against 22.7&nbsp;ms.
+          At a 128-token prompt both are dominated by fixed per-call overhead &mdash; vLLM pays IPC
+          to a separate engine process &mdash; so this measures offline round-trip latency, not
+          prefill speed. Reporting it as a win would be exactly the kind of benchmark theatre
+          section 11 is about.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 11 ================= -->
+  <section id="method">
+    <h2><span class="step">11 &middot; How we know</span>Numbers that survive contact</h2>
+
+    <p>
+      Every figure here comes from one harness, and a few rules keep them honest. They are worth
+      stealing whole:
+    </p>
+    <ul class="rules">
+      <li><strong>Force the output length.</strong> If one engine stops at an end-of-text token and
+        another runs on, you are comparing sentence lengths, not engines.</li>
+      <li><strong>Measure the mode that matches the change.</strong> Throughput answers "how much
+        fits at once"; latency answers "what does one step cost". Reporting a latency measured
+        under saturation mostly records queue position.</li>
+      <li><strong>Compare at matched batch width</strong>, and against the design each change
+        actually improves on &mdash; not against whatever number is handy.</li>
+      <li><strong>Know your noise floor.</strong> Run-to-run variance here is about &plusmn;4%, so
+        anything under ~1.1&times; is not a result.</li>
+      <li><strong>Report the metric that got worse.</strong> Continuous batching won throughput
+        5.0&times; and gave up about 9% of single-request latency against the fastest
+        single-sequence design. Both belong in the write-up.</li>
+    </ul>
+    <p>
+      One consequence is unusual enough to state plainly: when a design clearly and generally beats
+      another, <strong>the loser is deleted</strong>. Its measurements stay in the results so the
+      progression is still readable, but the code goes, and whatever abstraction existed only to
+      support the choice collapses with it. Every design in sections 02&ndash;05 has been removed
+      from the engine on those grounds.
+    </p>
+    <p>
+      The exception matters as much as the rule: an improvement that only applies under some
+      precondition &mdash; a mixture-of-experts kernel, a quantised path &mdash; replaces nothing,
+      however large its win, because outside its domain it does not apply. Two paths chosen by a
+      precondition are not debt; they are the feature.
+    </p>
+
+    <figure class="widget" id="bm">
+      <h4>Every number on this page</h4>
+      <p class="wnote">
+        The full result set, three ways. Switch the view; sort by clicking a column header in the
+        table.
+      </p>
+
+      <div class="wctl">
+        <div class="seg" role="group" aria-label="Choose a view">
+          <button type="button" data-view="designs" aria-pressed="true">the nine designs</button>
+          <button type="button" data-view="shapes" aria-pressed="false">prompt &amp; reply shapes</button>
+          <button type="button" data-view="kernels" aria-pressed="false">kernel A/B</button>
+        </div>
+        <span class="spacer"></span>
+        <div class="seg" id="bm-metric" role="group" aria-label="Choose a metric">
+          <button type="button" data-metric="tok" aria-pressed="true">throughput</button>
+          <button type="button" data-metric="itl" aria-pressed="false">latency per token</button>
+        </div>
+        <button type="button" id="bm-log" aria-pressed="false">log scale</button>
+      </div>
+
+      <div class="rows" id="bm-rows"></div>
+      <div class="legend" id="bm-legend"></div>
+      <div class="tablewrap"><table id="bm-table"></table></div>
+      <p class="rowsub" id="bm-note"></p>
+    </figure>
+
+    <details class="deep">
+      <summary>The rules that made these numbers comparable</summary>
+      <div class="body">
+        <p>
+          <strong>Identical inputs.</strong> One canonical prompt set per (model, prompt length,
+          reply length), reused by every engine, drawn from the same ShareGPT corpus vLLM's own
+          benchmarks use. Every result stores the SHA-256 of its prompt set and the report flags
+          any group whose members disagree.
+        </p>
+        <p>
+          <strong>Forced output length.</strong> <code>min_tokens = max_tokens = OSL</code> with
+          <code>ignore_eos</code>, verified after every run: a run that violates it fails instead
+          of reporting.
+        </p>
+        <p>
+          <strong>Warmup and isolation.</strong> Each run exercises the exact path it is about to
+          measure, twice, before the clock starts &mdash; so kernel autotuning and CUDA graph
+          capture land outside the timed region. Each (config, mode) pair runs in a fresh process,
+          so no allocator fragmentation carries over.
+        </p>
+        <p>
+          <strong>vLLM at its strongest.</strong> Its own scheduler, CUDA graphs on,
+          <code>gpu_memory_utilization=0.90</code>, bfloat16. And the harness is checked against
+          vLLM's own tooling at the identical shape: <code>vllm bench throughput</code> reports
+          4,421.7 tok/s where this harness reports 4,465.9 &mdash; 1.0% apart, with both emitting
+          exactly 51,200 tokens.
+        </p>
+        <p>
+          <strong>One measurement was thrown out.</strong> In the first parallel sweep vLLM's TTFT
+          read 28.1&nbsp;ms; re-run sequentially it dropped to 21.3&nbsp;ms while every other number
+          stayed put. Its offline TTFT is mostly IPC overhead and therefore CPU-scheduling
+          sensitive. The latency tables are all from the sequential re-run, and the harness now
+          warns when latency mode is combined with parallel GPUs.
+        </p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ================= 12 ================= -->
+  <section id="code">
+    <h2><span class="step">12 &middot; Read it yourself</span>Where to start in 2,272 lines</h2>
+
+    <p>
+      The engine is deliberately small enough to read end to end. One execution path, no
+      alternatives to hold in your head. A reasonable order &mdash; every file links to the branch
+      this page describes:
+    </p>
+
+    <div class="map">
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/async_llm.py">async_llm.py</a></h4>
+        <p>Start here. The public API &mdash; submit prompts, await results, or stream tokens as they arrive.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/engine/async_llm_engine.py">engine/async_llm_engine.py</a></h4>
+        <p>The loop. Evict finished sequences, admit waiting ones, run a pass, deliver events.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/engine/continuous_scheduler.py">engine/continuous_scheduler.py</a></h4>
+        <p>Section 06 in code: which sequences prefill and which decode on this step. Smaller than you expect.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/cache/block_pool.py">cache/block_pool.py</a></h4>
+        <p>Section 04 in code: the slot arithmetic, the null block, and <code>slot_table</code>.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/cache/continuous_kv_cache.py">cache/continuous_kv_cache.py</a></h4>
+        <p>Per-sequence block tables; register on admit, free on evict.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/models/llama.py">models/llama.py</a></h4>
+        <p>The transformer itself, written out plainly &mdash; RoPE, MLP, norms, projections.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/models/attention.py">models/attention.py</a></h4>
+        <p>Section 08 in code: the two kernels, and the one line that picks between them.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/engine/metrics.py">engine/metrics.py</a></h4>
+        <p>Section 09 in code: the stage accounting, and the residual bucket that keeps it honest.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/tokenizer.py">tokenizer.py</a></h4>
+        <p>The incremental detokenizer &mdash; the sliding window, and the replacement-character rule.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/blob/v0.5.0/liteinfer/sampling/sampler.py">sampling/sampler.py</a></h4>
+        <p>Greedy rows taken together in one kernel; stochastic rows, which each need their own stream, stay a loop.</p>
+      </div>
+      <div>
+        <h4><a href="https://github.com/ValeGian/liteinfer/tree/v0.5.0/benchmarks">benchmarks/</a></h4>
+        <p>Sections 10&ndash;11 in code: the matrix, the harness, the report, and the stored results.</p>
+      </div>
+    </div>
+
+    <h3>The one line worth memorising</h3>
+    <pre><code><span class="cmt"># A whole batch's cached keys, read in a single indexing operation.</span>
+<span class="cmt"># self._slots is [batch, max_tokens] of physical slot numbers.</span>
+gathered_k = keys[self._slots].permute(0, 2, 1, 3)</code></pre>
+    <p>
+      An earlier version of that gather looped over sequences and blocks in Python, once per layer,
+      once per step &mdash; roughly 8,000 tensor operations per decode step at 32 slots. Replacing
+      it with the line above made continuous batching <strong>7&times; faster</strong>. Address
+      arithmetic that collapses to one integer is the reason it fits on one line.
+    </p>
+    <p>
+      Two claims on this page were <em>false</em> before that fix: that paging beats no cache at
+      all, and that continuous batching beats static batching. Both were true of the designs and
+      untrue of the implementation. It is worth knowing how easily a Python loop can libel an
+      algorithm.
+    </p>
+  </section>
+
+  <!-- ================= 13 ================= -->
+  <section id="glossary">
+    <h2><span class="step">13 &middot; Reference</span>The vocabulary, in one place</h2>
+    <p>
+      Every dotted term on this page, collected. Nothing here is liteinfer-specific &mdash; it is
+      the shared vocabulary of inference serving.
+    </p>
+    <div class="gloss" id="gloss"></div>
+  </section>
+
+  <footer>
+    <p style="max-width:66ch">
+      liteinfer is a from-scratch inference engine built to be read. Source, benchmark harness and
+      the full methodology live in
+      <a href="https://github.com/ValeGian/liteinfer/tree/v0.5.0">the repository</a>;
+      every number on this page is reproducible with <code>bench run</code> and a single GPU.
+      Measurements: Llama-3.2-1B-Instruct, bfloat16, one NVIDIA A40, vLLM 0.28.0,
+      greedy decoding with forced output length.
+    </p>
+  </footer>
+
+  </main>
+</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var reduce = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var $$ = function (s, r) { return [].slice.call((r || document).querySelectorAll(s)); };
+  var fmt = function (n, d) {
+    return Number(n).toLocaleString("en-US", { minimumFractionDigits: d === undefined ? 0 : d,
+                                               maximumFractionDigits: d === undefined ? 0 : d });
+  };
+  var bytes = function (b) {
+    var gi = b / 1073741824;
+    if (gi >= 1) return gi.toFixed(gi < 10 ? 2 : 1) + " GiB";
+    return Math.round(b / 1048576) + " MiB";
+  };
+  function row(label, valueHtml, pct, cls, cur) {
+    return '<div class="row' + (cur ? " is-cur" : "") + '">' +
+      '<span class="rlab">' + label + '</span>' +
+      '<span class="rtrack"><span class="rbar ' + (cls || "") + '" style="width:' +
+        Math.max(0, Math.min(100, pct)).toFixed(2) + '%"></span></span>' +
+      '<span class="rval ' + (cls === "cost" ? "cost" : "") + '">' + valueHtml + '</span></div>';
+  }
+  function stat(k, v, cls) {
+    return '<div><span class="k">' + k + '</span><span class="v ' + (cls || "") + '">' + v + "</span></div>";
+  }
+
+  /* =====================================================================
+     0. Glossary + tooltips
+     ===================================================================== */
+  var TERMS = {
+    prefill: ["Prefill", "The first forward pass over a request: the whole prompt goes through the model at once, producing the first output token and filling the KV cache."],
+    decode: ["Decode", "Everything after prefill — one forward pass per generated token, each re-reading every model weight to produce a single token."],
+    kv: ["KV cache", "The keys and values each attention layer computes per token. Storing them means later tokens never recompute earlier ones; the cost is memory that grows with every token."],
+    bf16: ["bfloat16", "A 16-bit float with fp32's exponent range and less precision. Two bytes per parameter — the default weight format for inference."],
+    membound: ["Memory-bound", "Limited by how fast memory can be read rather than by arithmetic. A decode step moves 2.48 GB to do 2.5 GFLOP of maths, so it waits on memory over 99% of the time."],
+    gqa: ["Grouped-query attention", "Several query heads share one key/value head. Llama-3.2-1B has 32 query heads and 8 KV heads, so its KV cache is a quarter of the size — at the cost of expanding the heads back before the multiply."],
+    internal: ["Internal fragmentation", "Memory allocated to a sequence and never used: the gap between the space reserved and the tokens actually generated."],
+    external: ["External fragmentation", "Free memory that cannot be used because it sits in holes between allocations — too small or too scattered for the next request."],
+    blocktable: ["Block table", "A sequence's list mapping its logical blocks (0, 1, 2…) to whatever physical blocks the pool handed out. The indirection that makes scattered memory look contiguous."],
+    static: ["Static batching", "A group of requests starts and finishes together; a slot cannot be reused until the slowest member of the batch is done."],
+    continuous: ["Continuous batching", "Batch membership is re-decided every iteration: finished sequences are evicted and waiting ones admitted on the very next step. Also called iteration-level scheduling or in-flight batching."],
+    softmax: ["Softmax", "Turns attention scores into weights that sum to 1. Computed in fp32 for numerical safety, which doubles the size of the score tensor."],
+    flash: ["FlashAttention", "An attention algorithm that computes the score matrix in tiles inside on-chip memory and never stores it, so peak memory stops depending on sequence length."],
+    sram: ["SRAM", "The small, very fast memory on the GPU chip itself — megabytes, not gigabytes. Tiled attention works by keeping each tile inside it."],
+    amdahl: ["Amdahl's law", "The bound on any partial optimisation: if a part takes fraction f of the time, removing it entirely speeds things up by 1 ÷ (1 − f), and never more."],
+    cudagraph: ["CUDA graphs", "A recorded sequence of GPU kernel launches replayed as one unit, removing the per-launch CPU cost. Standard in production engines; not yet in liteinfer."],
+    detok: ["Detokenisation", "Turning generated token ids back into text. Cheap per call — but a serving loop calls it every step for every running sequence, so whether its cost is flat or grows with the reply is a property of how it is written, not of the tokenizer."],
+    sync: ["Device synchronisation", "A point where the CPU stops until every operation it has queued on the GPU has finished. Reading a single number back off the device forces one, which is why a per-row loop over a batch costs far more than the arithmetic inside it."],
+    h2d: ["Host-to-device copy", "Moving data from CPU memory into GPU memory. An ordinary (pageable) copy blocks the caller while it runs, so many small per-sequence transfers cost much more than one padded transfer of the whole batch."],
+    isl: ["ISL / OSL", "Input and output sequence length — the prompt size and the forced reply size that define a benchmark shape. Most numbers here are ISL 128 / OSL 256."],
+    ttft: ["TTFT", "Time to first token: how long a request waits before it sees anything. Dominated by prefill — and, in offline benchmarks, by fixed per-call overhead."],
+    itl: ["ITL", "Inter-token latency: the average gap between successive output tokens. Derived here as (end-to-end − TTFT) ÷ (tokens − 1), so both engines are measured by one clock."],
+    throughput: ["Throughput", "Output tokens per second with every prompt offered at once. Answers “how much fits”, not “how fast is one request” — which is why the harness measures the two separately."]
+  };
+
+  var gl = $("#gloss");
+  if (gl) {
+    gl.innerHTML = Object.keys(TERMS).map(function (k) {
+      return "<div><h4>" + TERMS[k][0] + "</h4><p>" + TERMS[k][1] + "</p></div>";
+    }).join("");
+  }
+
+  var tip = document.createElement("div");
+  tip.id = "tip"; tip.hidden = true; tip.setAttribute("role", "tooltip");
+  document.body.appendChild(tip);
+  var tipFor = null;
+  function showTip(el) {
+    var t = TERMS[el.dataset.t]; if (!t) return;
+    tipFor = el;
+    tip.innerHTML = "<b>" + t[0] + "</b>" + t[1];
+    tip.hidden = false;
+    var r = el.getBoundingClientRect(), tr = tip.getBoundingClientRect();
+    var left = Math.min(Math.max(8, r.left - 10), window.innerWidth - tr.width - 8);
+    var top = r.top - tr.height - 9;
+    if (top < 8) top = r.bottom + 9;
+    tip.style.left = left + "px"; tip.style.top = top + "px";
+  }
+  function hideTip() { tip.hidden = true; tipFor = null; }
+  $$("button.term[data-t]").forEach(function (el) {
+    el.setAttribute("aria-label", "definition of " + (TERMS[el.dataset.t] ? TERMS[el.dataset.t][0] : el.textContent));
+    el.addEventListener("mouseenter", function () { showTip(el); });
+    el.addEventListener("mouseleave", hideTip);
+    el.addEventListener("focus", function () { showTip(el); });
+    el.addEventListener("blur", hideTip);
+    el.addEventListener("click", function (e) { e.preventDefault(); if (tipFor === el) hideTip(); else showTip(el); });
+  });
+  window.addEventListener("scroll", function () { if (!tip.hidden) hideTip(); }, { passive: true });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") hideTip(); });
+
+  /* =====================================================================
+     0b. Progress bar, scrollspy, expand-all
+     ===================================================================== */
+  var prog = $("#prog"), railLinks = $$("#rail a"), secs = railLinks.map(function (a) {
+    return document.getElementById(a.getAttribute("href").slice(1));
+  });
+  function onScroll() {
+    var h = document.documentElement.scrollHeight - window.innerHeight;
+    prog.style.width = (h > 0 ? Math.min(100, Math.max(0, window.scrollY / h * 100)) : 0) + "%";
+    var best = 0;
+    for (var i = 0; i < secs.length; i++) {
+      if (secs[i] && secs[i].getBoundingClientRect().top < window.innerHeight * 0.35) best = i;
+    }
+    railLinks.forEach(function (a, i) { a.classList.toggle("here", i === best); });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("resize", onScroll);
+  onScroll();
+
+  $$("section").forEach(function (s) {
+    if ($(".widget", s)) {
+      var a = railLinks[secs.indexOf(s)];
+      if (a) { a.classList.add("ix"); a.title = "has an interactive figure"; }
+    }
+  });
+
+  var xa = $("#expand-all");
+  if (xa) {
+    xa.addEventListener("click", function () {
+      var deeps = $$("details.deep");
+      var anyClosed = deeps.some(function (d) { return !d.open; });
+      deeps.forEach(function (d) { d.open = anyClosed; });
+      xa.textContent = anyClosed ? "Close all deep dives" : "Open all deep dives";
+    });
+  }
+
+  /* =====================================================================
+     0c. Predict-then-reveal
+     ===================================================================== */
+  $$(".predict").forEach(function (p) {
+    var ans = p.dataset.answer, mark = $(".mark", p), pans = $(".pans", p);
+    $$("button", p).forEach(function (b) {
+      b.addEventListener("click", function () {
+        if (p.dataset.done) return;
+        p.dataset.done = "1";
+        pans.hidden = false;
+        mark.hidden = false;
+        var v = b.dataset.v;
+        if (!v) {
+          mark.className = "mark";
+          mark.textContent = p.dataset.explain;
+        } else {
+          b.classList.add("picked");
+          var right = v === ans;
+          mark.className = "mark " + (right ? "right" : "wrong");
+          mark.textContent = (right ? "✓ Right. " : "✗ Not this time. ") + p.dataset.explain;
+        }
+        $$("button", p).forEach(function (o) { if (!o.classList.contains("picked")) o.disabled = true; });
+      });
+    });
+  });
+
+  /* =====================================================================
+     1. The bandwidth budget
+     ===================================================================== */
+  (function () {
+    var r = $("#bw-r"); if (!r) return;
+    var WIDTHS = [1, 2, 4, 8, 16, 32, 64];
+    var FLOOR_MS = 3.56, PER_SEQ = 1000 / FLOOR_MS; // 280.9 tok/s per sequence
+    var M = { 1: { li: 73.4, v: 188.4, what: "KV cache, one sequence" },
+              4: { li: 281.6, v: 724.0, what: "static batching, four sequences" },
+              32: { li: 1445.5, v: 4466.6, what: "continuous batching, 32 slots" } };
+    var out = $("#bw-out"), rows = $("#bw-rows"), stats = $("#bw-stats"), say = $("#bw-say");
+    function draw() {
+      var B = WIDTHS[+r.value], ceil = PER_SEQ * B, m = M[B];
+      out.textContent = "B = " + B;
+      rows.innerHTML =
+        row("ceiling", fmt(ceil) + " tok/s", 100, "pale") +
+        row("liteinfer", m ? fmt(m.li, 1) + " tok/s" : "not measured", m ? m.li / ceil * 100 : 0, m ? "" : "pale") +
+        row("vLLM", m ? fmt(m.v, 1) + " tok/s" : "not measured", m ? m.v / ceil * 100 : 0, "cost");
+      stats.innerHTML =
+        stat("weights read per step", "2.48 GB") +
+        stat("tokens that read pays for", B) +
+        stat("GB read per token", (2.48 / B).toFixed(B > 8 ? 3 : 2), B > 1 ? "good" : "bad") +
+        stat("ceiling", fmt(ceil) + " tok/s") +
+        stat("liteinfer, % of ceiling", m ? (m.li / ceil * 100).toFixed(0) + "%" : "—");
+      say.innerHTML = m
+        ? "At <b>B = " + B + "</b> the same 2.48 GB read serves " + B + " token" + (B > 1 ? "s" : "") +
+          ", so the hardware ceiling is " + fmt(ceil) + " tok/s. Measured, " + m.what +
+          ": liteinfer reaches " + fmt(m.li, 1) + " (" + (m.li / ceil * 100).toFixed(0) +
+          "% of the ceiling), vLLM " + fmt(m.v, 1) + " (" + (m.v / ceil * 100).toFixed(0) + "%)."
+        : "At <b>B = " + B + "</b> each weight byte would serve " + B + " tokens, putting the ceiling at " +
+          fmt(ceil) + " tok/s — " + (2.48 / B).toFixed(3) +
+          " GB read per token. The benchmark only ran at 1, 4 and 32 slots, so there is no measured bar here.";
+    }
+    r.addEventListener("input", draw);
+    draw();
+  })();
+
+  /* =====================================================================
+     2. KV cache: work saved vs time saved
+     ===================================================================== */
+  (function () {
+    var r = $("#kv-r"); if (!r) return;
+    var P = 128, MEAS = { 256: 1.15, 512: 1.61, 1024: 2.88 };
+    var out = $("#kv-out"), rows = $("#kv-rows"), stats = $("#kv-stats"), say = $("#kv-say");
+    function draw() {
+      var N = (+r.value) * 64;
+      var no = P * N + N * (N - 1) / 2, yes = N, ratio = no / yes;
+      var meas = MEAS[N];
+      out.textContent = fmt(N) + " tokens out";
+      rows.innerHTML =
+        row("no cache", fmt(no) + " token-passes", 100, "cost") +
+        row("KV cache", fmt(yes) + " token-passes", Math.max(0.6, yes / no * 100), "");
+      stats.innerHTML =
+        stat("arithmetic avoided", (100 - yes / no * 100).toFixed(2) + "%") +
+        stat("work ratio", fmt(ratio, 0) + "×", "good") +
+        stat("measured speedup", meas ? meas.toFixed(2) + "×" : "not measured", meas ? "bad" : "") +
+        stat("cached throughput", meas ? (N === 256 ? "69.5" : N === 512 ? "71.9" : "69.6") + " tok/s" : "—");
+      say.innerHTML = meas
+        ? "At " + fmt(N) + " tokens out the cache removes <b>" + fmt(ratio) +
+          "×</b> the arithmetic and returns <b>" + meas.toFixed(2) +
+          "×</b> the throughput. The two are not the same number because a decode step at this size is " +
+          "bound by kernel launches and weight traffic, not by the tokens it re-reads — and because the " +
+          "cache pays its own cost, growing a tensor every step."
+        : "At " + fmt(N) + " tokens out the cache removes <b>" + fmt(ratio) +
+          "×</b> the arithmetic. Throughput was only measured at 256, 512 and 1024 tokens out — " +
+          "1.15×, 1.61× and 2.88× — so the honest thing to say about this length is nothing.";
+    }
+    r.addEventListener("input", draw);
+    $$("#kv .seg button").forEach(function (b) {
+      b.addEventListener("click", function () { r.value = String(+b.dataset.osl / 64); draw(); });
+    });
+    draw();
+  })();
+
+  /* =====================================================================
+     3. Amdahl calculator
+     ===================================================================== */
+  (function () {
+    var host = $("#am-chks"); if (!host) return;
+    var PARTS = [["cache copies", .15], ["tensor clones", .10], ["reshape, cast", .10], ["sampling", .07]];
+    var VLLM = 3.09, BASE = 1445.5;
+    host.innerHTML = PARTS.map(function (p, i) {
+      return '<label class="chk"><input type="checkbox" data-i="' + i + '"><span>' + p[0] +
+        '</span><span class="pct">' + Math.round(p[1] * 100) + "%</span></label>";
+    }).join("");
+    var rows = $("#am-rows"), stats = $("#am-stats"), say = $("#am-say");
+    function draw() {
+      var f = 0, picked = [];
+      $$("input", host).forEach(function (c) {
+        c.parentNode.classList.toggle("on", c.checked);
+        if (c.checked) { f += PARTS[+c.dataset.i][1]; picked.push(PARTS[+c.dataset.i][0]); }
+      });
+      var sp = 1 / (1 - f), max = Math.max(VLLM, sp);
+      rows.innerHTML =
+        row("liteinfer today", "1.00×", 1 / max * 100, "pale") +
+        row("after your cuts", sp.toFixed(2) + "×", sp / max * 100, "") +
+        row("vLLM, measured", VLLM.toFixed(2) + "×", VLLM / max * 100, "cost");
+      stats.innerHTML =
+        stat("of GPU time removed", (f * 100).toFixed(0) + "%") +
+        stat("best-case speedup", sp.toFixed(2) + "×", f ? "good" : "") +
+        stat("throughput would be", fmt(BASE * sp) + " tok/s") +
+        stat("still behind vLLM by", (VLLM / sp).toFixed(2) + "×", VLLM / sp > 1.5 ? "bad" : "");
+      say.innerHTML = !f
+        ? "Nothing removed yet. liteinfer runs at " + fmt(BASE, 1) + " tok/s; vLLM at the same width runs at " +
+          fmt(BASE * VLLM) + " — about <b>3×</b>. Tick the data-movement rows and see how much of that gap they can possibly account for."
+        : "Removing " + picked.join(", ") + " — " + (f * 100).toFixed(0) +
+          "% of GPU time, perfectly and for free — buys <b>" + sp.toFixed(2) +
+          "×</b>. " + (sp >= VLLM
+            ? "That would close the gap, but only because you have now deleted more than the profile contains."
+            : "vLLM is still " + (VLLM / sp).toFixed(2) +
+              "× ahead, so the rest has to come from the 49% marked <em>projections</em> — CUDA graphs, compiled kernels, fused attention.");
+    }
+    host.addEventListener("change", draw);
+    draw();
+  })();
+
+  /* =====================================================================
+     4. Attention memory calculator
+     ===================================================================== */
+  (function () {
+    var rb = $("#at-b"); if (!rb) return;
+    var rl = $("#at-l"), out = $("#at-out"), rows = $("#at-rows"), stats = $("#at-stats"), say = $("#at-say");
+    var BS = [1, 2, 4, 8, 16, 32], H = 32, D = 64, CARD = 46e9, BUDGET = 40 * 1073741824;
+    function draw() {
+      var B = BS[+rb.value], L = (+rl.value) * 128;
+      var qkv = 3 * B * H * L * D * 2;          // Q, K, V after the GQA expansion, bf16
+      var sc = B * H * L * L;                   // one element per (query, key) pair
+      var fp32 = 4 * sc;                        // the softmax's fp32 copy — the single largest allocation
+      var eager = qkv + 10 * sc, tiled = qkv;
+      var max = Math.max(eager, CARD);
+      out.textContent = B + " seq" + (B > 1 ? "s" : "") + " × " + fmt(L) + " tokens";
+      rows.innerHTML =
+        row("eager", bytes(eager), eager / max * 100, eager > BUDGET ? "cost" : "") +
+        row("tiled (sdpa)", bytes(tiled), Math.max(0.5, tiled / max * 100), "") +
+        row("the A40", "46 GB", CARD / max * 100, "pale");
+      stats.innerHTML =
+        stat("fp32 score matrix", bytes(fp32), fp32 > 4 * 1073741824 ? "bad" : "") +
+        stat("eager, peak for the call", bytes(eager), eager > BUDGET ? "bad" : "") +
+        stat("tiled, peak for the call", bytes(tiled), "good") +
+        stat("tiled is smaller by", (eager / tiled).toFixed(eager / tiled > 10 ? 0 : 1) + "×") +
+        stat("eager verdict", eager > BUDGET ? "out of memory" : "fits", eager > BUDGET ? "bad" : "good");
+      var note = "";
+      if (B === 32 && L === 2048) note = " This is the exact allocation that killed the engine: 16.02 GiB of fp32 scores in one request, on a shape vLLM served without noticing.";
+      else if (B === 32 && L === 1024) note = " This shape OOM'd too — not because 4.00 GiB is unaffordable, but because the block pool had claimed 32.74 GiB it could never address. Sizing the pool correctly is what made it run under both kernels.";
+      else if (B === 4 && L === 2048) note = " These are the calibration points: 5,192 MiB measured for eager, 96 MiB for tiled.";
+      say.innerHTML = "At " + B + " × " + fmt(L) + ", the score matrix holds " + fmt(sc) +
+        " numbers. Eager keeps them: <b>" + bytes(eager) + "</b> for one attention call. Tiled never assembles them: <b>" +
+        bytes(tiled) + "</b>, which is just the queries, keys and values themselves." + note;
+    }
+    rb.addEventListener("input", draw); rl.addEventListener("input", draw);
+    draw();
+  })();
+
+  /* =====================================================================
+     5. Benchmark explorer
+     ===================================================================== */
+  (function () {
+    var host = $("#bm"); if (!host) return;
+    var DESIGNS = [
+      ["no cache", 1, 60.5, 16.5, 14.8, "—", "removed"],
+      ["KV cache", 1, 73.4, 13.7, 15.7, "1.21×", "removed"],
+      ["plain tensors", 1, 72.7, 13.7, 14.8, "1.00×", "removed"],
+      ["paged", 1, 66.8, 15.3, 19.3, "0.92×", "removed"],
+      ["static ×4", 4, 281.6, 14.0, 15.8, "3.84×", "removed"],
+      ["static ×4, plain", 4, 277.6, 13.9, 14.9, "3.82×", "removed"],
+      ["static ×4, paged", 4, 252.9, 15.0, 19.0, "3.79×", "removed"],
+      ["continuous ×32", 32, 1268.3, 14.9, 19.0, "5.01×", "shipping"],
+      ["+ fused attention", 32, 1445.5, null, null, "1.08×", "shipping"],
+      ["vLLM 0.28", 32, 4466.6, 5.2, 23.2, "reference", "reference"]
+    ];
+    var SHAPES = [["128 / 256", 1369.1, 4458.7], ["128 / 1024", 942.3, 4211.9],
+                  ["1024 / 256", 646.0, 2871.2], ["1024 / 1024", 574.1, 3240.6]];
+    var KERNELS = [["128 / 256", 1344.4, 1445.5], ["128 / 1024", 937.9, 959.7],
+                   ["1024 / 256", 645.2, 711.1], ["1024 / 1024", 572.9, 592.8],
+                   ["2048 / 128", null, 385.3]];
+    var view = "designs", metric = "tok", sortCol = null, sortDir = -1, logScale = false;
+    function pct(v, max) {
+      if (v == null) return 0;
+      if (!logScale) return v / max * 100;
+      var lo = Math.log(3);
+      return Math.max(2, (Math.log(v) - lo) / (Math.log(max) - lo) * 100);
+    }
+    var rows = $("#bm-rows"), tbl = $("#bm-table"), note = $("#bm-note"), leg = $("#bm-legend");
+    var mseg = $("#bm-metric");
+
+    function th(label, i) { return '<th data-c="' + i + '" tabindex="0" role="button">' + label +
+      (sortCol === i ? (sortDir < 0 ? " ▾" : " ▴") : "") + "</th>"; }
+
+    function draw() {
+      mseg.style.display = view === "designs" ? "" : "none";
+      $$("#bm .seg button[data-view]").forEach(function (b) {
+        b.setAttribute("aria-pressed", b.dataset.view === view ? "true" : "false");
+      });
+      $$("#bm .seg button[data-metric]").forEach(function (b) {
+        b.setAttribute("aria-pressed", b.dataset.metric === metric ? "true" : "false");
+      });
+      $("#bm-log").setAttribute("aria-pressed", logScale ? "true" : "false");
+
+      if (view === "designs") {
+        var d = DESIGNS.slice();
+        if (sortCol !== null) d.sort(function (a, b) {
+          var x = a[sortCol], y = b[sortCol];
+          if (typeof x === "number" && typeof y === "number") return (x - y) * sortDir;
+          return String(x).localeCompare(String(y)) * sortDir;
+        });
+        var useItl = metric === "itl";
+        var vals = d.map(function (x) { return useItl ? x[3] : x[2]; }).filter(function (v) { return v != null; });
+        var max = Math.max.apply(null, vals);
+        rows.innerHTML = d.map(function (x) {
+          var v = useItl ? x[3] : x[2];
+          var cls = x[6] === "reference" ? "cost" : x[6] === "removed" ? "pale" : "";
+          return row(x[0], v == null ? "not measured" : fmt(v, 1) + (useItl ? " ms" : " tok/s"),
+                     pct(v, max), cls);
+        }).join("");
+        leg.innerHTML = '<span><i class="acc"></i> shipping today</span>' +
+                        '<span><i class="pale"></i> measured, then deleted</span>' +
+                        '<span><i class="cost"></i> vLLM reference</span>';
+        tbl.innerHTML = "<thead><tr>" + th("Design", 0) + th("Slots", 1) + th("tok/s", 2) +
+          th("ITL", 3) + th("TTFT", 4) + "<th>vs base</th><th>Status</th></tr></thead><tbody>" +
+          d.map(function (x) {
+            return '<tr class="' + (x[6] === "shipping" ? "" : "gone") + '"><td class="name">' + x[0] +
+              "</td><td>" + x[1] + "</td><td>" + fmt(x[2], 1) + "</td><td>" +
+              (x[3] == null ? "—" : x[3].toFixed(1) + " ms") + "</td><td>" +
+              (x[4] == null ? "—" : x[4].toFixed(1) + " ms") + "</td><td>" + x[5] +
+              '</td><td><span class="pill' + (x[6] === "shipping" ? " live" : "") + '">' + x[6] + "</span></td></tr>";
+          }).join("") + "</tbody>";
+        note.innerHTML = "ISL 128 / OSL 256, one A40, greedy with forced output length. <em>vs base</em> compares each " +
+          "design to the one it improves on, never to whatever number is handiest. " +
+          (useItl ? "Latency is measured with one request in flight, and <strong>lower is better</strong> — a long bar is a slow engine. The fused-attention row has no latency run."
+                  : "Throughput is measured with 200 prompts offered at once.");
+      } else if (view === "shapes") {
+        var max2 = 4458.7;
+        rows.innerHTML = SHAPES.map(function (s) {
+          return row(s[0], fmt(s[1]) + " tok/s", pct(s[1], max2), "") +
+                 row("&nbsp;↳ vLLM", fmt(s[2]) + " tok/s", pct(s[2], max2), "cost");
+        }).join("");
+        leg.innerHTML = '<span><i class="acc"></i> liteinfer</span><span><i class="cost"></i> vLLM</span>';
+        tbl.innerHTML = "<thead><tr><th>ISL / OSL</th><th>liteinfer</th><th>vLLM</th><th>gap</th></tr></thead><tbody>" +
+          SHAPES.map(function (s) {
+            return '<tr><td class="name">' + s[0] + "</td><td>" + fmt(s[1], 1) + "</td><td>" + fmt(s[2], 1) +
+              "</td><td>" + (s[2] / s[1]).toFixed(1) + "×</td></tr>";
+          }).join("") + "</tbody>";
+        note.innerHTML = "An 8× longer prompt costs liteinfer 2.1× throughput where vLLM gives up 1.6×, " +
+          "so the gap widens from 3.3× to 4.4×. <strong>Long prompts are this engine's weak shape</strong> — " +
+          "and the bottom two rows did not run at all until the block pool was resized.";
+      } else {
+        var max3 = 1445.5;
+        rows.innerHTML = KERNELS.map(function (k) {
+          return row(k[0] + " eager", k[1] == null ? "out of memory" : fmt(k[1], 1),
+                     pct(k[1], max3), k[1] == null ? "cost" : "pale") +
+                 row(k[0] + " tiled", fmt(k[2], 1), pct(k[2], max3), "");
+        }).join("");
+        leg.innerHTML = '<span><i class="pale"></i> eager</span><span><i class="acc"></i> tiled (sdpa)</span>';
+        tbl.innerHTML = "<thead><tr><th>ISL / OSL</th><th>eager</th><th>sdpa</th><th>ratio</th></tr></thead><tbody>" +
+          KERNELS.map(function (k) {
+            return '<tr><td class="name">' + k[0] + "</td><td>" + (k[1] == null ? "OOM" : fmt(k[1], 1)) +
+              "</td><td>" + fmt(k[2], 1) + "</td><td>" +
+              (k[1] == null ? "<em>runs at all</em>" : (k[2] / k[1]).toFixed(2) + "×") + "</td></tr>";
+          }).join("") + "</tbody>";
+        note.innerHTML = "Four of the five rows are within the ~1.1× noise floor: <strong>this is not a speedup</strong>. " +
+          "The last row is the entire feature — at ISL 2048 the eager kernel asks for 16.02 GiB in one allocation and dies.";
+      }
+      $$("th[data-c]", tbl).forEach(function (h) {
+        var go = function () {
+          var c = +h.dataset.c;
+          if (sortCol === c) sortDir = -sortDir; else { sortCol = c; sortDir = -1; }
+          draw();
+        };
+        h.addEventListener("click", go);
+        h.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+      });
+    }
+    $$("#bm .seg button[data-view]").forEach(function (b) {
+      b.addEventListener("click", function () { view = b.dataset.view; sortCol = null; draw(); });
+    });
+    $$("#bm .seg button[data-metric]").forEach(function (b) {
+      b.addEventListener("click", function () { metric = b.dataset.metric; draw(); });
+    });
+    $("#bm-log").addEventListener("click", function () { logScale = !logScale; draw(); });
+    draw();
+  })();
+
+  /* =====================================================================
+     6. Block-table explorer
+     ===================================================================== */
+  (function () {
+    var toks = $("#bx-toks"); if (!toks) return;
+    var BS = 4, NBLK = 10;
+    var tabN = $("#bx-tab"), calc = $("#bx-calc"), pool = $("#bx-pool"),
+        bsay = $("#bx-say"), nameN = $("#bx-seqname"), bstats = $("#bx-stats");
+    var seqs, cur, pos, free;
+
+    function reset() {
+      seqs = { A: { table: [3, 7], n: 6, live: true }, B: { table: [5], n: 3, live: true } };
+      free = [9, 8, 6, 4, 2, 1];   // allocate() pops the end, free() pushes it back
+      cur = "A"; pos = 5;
+    }
+    function other() { return cur === "A" ? "B" : "A"; }
+
+    function owners() {
+      var map = {};
+      ["A", "B"].forEach(function (k) {
+        if (!seqs[k].live) return;
+        seqs[k].table.forEach(function (pb, lb) {
+          for (var o = 0; o < BS; o++) map[pb * BS + o] = { seq: k, filled: lb * BS + o < seqs[k].n };
+        });
+      });
+      return map;
+    }
+
+    function drawBX(msg) {
+      var S = seqs[cur];
+      if (pos >= S.n) pos = Math.max(0, S.n - 1);
+      var lb = Math.floor(pos / BS), off = pos % BS, pb = S.table[lb], slot = pb * BS + off;
+      nameN.textContent = "seq " + cur;
+
+      toks.innerHTML = "";
+      for (var i = 0; i < S.n; i++) {
+        var b = document.createElement("button");
+        b.type = "button"; b.className = "tok" + (i % BS === 0 && i ? " brk" : "");
+        b.setAttribute("role", "radio");
+        b.setAttribute("aria-checked", i === pos ? "true" : "false");
+        b.tabIndex = i === pos ? 0 : -1;
+        b.textContent = String(i);
+        b.setAttribute("aria-label", "logical position " + i);
+        b.dataset.i = String(i);
+        toks.appendChild(b);
+      }
+
+      tabN.innerHTML = "";
+      S.table.forEach(function (p, l) {
+        var d = document.createElement("div");
+        d.className = "bent" + (l === lb ? " hot" : "");
+        d.innerHTML = "logical <b>" + l + "</b> &rarr; physical <b>" + p + "</b>";
+        tabN.appendChild(d);
+      });
+      var tail = S.table.length * BS - S.n;
+      if (tail > 0) {
+        var e = document.createElement("div");
+        e.className = "bent frag";
+        e.textContent = tail + " unused slot" + (tail > 1 ? "s" : "") + " in the last block";
+        tabN.appendChild(e);
+      }
+
+      calc.innerHTML =
+        "slot = block_table[<span class='p'>" + lb + "</span>] × " + BS +
+        " + <span class='o'>" + off + "</span> = <span class='p'>" + pb + "</span> × " + BS +
+        " + <span class='o'>" + off + "</span> = <span class='r'>" + slot + "</span>";
+
+      var own = owners();
+      pool.innerHTML = "";
+      for (var blk = 0; blk < NBLK; blk++) {
+        var d = document.createElement("div");
+        d.className = "blk" + (blk === 0 ? " nul" : "") + (blk === pb ? " own" : "");
+        var n = document.createElement("div");
+        n.className = "bn"; n.textContent = blk === 0 ? "null" : String(blk);
+        d.appendChild(n);
+        var g = document.createElement("div");
+        g.className = "slots";
+        for (var o = 0; o < BS; o++) {
+          var idx = blk * BS + o, sl = document.createElement("div"), ow = own[idx];
+          sl.className = "sl" + (blk === 0 ? "" : ow ? " " + ow.seq.toLowerCase() + (ow.filled ? "" : " dim") : "") +
+            (idx === slot ? " hit" : "");
+          sl.title = "slot " + idx;
+          g.appendChild(sl);
+        }
+        d.appendChild(g);
+        pool.appendChild(d);
+      }
+
+      var used = 0, waste = 0;
+      ["A", "B"].forEach(function (k) {
+        if (!seqs[k].live) return;
+        used += seqs[k].n; waste += seqs[k].table.length * BS - seqs[k].n;
+      });
+      bstats.innerHTML =
+        stat("token slots in use", used) +
+        stat("wasted in last blocks", waste, waste ? "bad" : "good") +
+        stat("blocks free in the pool", free.length, free.length ? "good" : "bad");
+
+      bsay.innerHTML = (msg ? "<b>" + msg + "</b> " : "") +
+        "seq " + cur + " token " + pos + " lives in logical block " + lb + " at offset " + off +
+        ". Its block table sends logical " + lb + " to physical block " + pb +
+        ", so this token's key and value sit in slot " + slot + " of the shared array." +
+        (S.table.length > 1 ? " Neighbouring logical tokens stop being neighbouring slots the moment a block boundary is crossed." : "");
+
+      $$("#bx .seg button").forEach(function (b) {
+        b.setAttribute("aria-pressed", b.dataset.seq === cur ? "true" : "false");
+        b.disabled = !seqs[b.dataset.seq].live;
+      });
+      var grow = $("#bx-grow"), freeBtn = $("#bx-free");
+      grow.disabled = (S.n % BS === 0 && !free.length);
+      grow.textContent = "+ append a token to seq " + cur;
+      freeBtn.disabled = !seqs[other()].live;
+      freeBtn.textContent = seqs[other()].live ? "free seq " + other() : "seq " + other() + " is freed";
+    }
+
+    reset();
+    toks.addEventListener("click", function (e) {
+      var b = e.target.closest(".tok"); if (!b) return;
+      pos = parseInt(b.dataset.i, 10); drawBX();
+      toks.querySelector('[aria-checked="true"]').focus();
+    });
+    toks.addEventListener("keydown", function (e) {
+      var n = seqs[cur].n, p = pos;
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") p = (pos + 1) % n;
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") p = (pos - 1 + n) % n;
+      else if (e.key === "Home") p = 0;
+      else if (e.key === "End") p = n - 1;
+      else return;
+      e.preventDefault(); pos = p; drawBX();
+      toks.querySelector('[aria-checked="true"]').focus();
+    });
+    $$("#bx .seg button").forEach(function (b) {
+      b.addEventListener("click", function () { cur = b.dataset.seq; pos = seqs[cur].n - 1; drawBX(); });
+    });
+    $("#bx-grow").addEventListener("click", function () {
+      var S = seqs[cur], msg;
+      if (S.n % BS === 0) {
+        if (!free.length) return;
+        var nb = free.pop();
+        S.table.push(nb);
+        msg = "Block full — allocated physical block " + nb + " from the free list.";
+      } else msg = "Appended token " + S.n + ".";
+      S.n++; pos = S.n - 1; drawBX(msg);
+    });
+    $("#bx-free").addEventListener("click", function () {
+      var k = other(), S = seqs[k];
+      var given = S.table.slice();
+      given.forEach(function (p) { free.push(p); });
+      S.live = false; S.table = []; S.n = 0;
+      drawBX("seq " + k + " finished and was evicted: block" + (given.length > 1 ? "s " : " ") +
+        given.join(", ") + " went straight back to the free list, ready for the next request.");
+    });
+    $("#bx-reset").addEventListener("click", function () { reset(); drawBX("Reset."); });
+    drawBX();
+  })();
+
+  /* =====================================================================
+     7. Continuous-batching stepper
+     ===================================================================== */
+  (function () {
+    var grids = $("#cb-grids"); if (!grids) return;
+    var LEN = { R1: 5, R2: 12, R3: 3, R4: 8, R5: 4, R6: 6, R7: 2 };
+    var ORDER = ["R1", "R2", "R3", "R4", "R5", "R6", "R7"];
+    var NSLOT = 4;
+    function push(o, k, v) { (o[k] = o[k] || []).push(v); }
+
+    function simStatic() {
+      var rows = [[], [], [], []], ev = {}, wait = [], t = 0, admitted = 0;
+      var nb = Math.ceil(ORDER.length / NSLOT);
+      for (var b = 0; b < nb; b++) {
+        var batch = ORDER.slice(b * NSLOT, b * NSLOT + NSLOT), dur = 0, i;
+        for (i = 0; i < batch.length; i++) dur = Math.max(dur, LEN[batch[i]]);
+        admitted += batch.length;
+        push(ev, t + 1, "batch " + (b + 1) + " admitted — " + batch.join(", ") +
+          ". Membership is now fixed until every one of them is done.");
+        for (var s = 0; s < NSLOT; s++) {
+          var r = batch[s];
+          for (var k = 0; k < dur; k++) rows[s][t + k] = (r && k < LEN[r]) ? r : "idle";
+          if (r) push(ev, t + LEN[r], LEN[r] < dur
+            ? r + " finishes, but slot " + (s + 1) + " cannot be reused — it idles until the batch ends."
+            : r + " finishes, and it was the last member of the batch to do so.");
+          if (!r) push(ev, t + 1, "slot " + (s + 1) + " has no request to run: the queue is shorter than the batch.");
+        }
+        for (var w = 0; w < dur; w++) wait[t + w] = ORDER.length - admitted;
+        t += dur;
+      }
+      return { rows: rows, ev: ev, wait: wait, total: t, label: "STATIC",
+               tag: "fixed batch of " + NSLOT + " · done at step " + t };
+    }
+
+    function simCont() {
+      var rows = [[], [], [], []], ev = {}, wait = [];
+      var q = ORDER.slice(), slot = [null, null, null, null], t = 0, guard = 0, s;
+      while ((q.length || slot[0] || slot[1] || slot[2] || slot[3]) && guard++ < 400) {
+        var adm = [];
+        for (s = 0; s < NSLOT; s++) {
+          if (!slot[s] && q.length) {
+            var r = q.shift();
+            slot[s] = { req: r, rem: LEN[r] };
+            adm.push(r + " → slot " + (s + 1));
+          }
+        }
+        if (adm.length) push(ev, t + 1, "admitted " + adm.join(", ") + ".");
+        var fin = [];
+        for (s = 0; s < NSLOT; s++) {
+          if (slot[s]) {
+            rows[s][t] = slot[s].req;
+            if (--slot[s].rem === 0) { fin.push(slot[s].req + " finishes, slot " + (s + 1) + " frees"); slot[s] = null; }
+          } else rows[s][t] = "idle";
+        }
+        if (fin.length) push(ev, t + 1, fin.join("; ") + (q.length
+          ? " — the next queued request takes it on the very next step."
+          : " — nothing is waiting, so it idles."));
+        wait[t] = q.length;
+        t++;
+      }
+      return { rows: rows, ev: ev, wait: wait, total: t, label: "CONTINUOUS",
+               tag: "re-decided every iteration · done at step " + t };
+    }
+
+    var ST = simStatic(), CO = simCont(), MAXT = Math.max(ST.total, CO.total);
+    var step = 1, timer = null;
+    var range = $("#cb-range"), out = $("#cb-out"), say = $("#cb-say"),
+        stats = $("#cb-stats"), playBtn = $("#cb-play");
+    range.max = String(MAXT);
+
+    [ST, CO].forEach(function (sim) {
+      var tl = document.createElement("div");
+      tl.className = "tl";
+      var h = document.createElement("p");
+      h.className = "tl-head";
+      h.innerHTML = sim.label + ' <span class="tag">' + sim.tag + "</span>";
+      tl.appendChild(h);
+
+      var g = document.createElement("div");
+      g.className = "tl-grid";
+      g.style.gridTemplateColumns = "52px repeat(" + MAXT + ", minmax(0,1fr))";
+      g.setAttribute("role", "img");
+      g.setAttribute("aria-label", sim.label + " schedule: " + NSLOT + " slots across " +
+        MAXT + " steps, finishing at step " + sim.total + ".");
+      g.appendChild(document.createElement("div"));
+      for (var c = 1; c <= MAXT; c++) {
+        var a = document.createElement("div");
+        a.className = "tl-axis"; a.dataset.axis = String(c);
+        a.textContent = (c === 1 || c % 3 === 0 || c === MAXT) ? String(c) : "";
+        g.appendChild(a);
+      }
+      for (var s = 0; s < NSLOT; s++) {
+        var lab = document.createElement("div");
+        lab.className = "tl-lab"; lab.textContent = "slot " + (s + 1);
+        g.appendChild(lab);
+        for (var k = 0; k < MAXT; k++) {
+          var v = sim.rows[s][k], d = document.createElement("div");
+          d.dataset.col = String(k + 1);
+          if (!v) d.className = "cell void";
+          else if (v === "idle") { d.className = "cell idle"; d.textContent = "·"; }
+          else {
+            var prev = sim.rows[s][k - 1], next = sim.rows[s][k + 1];
+            d.className = "cell run" + (prev === v ? "" : " start") + (next === v ? "" : " end");
+            d.textContent = v;
+          }
+          g.appendChild(d);
+        }
+      }
+      tl.appendChild(g);
+      var q = document.createElement("div");
+      q.className = "queue"; q.dataset.q = sim.label;
+      tl.appendChild(q);
+      sim.node = tl;
+      grids.appendChild(tl);
+    });
+
+    function render() {
+      out.textContent = "step " + step + " / " + MAXT;
+      range.value = String(step);
+      $$(".cell.cur", grids).forEach(function (e) { e.classList.remove("cur"); });
+      $$(".tl-axis.cur", grids).forEach(function (e) { e.classList.remove("cur"); });
+      $$('[data-col="' + step + '"]', grids).forEach(function (e) { e.classList.add("cur"); });
+      $$('[data-axis="' + step + '"]', grids).forEach(function (e) {
+        e.classList.add("cur"); if (!e.textContent) e.textContent = String(step);
+      });
+
+      var msgs = [];
+      [ST, CO].forEach(function (sim) {
+        var m = sim.ev[step];
+        if (m) msgs.push(sim.label.charAt(0) + sim.label.slice(1).toLowerCase() + ": " + m.join(" "));
+        var qn = sim.node.querySelector("[data-q]");
+        var n = sim.wait[step - 1]; if (n === undefined) n = 0;
+        var html = "waiting: ";
+        if (n > 0) html += ORDER.slice(ORDER.length - n).map(function (r) {
+          return '<span class="qchip">' + r + "</span>"; }).join(" ");
+        else html += '<span class="qchip none">queue empty</span>';
+        if (step > sim.total) html += ' <span class="tl-done">all done at step ' + sim.total + "</span>";
+        qn.innerHTML = html;
+      });
+      say.textContent = msgs.length ? msgs.join("  •  ")
+        : "Step " + step + ": every occupied slot runs one forward pass. Nothing starts or finishes.";
+
+      var acc = function (sim) {
+        var tok = 0, idle = 0, done = 0, s, k;
+        for (s = 0; s < NSLOT; s++) for (k = 0; k < step && k < sim.total; k++) {
+          var v = sim.rows[s][k];
+          if (v === "idle") idle++; else if (v) tok++;
+        }
+        for (var i = 0; i < ORDER.length; i++) {
+          var r = ORDER[i], last = -1;
+          for (s = 0; s < NSLOT; s++) for (k = 0; k < sim.total; k++) if (sim.rows[s][k] === r) last = Math.max(last, k + 1);
+          if (last > 0 && last <= step) done++;
+        }
+        return { tok: tok, idle: idle, done: done };
+      };
+      var a = acc(ST), b = acc(CO);
+      stats.innerHTML =
+        stat("tokens produced", a.tok + " → " + b.tok, "") +
+        stat("idle slot-steps", a.idle + " → " + b.idle, b.idle < a.idle ? "good" : (b.idle > a.idle ? "bad" : "")) +
+        stat("requests finished", a.done + " → " + b.done, b.done > a.done ? "good" : "") +
+        stat("steps to finish all 7", ST.total + " → " + CO.total, "good");
+    }
+
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+      if (playBtn) { playBtn.innerHTML = "▶ play"; playBtn.setAttribute("aria-pressed", "false"); }
+    }
+    function go(n) { step = Math.min(MAXT, Math.max(1, n)); render(); if (step >= MAXT) stop(); }
+    function play() {
+      if (timer) return stop();
+      if (step >= MAXT) step = 1;
+      playBtn.innerHTML = "❘❘ pause";
+      playBtn.setAttribute("aria-pressed", "true");
+      timer = setInterval(function () { go(step + 1); }, 760);
+    }
+    $$("#cb .wctl button[data-act]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var a = b.dataset.act;
+        if (a === "play") return play();
+        stop();
+        if (a === "start") go(1);
+        else if (a === "prev") go(step - 1);
+        else if (a === "next") go(step + 1);
+        else if (a === "end") go(MAXT);
+      });
+    });
+    range.addEventListener("input", function () { stop(); go(parseInt(range.value, 10)); });
+    $("#cb").addEventListener("keydown", function (e) {
+      if (e.target.tagName === "INPUT" || e.target.classList.contains("figscroll")) return;
+      if (e.key === "ArrowRight") { stop(); go(step + 1); e.preventDefault(); }
+      else if (e.key === "ArrowLeft") { stop(); go(step - 1); e.preventDefault(); }
+      else if (e.key === "Home") { stop(); go(1); e.preventDefault(); }
+      else if (e.key === "End") { stop(); go(MAXT); e.preventDefault(); }
+    });
+    if (reduce && playBtn) playBtn.hidden = true;
+    render();
+  })();
+  /* =====================================================================
+     8. Where the loop's time goes
+     ===================================================================== */
+  (function () {
+    var r = $("#lp-r"); if (!r) return;
+    var out = $("#lp-out"), rows = $("#lp-rows"), stats = $("#lp-stats"), say = $("#lp-say");
+    var mode = "naive";
+    /* An illustrative model. Three stages cost the same every step; the fourth
+       re-derives its answer from the whole history, so its average per-step cost
+       rises with the reply length. Units are arbitrary and deliberately unlabelled. */
+    var FWD = 100, SMP = 8, SCH = 1, FLAT = 1.2;
+    function deliver(N, m) { return m === "inc" ? FLAT : 3.5 + 0.0367 * (N / 2); }
+    function share(N, m) {
+      var d = deliver(N, m);
+      return { d: d, total: FWD + SMP + SCH + d };
+    }
+    function draw() {
+      var N = (+r.value) * 64;
+      var cur = share(N, mode), nai = share(N, "naive"), inc = share(N, "inc");
+      var pctOf = function (v) { return v / cur.total * 100; };
+      out.textContent = fmt(N) + " tokens out";
+      $$("#lp .seg button").forEach(function (b) {
+        b.setAttribute("aria-pressed", b.dataset.mode === mode ? "true" : "false");
+      });
+      rows.innerHTML =
+        row("forward pass", pctOf(FWD).toFixed(1) + "%", pctOf(FWD), "") +
+        row("deliver &mdash; ids to text", pctOf(cur.d).toFixed(1) + "%", pctOf(cur.d),
+            mode === "inc" ? "" : "cost") +
+        row("sample", pctOf(SMP).toFixed(1) + "%", pctOf(SMP), "") +
+        row("schedule", pctOf(SCH).toFixed(1) + "%", pctOf(SCH), "");
+      var gain = nai.total / inc.total, gain256 = share(256, "naive").total / share(256, "inc").total;
+      stats.innerHTML =
+        stat("reply length", fmt(N) + " tokens") +
+        stat("the growing stage", pctOf(cur.d).toFixed(1) + "%", mode === "inc" ? "good" : "bad") +
+        stat("everything but the model", ((cur.total - FWD) / cur.total * 100).toFixed(1) + "%") +
+        stat(mode === "inc" ? "flatness is worth" : "making it flat is worth", gain.toFixed(2) + "×", gain > 1.1 ? "good" : "");
+      say.innerHTML = mode === "naive"
+        ? "Re-deriving the whole text every step: at " + fmt(N) + " tokens out that stage takes <b>" +
+          pctOf(cur.d).toFixed(1) + "%</b> of the iteration, because its cost per token grows with the " +
+          "tokens already produced. Making it incremental would be worth <b>" + gain.toFixed(2) +
+          "×</b> here" + (N > 256 ? " &mdash; and only " + gain256.toFixed(2) +
+          "× at a 256-token reply, from the same change to the same code." : ".")
+        : "Incremental: that stage holds at <b>" + pctOf(cur.d).toFixed(1) +
+          "%</b> and stays there at any reply length, because the work per step no longer depends on " +
+          "how much text came before it. <b>The property is the result</b>; the ratio it reports " +
+          "depends on the shape you measured it at.";
+    }
+    r.addEventListener("input", draw);
+    $$("#lp .seg button").forEach(function (b) {
+      b.addEventListener("click", function () { mode = b.dataset.mode; draw(); });
+    });
+    draw();
+  })();
+})();
+</script>
+
+</body></html>
